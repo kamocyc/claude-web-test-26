@@ -5,11 +5,16 @@ export interface MeshData {
   normals: Float32Array
   /** 頂点ごとの素材の重み (grass, dirt, rock, sand)。合計 1。 */
   mats: Float32Array
+  /** 頂点ごとのバイオーム (temp, humid)。シェーダの色付けに使う。 */
+  biome: Float32Array
   indices: Uint32Array
 }
 
-/** 頂点位置と法線 y から素材の重みを `out[at..at+3]` に書き込む。 */
-export type MaterialSampler = (
+/**
+ * 頂点位置と法線 y から、素材の重み 4 要素とバイオーム 2 要素を
+ * `out[at .. at+5]` に書き込む。
+ */
+export type SurfaceSampler = (
   wx: number,
   wy: number,
   wz: number,
@@ -42,13 +47,14 @@ export function surfaceNets(
   oy: number,
   oz: number,
   matOverride: Uint8Array | null,
-  sampler: MaterialSampler | null,
+  sampler: SurfaceSampler | null,
 ): MeshData | null {
   const cellVert = new Int32Array(CELLS * CELLS * CELLS).fill(-1)
 
   const positions: number[] = []
   const normals: number[] = []
   const mats: number[] = []
+  const biome: number[] = []
   const indices: number[] = []
 
   const d = new Float32Array(8)
@@ -56,7 +62,7 @@ export function surfaceNets(
   const gx = new Float32Array(8)
   const gy = new Float32Array(8)
   const gz = new Float32Array(8)
-  const w = new Float32Array(4)
+  const w = new Float32Array(6)
   const acc = new Float32Array(4)
 
   const strideY = GRID
@@ -151,16 +157,21 @@ export function surfaceNets(
             }
           }
         }
+        // バイオームは素材の上書きに関係なく常に必要
+        if (sampler) {
+          sampler(ox + lx, oy + ly, oz + lz, ny, w, 0)
+        } else {
+          w[0] = 1
+          w[1] = 0
+          w[2] = 0
+          w[3] = 0
+          w[4] = 0.5
+          w[5] = 0.5
+        }
+        biome.push(w[4], w[5])
+
         const natural = solid - overridden
         if (natural > 0) {
-          if (sampler) {
-            sampler(ox + lx, oy + ly, oz + lz, ny, w, 0)
-          } else {
-            w[0] = 1
-            w[1] = 0
-            w[2] = 0
-            w[3] = 0
-          }
           acc[0] += w[0] * natural
           acc[1] += w[1] * natural
           acc[2] += w[2] * natural
@@ -233,6 +244,7 @@ export function surfaceNets(
     positions: new Float32Array(positions),
     normals: new Float32Array(normals),
     mats: new Float32Array(mats),
+    biome: new Float32Array(biome),
     indices: new Uint32Array(indices),
   }
 }

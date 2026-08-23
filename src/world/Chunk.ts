@@ -32,6 +32,10 @@ export function unpackLocalIndex(i: number): [number, number, number] {
 
 export class Chunk {
   mesh: THREE.Mesh | null = null
+  /** 木の InstancedMesh（種類ごと）。 */
+  treeMeshes: THREE.InstancedMesh[] = []
+  /** 幹の当たり判定 (x, y, z, 半径, 高さ) の並び。 */
+  trunks: Float32Array | null = null
   /** 最後に投入したジョブの世代。古い結果を破棄するために使う。 */
   requested = 0
   /** 一度でもメッシュ化が完了したか（初期ロード待ちの判定に使う）。 */
@@ -45,9 +49,16 @@ export class Chunk {
   ) {}
 
   dispose(parent: THREE.Object3D): void {
-    if (!this.mesh) return
-    parent.remove(this.mesh)
-    this.mesh.geometry.dispose()
-    this.mesh = null
+    if (this.mesh) {
+      parent.remove(this.mesh)
+      this.mesh.geometry.dispose()
+      this.mesh = null
+    }
+    for (const im of this.treeMeshes) {
+      parent.remove(im)
+      im.dispose() // ジオメトリは共有プロトタイプなので破棄しない
+    }
+    this.treeMeshes.length = 0
+    this.trunks = null
   }
 }

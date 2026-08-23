@@ -1,11 +1,5 @@
 import { expect, test } from '@playwright/test'
 
-declare global {
-  interface Window {
-    __smooth?: { frames: number; ready: boolean; edits: number; loaded: number; desired: number }
-  }
-}
-
 test('起動して地形を描画し、掘削できる', async ({ page }, testInfo) => {
   const errors: string[] = []
   page.on('console', (msg) => {

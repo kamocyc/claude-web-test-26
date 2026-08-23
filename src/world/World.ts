@@ -16,7 +16,9 @@ import { Chunk, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Ch
 import type { EditMap } from './Chunk'
 import { applySphereBrush } from './edits'
 import type { BrushMode } from './edits'
+import { TREE_STRIDE } from './vegetation'
 import { WorkerPool } from './WorkerPool'
+import type { TreePrototype } from '../render/treeMeshes'
 import type { MeshResponse } from './chunk.worker'
 import type { WorldStore } from './storage'
 
@@ -64,6 +66,10 @@ export class World {
   private readonly ringOffsets: Array<[number, number]> = []
 
   private material: THREE.Material | null = null
+  private treeProtos: TreePrototype[] | null = null
+  private treeMaterial: THREE.Material | null = null
+  private readonly dummy = new THREE.Object3D()
+  private readonly trunkBuf = new Float32Array(600 * 5)
   private store: WorldStore | null
   private jobCounter = 0
   private lastCenter = ''
@@ -72,6 +78,8 @@ export class World {
   /** 初期ロード進捗の判定用 */
   loadedChunks = 0
   requestedChunks = 0
+  /** 表示中の木の本数（デバッグ表示用）。 */
+  treeCount = 0
 
   constructor(opts: WorldOptions) {
     this.seed = opts.seed
@@ -84,6 +92,48 @@ export class World {
 
   setMaterial(material: THREE.Material): void {
     this.material = material
+  }
+
+  setTreeAssets(prototypes: TreePrototype[], material: THREE.Material): void {
+    this.treeProtos = prototypes
+    this.treeMaterial = material
+  }
+
+  /**
+   * 半径 r 以内にある木の幹を集める。
+   * 毎フレーム 1 回だけ呼んで Player に渡す想定なので、バッファを使い回す。
+   */
+  collectTrunks(x: number, y: number, z: number, r: number): Float32Array {
+    let n = 0
+    const r2 = r * r
+    const cx0 = Math.floor((x - r) / CHUNK_WORLD)
+    const cx1 = Math.floor((x + r) / CHUNK_WORLD)
+    const cz0 = Math.floor((z - r) / CHUNK_WORLD)
+    const cz1 = Math.floor((z + r) / CHUNK_WORLD)
+    const cy0 = Math.floor((y - 8) / CHUNK_WORLD)
+    const cy1 = Math.floor((y + 8) / CHUNK_WORLD)
+    const buf = this.trunkBuf
+    for (let cz = cz0; cz <= cz1; cz++) {
+      for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const t = this.chunks.get(chunkKey(cx, cy, cz))?.trunks
+          if (!t) continue
+          for (let i = 0; i < t.length; i += 5) {
+            const dx = t[i] - x
+            const dz = t[i + 2] - z
+            if (dx * dx + dz * dz > r2) continue
+            if (n + 5 > buf.length) return buf.subarray(0, n)
+            buf[n] = t[i]
+            buf[n + 1] = t[i + 1]
+            buf[n + 2] = t[i + 2]
+            buf[n + 3] = t[i + 3]
+            buf[n + 4] = t[i + 4]
+            n += 5
+          }
+        }
+      }
+    }
+    return buf.subarray(0, n)
   }
 
   setEdits(all: Map<string, EditMap>): void {
@@ -128,11 +178,14 @@ export class World {
         if (rec) return rec.d
       }
     }
+    const wx = gx * VOXEL_SIZE
+    const wz = gz * VOXEL_SIZE
     return this.field.density(
-      gx * VOXEL_SIZE,
+      wx,
       gy * VOXEL_SIZE,
-      gz * VOXEL_SIZE,
+      wz,
       this.heightAtLattice(gx, gz),
+      this.field.flattenAt(wx, wz),
     )
   }
 
@@ -392,6 +445,7 @@ export class World {
     for (const [key, chunk] of this.chunks) {
       if (desired.has(key)) continue
       this.pool.cancel(key)
+      this.treeCount -= countInstances(chunk)
       chunk.dispose(this.group)
       if (chunk.ready) this.loadedChunks--
       this.requestedChunks--
@@ -428,6 +482,7 @@ export class World {
 
   private applyMesh(chunk: Chunk, res: MeshResponse): void {
     if (!this.chunks.has(chunk.key)) return
+    this.treeCount -= countInstances(chunk)
     chunk.dispose(this.group)
     if (!chunk.ready) {
       chunk.ready = true
@@ -440,6 +495,7 @@ export class World {
     geo.setAttribute('position', new THREE.BufferAttribute(res.positions, 3))
     geo.setAttribute('normal', new THREE.BufferAttribute(res.normals, 3))
     geo.setAttribute('matw', new THREE.BufferAttribute(res.mats, 4))
+    if (res.biome) geo.setAttribute('abiome', new THREE.BufferAttribute(res.biome, 2))
     geo.setIndex(new THREE.BufferAttribute(res.indices, 1))
     geo.computeBoundingSphere()
 
@@ -451,6 +507,54 @@ export class World {
     mesh.updateMatrix()
     chunk.mesh = mesh
     this.group.add(mesh)
+
+    if (res.trees && res.trees.length > 0) this.applyTrees(chunk, res.trees)
+  }
+
+  /** 木のインスタンスを種類ごとの InstancedMesh にまとめる。 */
+  private applyTrees(chunk: Chunk, trees: Float32Array): void {
+    const protos = this.treeProtos
+    const mat = this.treeMaterial
+    if (!protos || !mat) return
+
+    const byType: number[][] = protos.map(() => [])
+    for (let i = 0; i < trees.length; i += TREE_STRIDE) {
+      const t = trees[i + 5] | 0
+      if (t >= 0 && t < byType.length) byType[t].push(i)
+    }
+
+    const trunks: number[] = []
+    for (let t = 0; t < byType.length; t++) {
+      const list = byType[t]
+      if (list.length === 0) continue
+      const proto = protos[t]
+      const im = new THREE.InstancedMesh(proto.geometry, mat, list.length)
+      im.castShadow = true
+      im.receiveShadow = true
+      im.matrixAutoUpdate = false
+      for (let k = 0; k < list.length; k++) {
+        const i = list[k]
+        const s = trees[i + 3]
+        this.dummy.position.set(trees[i], trees[i + 1], trees[i + 2])
+        this.dummy.rotation.set(0, trees[i + 4], 0)
+        this.dummy.scale.setScalar(s)
+        this.dummy.updateMatrix()
+        im.setMatrixAt(k, this.dummy.matrix)
+        trunks.push(
+          trees[i],
+          trees[i + 1],
+          trees[i + 2],
+          proto.trunkRadius * s,
+          proto.trunkHeight * s,
+        )
+      }
+      im.instanceMatrix.needsUpdate = true
+      im.computeBoundingSphere()
+      this.group.add(im)
+      chunk.treeMeshes.push(im)
+      this.treeCount += list.length
+    }
+    chunk.trunks = new Float32Array(trunks)
   }
 
   /** 指定位置を含むチャンクがメッシュ化済みか。 */
@@ -475,3 +579,9 @@ export class World {
 }
 
 const SCRATCH: FieldSample = { d: 0, gx: 0, gy: 0, gz: 0 }
+
+function countInstances(chunk: Chunk): number {
+  let n = 0
+  for (const im of chunk.treeMeshes) n += im.count
+  return n
+}

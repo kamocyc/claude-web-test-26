@@ -4,9 +4,12 @@ import { SkyDayNight } from './engine/SkyDayNight'
 import { Water } from './engine/Water'
 import { createTerrainMaterial } from './render/TerrainMaterial'
 import { createNoiseTexture } from './render/proceduralTextures'
+import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
+import { VillageManager } from './world/VillageManager'
+import type { Box } from './world/village'
 import { World } from './world/World'
 import { WorldStore } from './world/storage'
-import { CHUNK_SIZE, MATERIAL_INFO, SEA_LEVEL } from './world/constants'
+import { CHUNK_SIZE, MATERIAL_INFO, SEA_LEVEL, VILLAGE_CELL } from './world/constants'
 import { Player, PLAYER_EYE } from './player/Player'
 import { Controls } from './player/Controls'
 import { createRayHit, raycastTerrain } from './player/terrainRaycast'
@@ -34,7 +37,11 @@ async function boot(): Promise<void> {
 
   const world = new World({ seed, viewDistance: VIEW_DISTANCE, store })
   world.setMaterial(createTerrainMaterial(createNoiseTexture()))
+  world.setTreeAssets(createTreePrototypes(), treeMaterial)
   scene.add(world.group)
+
+  const villages = new VillageManager(world.field)
+  scene.add(villages.group)
   store.setEditSource((key) => world.getEdits(key))
   if (hasDb) world.setEdits(await store.loadAllEdits())
 
@@ -43,6 +50,9 @@ async function boot(): Promise<void> {
 
   const water = new Water()
   scene.add(water.mesh)
+
+  const VIEW_RANGE = VIEW_DISTANCE * CHUNK_SIZE
+  const boxScratch: Box[] = []
 
   const player = new Player()
   if (meta) {
@@ -127,8 +137,68 @@ async function boot(): Promise<void> {
     }
   }
 
-  // デバッグ／自動テスト用の状態（HUD と同じ値）
-  const stats = { frames: 0, ready: false, edits: 0, loaded: 0, desired: 0 }
+  /**
+   * デバッグ／自動テスト用のフック。`window.__smooth` から触れる。
+   */
+  const stats = {
+    frames: 0,
+    ready: false,
+    edits: 0,
+    loaded: 0,
+    desired: 0,
+    trees: 0,
+    villages: 0,
+    villageBoxes: 0,
+    /** 視線角を直接設定する。 */
+    look(yaw: number, pitch: number) {
+      controls.yaw = yaw
+      controls.pitch = pitch
+    },
+    /** プレイヤーの現在の状態。 */
+    state() {
+      return {
+        x: player.position.x,
+        y: player.position.y,
+        z: player.position.z,
+        onGround: player.onGround,
+        groundNormalY: player.groundNormalY,
+        flying: player.flying,
+        inWater: player.inWater,
+        trunks: player.trunks ? player.trunks.length / 5 : 0,
+        boxes: player.boxes.length,
+      }
+    },
+    /** 指定座標の地表へ移動する。 */
+    teleport(x: number, z: number) {
+      player.spawnAt(world, x, z)
+      // 落下待ちを挟まずすぐ接地するよう、地面のすぐ上に置く
+      player.position.y -= 1.0
+      world.update(x, player.position.y, z)
+    },
+    /** 最寄りの村の広場へ移動する。見つからなければ false。 */
+    gotoVillage(): boolean {
+      const cx = Math.floor(player.position.x / VILLAGE_CELL)
+      const cz = Math.floor(player.position.z / VILLAGE_CELL)
+      for (let r = 0; r <= 6; r++) {
+        for (let dz = -r; dz <= r; dz++) {
+          for (let dx = -r; dx <= r; dx++) {
+            if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue
+            const v = world.field.village(cx + dx, cz + dz)
+            if (!v) continue
+            stats.teleport(v.cx, v.cz - v.radius * 0.62)
+            // 広場の方を向く
+            controls.yaw = Math.atan2(
+              -(v.cx - player.position.x),
+              -(v.cz - player.position.z),
+            )
+            controls.pitch = -0.08
+            return true
+          }
+        }
+      }
+      return false
+    },
+  }
   ;(window as unknown as Record<string, unknown>).__smooth = stats
 
   const hit = createRayHit()
@@ -158,8 +228,13 @@ async function boot(): Promise<void> {
     camera.rotation.set(controls.pitch, controls.yaw, 0, 'YXZ')
 
     world.update(eye.x, eye.y, eye.z)
+    villages.update(player.position.x, player.position.z, VIEW_RANGE)
     sky.update(dt, camera.position, engine.fog)
     water.update(dt, camera.position)
+
+    // 木の幹と建物の壁の当たり判定は毎フレーム 1 回だけ集める
+    player.trunks = world.collectTrunks(player.position.x, player.position.y, player.position.z, 4)
+    player.boxes = villages.collidersNear(player.position.x, player.position.z, 1.2, boxScratch)
 
     // 水中は視界を濁らせる
     const underwater = camera.position.y < SEA_LEVEL
@@ -235,6 +310,7 @@ async function boot(): Promise<void> {
           `Chunk ${Math.floor(player.position.x / CHUNK_SIZE)} ${Math.floor(player.position.y / CHUNK_SIZE)} ${Math.floor(player.position.z / CHUNK_SIZE)}`,
           `Mesh  ${world.loadedChunks}/${world.desiredCount}  queue ${world.pendingJobs}`,
           `Mode  ${player.flying ? '飛行' : player.inWater ? '水中' : player.onGround ? '接地' : '空中'}`,
+          `Env   ${biomeName(world, player.position.x, player.position.z)}  村 ${villages.activeCount}`,
           `Time  ${String(h).padStart(2, '0')}:00`,
           `Seed  ${seed}`,
         ].join('\n'),
@@ -253,9 +329,22 @@ async function boot(): Promise<void> {
     stats.edits = world.editedChunkCount
     stats.loaded = world.loadedChunks
     stats.desired = world.desiredCount
+    stats.villages = villages.activeCount
+    stats.villageBoxes = villages.colliderCount
+    stats.trees = world.treeCount
   }
 
   tick()
+}
+
+/** HUD 表示用のバイオーム名。 */
+function biomeName(world: World, x: number, z: number): string {
+  const b = world.field.biomeAt(x, z)
+  if (b.mountain > 0.55) return '山岳'
+  if (b.temp < 0.32) return b.humid > 0.5 ? '雪の森' : 'ツンドラ'
+  if (b.temp > 0.56 && b.humid < 0.42) return '砂漠'
+  if (b.humid > 0.58) return '森'
+  return '草原'
 }
 
 function clamp(x: number, lo: number, hi: number): number {

@@ -22,7 +22,7 @@ export const CELL_BASE = PAD - 1
 
 /** ワールドの垂直方向の範囲（チャンク単位）。 */
 export const CHUNK_Y_MIN = -4
-export const CHUNK_Y_MAX = 4
+export const CHUNK_Y_MAX = 5
 
 export const WORLD_MIN_Y = CHUNK_Y_MIN * CHUNK_SIZE
 export const BEDROCK_Y = WORLD_MIN_Y + 4
@@ -47,6 +47,9 @@ export const MATERIAL_INFO = [
   { id: MAT_ROCK, name: '岩', color: '#8a8f96' },
   { id: MAT_SAND, name: '砂', color: '#d8c48a' },
 ] as const
+
+/** 村を配置する粗いグリッドの一辺（m）。 */
+export const VILLAGE_CELL = 420
 
 export function chunkKey(cx: number, cy: number, cz: number): string {
   return `${cx},${cy},${cz}`

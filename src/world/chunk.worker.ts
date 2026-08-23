@@ -2,6 +2,7 @@
 import { CHUNK_SIZE, GRID, VOXEL_SIZE } from './constants'
 import { ColumnHeightCache, DensityField, generateChunkDensity } from './density'
 import { surfaceNets } from './surfaceNets'
+import { scatterTrees } from './vegetation'
 
 export interface MeshRequest {
   id: number
@@ -21,7 +22,10 @@ export interface MeshResponse {
   positions?: Float32Array
   normals?: Float32Array
   mats?: Float32Array
+  biome?: Float32Array
   indices?: Uint32Array
+  /** 木のインスタンス（TREE_STRIDE ごとに 1 本）。 */
+  trees?: Float32Array
 }
 
 let field: DensityField | null = null
@@ -65,7 +69,7 @@ self.onmessage = (ev: MessageEvent<MeshRequest>) => {
   const oz = req.cz * CHUNK_SIZE * VOXEL_SIZE
 
   const mesh = surfaceNets(density, ox, oy, oz, matOverride, (wx, wy, wz, ny, out, at) =>
-    f.materialWeights(wx, wy, wz, ny, out, at),
+    f.surfaceSample(wx, wy, wz, ny, out, at),
   )
 
   if (!mesh) {
@@ -73,18 +77,24 @@ self.onmessage = (ev: MessageEvent<MeshRequest>) => {
     return
   }
 
+  const trees = scatterTrees(f, mesh, ox, oy, oz, req.seed)
+
   const res: MeshResponse = {
     id: req.id,
     empty: false,
     positions: mesh.positions,
     normals: mesh.normals,
     mats: mesh.mats,
+    biome: mesh.biome,
     indices: mesh.indices,
+    trees,
   }
   ;(self as unknown as Worker).postMessage(res, [
     mesh.positions.buffer,
     mesh.normals.buffer,
     mesh.mats.buffer,
+    mesh.biome.buffer,
     mesh.indices.buffer,
+    trees.buffer,
   ])
 }

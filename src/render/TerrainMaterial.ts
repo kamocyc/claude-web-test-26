@@ -3,7 +3,9 @@ import { SEA_LEVEL } from '../world/constants'
 
 const COMMON_VERT = /* glsl */ `
 attribute vec4 matw;
+attribute vec2 abiome;
 varying vec4 vMatW;
+varying vec2 vBiome;
 varying vec3 vWPos;
 varying vec3 vWNormal;
 `
@@ -11,6 +13,7 @@ varying vec3 vWNormal;
 const COMMON_FRAG = /* glsl */ `
 uniform sampler2D uNoise;
 varying vec4 vMatW;
+varying vec2 vBiome;
 varying vec3 vWPos;
 varying vec3 vWNormal;
 
@@ -35,10 +38,15 @@ vec4 n3 = triSample(vWPos, bw, 1.0500);  // 近景の細かい粒
 
 float slope = 1.0 - wn.y;
 
-vec3 grass = mix(vec3(0.130, 0.243, 0.086), vec3(0.443, 0.588, 0.216), n1.g);
-grass = mix(grass, vec3(0.271, 0.404, 0.106), n0.r * 0.85);
-grass = mix(grass, vec3(0.451, 0.478, 0.239), smoothstep(0.55, 0.95, n1.a) * 0.55);
-grass *= 0.72 + 0.42 * n2.b;
+// バイオーム：湿潤なほど濃い緑、乾燥するとサバンナ色、寒冷だとくすむ
+float bTemp = vBiome.x;
+float bHumid = vBiome.y;
+vec3 grassBase = mix(vec3(0.435, 0.412, 0.192), vec3(0.129, 0.259, 0.086), smoothstep(0.22, 0.78, bHumid));
+grassBase = mix(grassBase, vec3(0.227, 0.322, 0.216), smoothstep(0.46, 0.14, bTemp));
+vec3 grass = mix(grassBase * 0.70, grassBase * 1.55, n1.g);
+grass = mix(grass, grassBase * vec3(1.12, 1.02, 0.72), n0.r * 0.7);
+grass = mix(grass, vec3(0.451, 0.478, 0.239), smoothstep(0.62, 0.96, n1.a) * 0.4);
+grass *= 0.76 + 0.38 * n2.b;
 grass *= 0.86 + 0.28 * n3.g;
 
 vec3 dirt = mix(vec3(0.216, 0.145, 0.090), vec3(0.494, 0.373, 0.235), n1.r);
@@ -60,8 +68,10 @@ vec4 mw = vMatW;
 mw /= max(1e-4, mw.x + mw.y + mw.z + mw.w);
 vec3 col = grass * mw.x + dirt * mw.y + rock * mw.z + sand * mw.w;
 
-// 高所かつ平坦なところに雪
-float snow = smoothstep(64.0, 96.0, vWPos.y + n0.r * 18.0 - 9.0) * smoothstep(0.60, 0.22, slope);
+// 高所、または寒冷バイオームの平坦なところに雪
+float altSnow = smoothstep(62.0, 98.0, vWPos.y + n0.r * 20.0 - 10.0);
+float coldSnow = smoothstep(0.32, 0.10, bTemp) * smoothstep(-1.0, 12.0, vWPos.y);
+float snow = max(altSnow, coldSnow) * smoothstep(0.62, 0.20, slope);
 col = mix(col, vec3(0.870, 0.910, 0.965) * (0.88 + 0.16 * n2.b), snow);
 
 // 水面下は濡れて暗く、青みを帯びる
@@ -98,6 +108,7 @@ export function createTerrainMaterial(noiseTex: THREE.Texture): THREE.MeshStanda
         '#include <begin_vertex>',
         `#include <begin_vertex>
         vMatW = matw;
+        vBiome = abiome;
         vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
         vWNormal = normalize(mat3(modelMatrix) * objectNormal);`,
       )
