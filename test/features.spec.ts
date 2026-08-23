@@ -154,6 +154,32 @@ test.describe('採掘量', () => {
   })
 })
 
+/** 中心 c から +x 方向へ 0..6 m の地表の高さ。 */
+async function profile(
+  page: Page,
+  c: { x: number; y: number; z: number },
+  span = 14,
+): Promise<number[]> {
+  return page.evaluate(
+    ([p, up]) => {
+      const s = window.__smooth!
+      const out: number[] = []
+      for (let dx = 0; dx <= 6; dx++) {
+        let h = -99
+        for (let y = p.y + up; y > p.y - 12; y -= 0.2) {
+          if (s.density(p.x + dx, y, p.z) > 0) {
+            h = y
+            break
+          }
+        }
+        out.push(h)
+      }
+      return out
+    },
+    [c, span] as const,
+  )
+}
+
 /** 中心 c のまわりの密度を格子状に読む。 */
 async function probe(page: Page, c: { x: number; y: number; z: number }): Promise<number[]> {
   return page.evaluate((p) => {
@@ -266,27 +292,9 @@ test.describe('土砂', () => {
     await page.waitForTimeout(400)
 
     const c = await page.evaluate(() => window.__smooth!.state())
-    /** 中心から +x 方向の地表の高さ。 */
-    const profile = () =>
-      page.evaluate((p) => {
-        const s = window.__smooth!
-        const out: number[] = []
-        for (let dx = 0; dx <= 6; dx++) {
-          let h = -99
-          for (let y = p.y + 8; y > p.y - 10; y -= 0.2) {
-            if (s.density(p.x + dx, y, p.z) > 0) {
-              h = y
-              break
-            }
-          }
-          out.push(h)
-        }
-        return out
-      }, c)
-
-    const before = await profile()
+    const before = await profile(page, c)
     await click(page, 2, 900)
-    const after = await profile()
+    const after = await profile(page, c)
 
     // ブラシ半径の上限は 3.5 m。その外側が持ち上がっていれば「崩れて広がった」
     expect(after[5], `4〜5m 先が持ち上がっていない before=${before[5]} after=${after[5]}`).toBeGreaterThan(
@@ -296,5 +304,38 @@ test.describe('土砂', () => {
     for (let i = 0; i < before.length; i++) {
       expect(after[i], `${i}m の地面が下がった`).toBeGreaterThan(before[i] - 0.25)
     }
+  })
+})
+
+test.describe('崩落', () => {
+  test('積んだ山を掘ると、ブラシの外まで崩れてくる', async ({ page }) => {
+    await start(page)
+    await lookDown(page)
+    await page.evaluate(() => {
+      window.__smooth!.giveMaterial(1, 20000)
+      window.__smooth!.setBrushRadius(3.5)
+    })
+    await page.keyboard.press('Digit2') // 土
+    await page.waitForTimeout(400)
+
+    // 飛行して真下に土を積む
+    await page.keyboard.press('Space')
+    await page.keyboard.press('Space')
+    await page.waitForTimeout(400)
+    const c = await page.evaluate(() => window.__smooth!.state())
+    for (let i = 0; i < 5; i++) await click(page, 2, 500)
+
+    const before = await profile(page, c)
+    expect(before[0], '山が積み上がっていない').toBeGreaterThan(c.y - 6)
+
+    // 山の天辺を掘る。ブラシ半径は 2.5 m なので 4〜5 m 先には届かない
+    await page.evaluate(() => window.__smooth!.setBrushRadius(2.5))
+    await click(page, 0, 600)
+    const after = await profile(page, c)
+
+    expect(
+      after[4],
+      `ブラシの外が崩れてこない before=${before[4]} after=${after[4]}`,
+    ).toBeLessThan(before[4] - 0.15)
   })
 })

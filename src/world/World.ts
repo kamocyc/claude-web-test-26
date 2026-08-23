@@ -4,7 +4,9 @@ import {
   CHUNK_Y_MAX,
   CHUNK_Y_MIN,
   GRID,
+  MAT_DIRT,
   MAT_NONE,
+  MAT_SAND,
   PAD,
   VOXEL_SIZE,
   WORLD_MIN_Y,
@@ -14,7 +16,7 @@ import {
 import { DensityField } from './density'
 import { Chunk, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
 import type { EditMap } from './Chunk'
-import { applyBrush, applyPileBrush, applySmoothBrush } from './edits'
+import { applyBrush, applySmoothBrush, isLooseMaterial, settleLoose } from './edits'
 import type { BrushBounds, BrushMode, BrushShape } from './edits'
 import { TREE_CELL, TREE_STRIDE, treeCellKey } from './vegetation'
 import { WorkerPool } from './WorkerPool'
@@ -282,65 +284,94 @@ export class World {
     mode: BrushMode,
     material: number,
   ): BrushBounds | null {
-    return this.finishEdit(
-      applyBrush(
-        x,
-        y,
-        z,
-        shape,
-        mode,
-        material,
-        this.readD,
-        this.readMat,
-        this.writeCorner,
-        WORLD_MIN_Y + 2,
-        WORLD_MAX_Y - 2,
-      ),
+    const bounds = applyBrush(
+      x,
+      y,
+      z,
+      shape,
+      mode,
+      material,
+      this.readD,
+      this.readMat,
+      this.writeCorner,
+      WORLD_MIN_Y + 2,
+      WORLD_MAX_Y - 2,
     )
+    // 崩すのは、緩い土砂に触ったとき・粒状の素材を置いたとき・
+    // 土や砂の自然地形を掘ったときだけ。岩場や草地の掘削は今までどおりの負荷で済む。
+    const needsSettle =
+      bounds.looseTouched > 0 ||
+      (mode === 'place' && isLooseMaterial(material)) ||
+      (mode === 'dig' && this.naturalLoose(Math.round(x), Math.round(z), y) !== MAT_NONE)
+    if (needsSettle) this.settle(x, y, z, shape.ex, shape.ey, shape.ez, bounds)
+    return this.finishEdit(bounds)
   }
 
-  /** 粒状の素材を盛る。落ちて安息角の山になる。何も変化しなければ null。 */
-  applyPile(
+  /**
+   * 自然地形（プレイヤーが置いたのではない部分）の素材が粒状かどうか。
+   * 重みを混ぜて安息角を作ると草地の傾斜が浅くなって逆に崩れやすくなるので、
+   * 土＋砂が十分に優勢なときだけ、優勢な方の素材 ID を返す。
+   */
+  private readonly naturalLoose = (gx: number, gz: number, y: number): number => {
+    this.field.surfaceSample(gx, y, gz, 1, this.matScratch, 0)
+    const dirt = this.matScratch[MAT_DIRT]
+    const sand = this.matScratch[MAT_SAND]
+    if (dirt + sand < 0.6) return MAT_NONE
+    return sand > dirt ? MAT_SAND : MAT_DIRT
+  }
+
+  private readonly matScratch = new Float32Array(6)
+
+  /** 緩い土砂を崩し、その影響範囲を `bounds` に取り込む。 */
+  private settle(
     x: number,
     y: number,
     z: number,
-    shape: BrushShape,
-    material: number,
-    repose: number,
-  ): BrushBounds | null {
-    return this.finishEdit(
-      applyPileBrush(
-        x,
-        y,
-        z,
-        shape,
-        material,
-        repose,
-        this.readD,
-        this.readMat,
-        this.writeCorner,
-        WORLD_MIN_Y + 2,
-        WORLD_MAX_Y - 2,
-      ),
+    ex: number,
+    ey: number,
+    ez: number,
+    bounds: BrushBounds,
+  ): void {
+    const s = settleLoose(
+      x,
+      y,
+      z,
+      ex,
+      ey,
+      ez,
+      this.readD,
+      this.readMat,
+      this.naturalLoose,
+      this.writeCorner,
+      WORLD_MIN_Y + 2,
+      WORLD_MAX_Y - 2,
     )
+    if (s.touched === 0) return
+    bounds.touched += s.touched
+    bounds.minX = Math.min(bounds.minX, s.minX)
+    bounds.minY = Math.min(bounds.minY, s.minY)
+    bounds.minZ = Math.min(bounds.minZ, s.minZ)
+    bounds.maxX = Math.max(bounds.maxX, s.maxX)
+    bounds.maxY = Math.max(bounds.maxY, s.maxY)
+    bounds.maxZ = Math.max(bounds.maxZ, s.maxZ)
   }
 
   /** 凸凹をならす。何も変化しなければ null。 */
   applySmooth(x: number, y: number, z: number, radius: number, strength: number): BrushBounds | null {
-    return this.finishEdit(
-      applySmoothBrush(
-        x,
-        y,
-        z,
-        radius,
-        strength,
-        this.readD,
-        this.readMat,
-        this.writeCorner,
-        WORLD_MIN_Y + 2,
-        WORLD_MAX_Y - 2,
-      ),
+    const bounds = applySmoothBrush(
+      x,
+      y,
+      z,
+      radius,
+      strength,
+      this.readD,
+      this.readMat,
+      this.writeCorner,
+      WORLD_MIN_Y + 2,
+      WORLD_MAX_Y - 2,
     )
+    if (bounds.looseTouched > 0) this.settle(x, y, z, radius, radius, radius, bounds)
+    return this.finishEdit(bounds)
   }
 
   private readonly readD = (gx: number, gy: number, gz: number): number =>

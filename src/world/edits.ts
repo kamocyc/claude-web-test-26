@@ -1,4 +1,4 @@
-import { VOXEL_SIZE } from './constants'
+import { MATERIAL_COUNT, MATERIAL_INFO, VOXEL_SIZE } from './constants'
 import { MAT_NONE } from './constants'
 
 export type BrushMode = 'dig' | 'place'
@@ -21,7 +21,26 @@ export interface BrushBounds {
   cleared: number
   /** 取り除いた切れ端の格子点の数。 */
   fragmentsRemoved: number
+  /** 読み込み範囲にあった「置いた土砂」の格子点の数。0 なら崩す処理を省ける。 */
+  looseTouched: number
 }
+
+/** 素材 ID → tan(安息角)。0 は崩れない素材。 */
+const LOOSE_TAN = new Float32Array(MATERIAL_COUNT)
+for (const m of MATERIAL_INFO) {
+  LOOSE_TAN[m.id] = m.repose > 0 ? Math.tan((m.repose * Math.PI) / 180) : 0
+}
+
+/** その素材が粒状（盛ると崩れる）かどうか。 */
+export function isLooseMaterial(mat: number): boolean {
+  return mat < MATERIAL_COUNT && LOOSE_TAN[mat] > 0
+}
+
+/**
+ * 自然地形（プレイヤーが置いたのではない格子点）の素材を返す。
+ * 粒状なら素材 ID、そうでなければ {@link MAT_NONE}。
+ */
+export type NaturalLooseReader = (gx: number, gz: number, y: number) => number
 
 /**
  * ブラシの形。中心を原点とするローカル座標（格子単位）の符号付き距離で表す。
@@ -180,7 +199,20 @@ function emptyBounds(): BrushBounds {
     solidified: 0,
     cleared: 0,
     fragmentsRemoved: 0,
+    looseTouched: 0,
   }
+}
+
+/** `b` の影響範囲を `a` に取り込む。体積の集計は `a` のものを残す。 */
+function mergeBounds(a: BrushBounds, b: BrushBounds): void {
+  if (b.touched === 0) return
+  a.touched += b.touched
+  if (b.minX < a.minX) a.minX = b.minX
+  if (b.minY < a.minY) a.minY = b.minY
+  if (b.minZ < a.minZ) a.minZ = b.minZ
+  if (b.maxX > a.maxX) a.maxX = b.maxX
+  if (b.maxY > a.maxY) a.maxY = b.maxY
+  if (b.maxZ > a.maxZ) a.maxZ = b.maxZ
 }
 
 /** 走査範囲。ブラシの半サイズ + REACH_PAD を格子に切り上げたもの。 */
@@ -312,9 +344,12 @@ export function applyBrush(
         const m = readMat(gx, gy, gz)
         bufOrigD[idx] = cur
         bufOrigMat[idx] = m
+        if (cur > 0 && isLooseMaterial(m)) bounds.looseTouched++
         const next = place ? Math.max(cur, SURFACE_BIAS - s) : Math.min(cur, s)
         bufD[idx] = next
-        bufMat[idx] = place && next > 0 && s < 0.5 ? material : m
+        // 素材を刻むのは新しく固体になった格子点だけ。
+        // 既にあった地形まで「置いた土砂」に化けると、山肌ごと崩れてしまう。
+        bufMat[idx] = place && next > 0 && s < 0.5 && cur <= 0 ? material : m
       }
     }
   }
@@ -418,6 +453,7 @@ export function applySmoothBrush(
         }
         const cur = readD(i0 + i, j0 + j, k0 + k)
         const m = readMat(i0 + i, j0 + j, k0 + k)
+        if (cur > 0 && isLooseMaterial(m)) bounds.looseTouched++
         bufD[idx] = cur
         bufOrigD[idx] = cur
         bufMat[idx] = m
@@ -467,10 +503,23 @@ export function applySmoothBrush(
 }
 
 /** 土砂が横に広がれる距離（m）。これより外へは流れない。 */
-const PILE_SPREAD = 8
+const PILE_SPREAD = 6
 
-/** ブラシの底からこの深さまで落ちる。 */
-const PILE_FALL = 6
+/** ブラシの底からこの深さまで落ちる。空洞がある柱しか深く読まない。 */
+const PILE_FALL = 48
+
+/** ブラシより上にある地面をこの高さまで遡って探す（山の下を掘ったとき用）。 */
+const PILE_RISE = 16
+
+/** 自然地形が緩いとみなされる、地表からの深さ（m）。 */
+const NATURAL_SKIN = 2.5
+
+/**
+ * 自然地形が緩いとみなされる、編集点からの水平距離（m）。
+ * 「掘った周辺」だけを崩すための制限。置いた土砂は {@link PILE_SPREAD} まで流れる。
+ * ここを広げると、砂地では region 全体が緩くなって走査が一気に増える。
+ */
+const NATURAL_RADIUS = 3
 
 /** 安息角に達するまでの緩和回数と 1 回あたりの移動割合。 */
 const PILE_PASSES = 64
@@ -483,43 +532,55 @@ const COL_BLOCKED = 2
 // 柱ごとの作業配列
 let colBase: Float32Array = new Float32Array(0)
 let colTop: Float32Array = new Float32Array(0)
+let colOldTop: Float32Array = new Float32Array(0)
+let colOldLo: Float32Array = new Float32Array(0)
+let colTan: Float32Array = new Float32Array(0)
+let colMat: Uint8Array = new Uint8Array(0)
 let colState: Uint8Array = new Uint8Array(0)
-const scratchSpan: Span = { lo: 0, hi: 0 }
 
 function ensureColumns(n: number): void {
   if (colBase.length >= n) return
   colBase = new Float32Array(n)
   colTop = new Float32Array(n)
+  colOldTop = new Float32Array(n)
+  colOldLo = new Float32Array(n)
+  colTan = new Float32Array(n)
+  colMat = new Uint8Array(n)
   colState = new Uint8Array(n)
 }
 
 /**
- * 粒状の素材（土・砂）を盛る。ブラシの形に固まらず、**落ちて安息角の山になる**。
+ * 緩い土砂を崩して安息角の斜面に落ち着かせる。
  *
- * 密度場を直接崩すのではなく、柱ごとの高さ場に置き換えて解く:
+ * ブラシとは無関係で、入力は範囲だけ。**何が緩いかは密度場と素材 ID から自分で読む**ので、
+ * 盛った瞬間だけでなく「積んだ山の下を掘った」ときにも同じ処理で崩れる。
+ * 置いた土砂の素材 ID は編集差分としてそのまま保存されているので、
+ * 「どの土砂がまだ緩いか」のために新しい状態を持つ必要はない。
  *
- * 1. ブラシの footprint の各柱について、いまの地表の高さ `base` を求める
- *    （上から下へ最初に固体になるところ。線形補間するので段差にならない）
- * 2. ブラシがその柱を貫く長さのうち **地表より上の分** を、その柱に積む
- *    （地表より下はもともと固体なので、置いても何も増えない）
- * 3. 隣り合う柱の高さ差が `tan(安息角)` を超えているあいだ、超過分を隣へ流す。
- *    流せるのは今回積んだ分だけなので、元の地形は削れない
- * 4. 柱ごとに、元の地表の 1 つ下から新しい地表までを密度場に union する
+ * 緩いとみなすもの:
+ * - プレイヤーが置いた土・砂（素材 ID が粒状）。深さの制限なし
+ * - 自然地形のうち、地表素材が土・砂寄りの柱の **上から {@link NATURAL_SKIN} まで**。
+ *   ワールド全体を不安定にしないため、この関数を呼んだ範囲の中だけの話になる
  *
- * 落下は 1 の時点で織り込まれている。空中に置いても、その柱の地表の上に積まれる。
- * 地表の探索は必要になった柱だけ遅延して行う（山が届かない柱は読まない）。
+ * 柱ごとに解く:
+ * 1. 上端の格子点を探す（ブラシより上に地面が続いていれば遡る）
+ * 2. そこから下へ「緩い」格子点が続く範囲を切り出す
+ * 3. その下が空気なら、さらに下の地面まで落とす
+ * 4. 隣との高さ差が tan(安息角) を超える分だけ隣へ流す（流せるのは緩い分だけ）
+ * 5. 動いた柱だけ密度場に書き戻す。非緩固体は union しかしないので地形は削れない
  *
- * @param repose 安息角（度）。土 38°、砂 32° 程度。
+ * @param ex,ey,ez 中心からの半サイズ（格子単位）。ここに {@link PILE_SPREAD} を足した範囲を見る。
  */
-export function applyPileBrush(
+export function settleLoose(
   wx: number,
   wy: number,
   wz: number,
-  shape: BrushShape,
-  material: number,
-  repose: number,
+  ex: number,
+  ey: number,
+  ez: number,
   readD: CornerReader,
   readMat: CornerMatReader,
+  readNaturalLoose: NaturalLooseReader,
   write: CornerWriter,
   clampMinY: number,
   clampMaxY: number,
@@ -529,16 +590,18 @@ export function applyPileBrush(
   const cz = wz / VOXEL_SIZE
   const bounds = emptyBounds()
 
-  const rx = shape.ex + PILE_SPREAD / VOXEL_SIZE
-  const rz = shape.ez + PILE_SPREAD / VOXEL_SIZE
+  const rx = ex + PILE_SPREAD / VOXEL_SIZE
+  const rz = ez + PILE_SPREAD / VOXEL_SIZE
   const i0 = Math.floor(cx - rx)
   const i1 = Math.ceil(cx + rx)
   const k0 = Math.floor(cz - rz)
   const k1 = Math.ceil(cz + rz)
-  const yTop = Math.min(Math.ceil(clampMaxY / VOXEL_SIZE), Math.ceil(cy + shape.ey) + 1)
+  const yLimit = Math.ceil(clampMaxY / VOXEL_SIZE)
+  // ブラシより上から始めること。掘って宙に浮いた庇を見落とさないために必要。
+  const yTop = Math.min(yLimit, Math.ceil(cy + ey) + 2)
   const yBottom = Math.max(
     Math.floor(clampMinY / VOXEL_SIZE),
-    Math.floor(cy - shape.ey - PILE_FALL / VOXEL_SIZE),
+    Math.floor(cy - ey - PILE_FALL / VOXEL_SIZE),
   )
   const w = i1 - i0 + 1
   const d = k1 - k0 + 1
@@ -547,48 +610,158 @@ export function applyPileBrush(
   ensureColumns(n)
   colState.fill(COL_UNSCANNED, 0, n)
 
-  /** 柱の地表を測る。天井まで詰まっていれば壁として扱う。 */
+  /** 柱の状態を測る。読むのは必要になった柱だけ。 */
   function scan(idx: number): boolean {
     if (colState[idx] !== COL_UNSCANNED) return colState[idx] === COL_OPEN
     const i = idx % w
     const gx = i0 + i
     const gz = k0 + (idx - i) / w
-    let prev = readD(gx, yTop, gz)
-    if (prev > 0) {
-      colState[idx] = COL_BLOCKED
-      return false
+
+    // --- 1. 上端の格子点 ---
+    // yTop が地面の中なら空気に出るまで遡る。急斜面では大半の柱がこれに当たるので、
+    // 1 マスずつではなく指数的に跳ばしてから二分探索で詰める。
+    let yc = yTop
+    let air = readD(gx, yc, gz)
+    if (air > 0) {
+      let solidY = yTop
+      let airY = -1
+      for (let step = 1; step <= PILE_RISE; step *= 2) {
+        const y = Math.min(yLimit, yTop + step)
+        const v = readD(gx, y, gz)
+        if (v <= 0) {
+          airY = y
+          air = v
+          break
+        }
+        solidY = y
+        if (y >= yLimit) break
+      }
+      if (airY < 0) {
+        colState[idx] = COL_BLOCKED // 遡っても地面から抜けない
+        return false
+      }
+      while (airY - solidY > 1) {
+        const mid = (solidY + airY) >> 1
+        const v = readD(gx, mid, gz)
+        if (v > 0) solidY = mid
+        else {
+          airY = mid
+          air = v
+        }
+      }
+      yc = airY
     }
-    let base = yBottom
-    for (let y = yTop - 1; y >= yBottom; y--) {
+    let topY = yBottom - 1
+    let topD = 0
+    for (let y = yc - 1; y >= yBottom; y--) {
       const cur = readD(gx, y, gz)
       if (cur > 0) {
-        base = y + cur / (cur - prev)
+        topY = y
+        topD = cur
         break
       }
-      prev = cur
+      air = cur
     }
+    if (topY < yBottom) {
+      colState[idx] = COL_BLOCKED // 何も無い柱
+      return false
+    }
+    const top = topY + topD / (topD - air)
+
     colState[idx] = COL_OPEN
+    colOldTop[idx] = top
+    colOldLo[idx] = top
+    colBase[idx] = top
+    colTop[idx] = top
+    colTan[idx] = 0
+    colMat[idx] = MAT_NONE
+
+    // --- 2. 緩い層を切り出す ---
+    // 自然地形が緩いのは編集点のすぐ周りだけ
+    const nearEdit =
+      Math.abs(gx - cx) <= ex + NATURAL_RADIUS / VOXEL_SIZE &&
+      Math.abs(gz - cz) <= ez + NATURAL_RADIUS / VOXEL_SIZE
+    let natural = -1 // 自然素材の判定は柱あたり 1 回だけ
+    let naturalTop = Infinity
+    let lo = topY + 1
+    let loD = 0
+    let tan = 0
+    let mat = MAT_NONE
+    for (let y = topY; y >= yBottom; y--) {
+      const dv = y === topY ? topD : readD(gx, y, gz)
+      if (dv <= 0) break
+      const m = readMat(gx, y, gz)
+      let t: number
+      let id: number
+      if (isLooseMaterial(m)) {
+        t = LOOSE_TAN[m]
+        id = m
+      } else {
+        // 自然地形は編集点の近く・地表から NATURAL_SKIN までしか緩くない
+        if (!nearEdit) break
+        if (naturalTop === Infinity) naturalTop = y
+        if (naturalTop - y > NATURAL_SKIN) break
+        if (natural < 0) natural = readNaturalLoose(gx, gz, top)
+        if (natural === MAT_NONE) break
+        t = LOOSE_TAN[natural]
+        id = natural
+      }
+      if (t <= 0) break
+      // 混ざっていたら一番寝る素材に合わせる
+      if (tan === 0 || t < tan) tan = t
+      if (mat === MAT_NONE) mat = id
+      lo = y
+      loD = dv
+    }
+    if (lo > topY) return true // 緩い層なし。受け取る側にはなれる
+
+    // --- 3. 下端と落下先 ---
+    const belowD = readD(gx, lo - 1, gz)
+    let bottom: number
+    let base: number
+    if (belowD <= 0) {
+      bottom = lo - 1 + -belowD / (loD - belowD)
+      // 空気の上に乗っている＝落ちる。下の地面を探す
+      let prev = belowD
+      let ground = yBottom - 1
+      for (let y = lo - 2; y >= yBottom; y--) {
+        const cur = readD(gx, y, gz)
+        if (cur > 0) {
+          ground = y + cur / (cur - prev)
+          break
+        }
+        prev = cur
+      }
+      if (ground < yBottom) {
+        colState[idx] = COL_BLOCKED // 落ちる先が見つからない。動かさない
+        return false
+      }
+      base = ground
+    } else {
+      // 非緩固体の上に乗っている。境界は格子の中間とみなす
+      bottom = lo - 0.5
+      base = bottom
+    }
+
+    colOldLo[idx] = bottom
     colBase[idx] = base
-    colTop[idx] = base
+    colTop[idx] = base + (top - bottom)
+    colTan[idx] = tan
+    colMat[idx] = mat
     return true
   }
 
-  // --- 1〜2. ブラシが当たる柱だけ測って、地表より上の分を積む ---
+  // ブラシが当たった柱から始める
   for (let k = 0; k < d; k++) {
-    const dz = k0 + k - cz
     for (let i = 0; i < w; i++) {
-      const span = shape.span(i0 + i - cx, dz, scratchSpan)
-      if (span.hi <= span.lo) continue
-      const idx = i + k * w
-      if (!scan(idx)) continue
-      const hi = cy + span.hi
-      const lo = Math.max(colBase[idx], cy + span.lo)
-      if (hi > lo) colTop[idx] = colBase[idx] + (hi - lo)
+      const dx = i0 + i - cx
+      const dz = k0 + k - cz
+      if (Math.abs(dx) > ex + 1 || Math.abs(dz) > ez + 1) continue
+      scan(i + k * w)
     }
   }
 
-  // --- 3. 安息角まで崩す ---
-  const maxStep = Math.tan((repose * Math.PI) / 180) * VOXEL_SIZE
+  // --- 4. 安息角まで崩す ---
   for (let pass = 0; pass < PILE_PASSES; pass++) {
     let moved = 0
     for (let k = 0; k < d; k++) {
@@ -597,6 +770,7 @@ export function applyPileBrush(
         if (colState[idx] !== COL_OPEN) continue
         let loose = colTop[idx] - colBase[idx]
         if (loose <= 1e-4) continue
+        const maxStep = colTan[idx] * VOXEL_SIZE
         for (let dir = 0; dir < 4; dir++) {
           const ni = i + (dir === 0 ? 1 : dir === 1 ? -1 : 0)
           const nk = k + (dir === 2 ? 1 : dir === 3 ? -1 : 0)
@@ -609,6 +783,11 @@ export function applyPileBrush(
           if (m <= 1e-5) continue
           colTop[idx] -= m
           colTop[nIdx] += m
+          // 受け取った側は、流れてきた土砂の性質を引き継ぐ
+          if (colTan[nIdx] === 0) {
+            colTan[nIdx] = colTan[idx]
+            colMat[nIdx] = colMat[idx]
+          }
           loose -= m
           moved += m
           if (loose <= 1e-4) break
@@ -618,28 +797,36 @@ export function applyPileBrush(
     if (moved < 1e-3) break
   }
 
-  // --- 4. 柱ごとに密度場へ union する ---
-  const yLimit = Math.ceil(clampMaxY / VOXEL_SIZE)
+  // --- 5. 動いた柱だけ書き戻す ---
   for (let k = 0; k < d; k++) {
     const gz = k0 + k
     for (let i = 0; i < w; i++) {
       const idx = i + k * w
       if (colState[idx] !== COL_OPEN) continue
-      const base = colBase[idx]
       const top = colTop[idx]
-      if (top - base < 1e-3) continue
+      const base = colBase[idx]
+      const oldTop = colOldTop[idx]
+      const oldLo = colOldLo[idx]
+      // 平衡状態なら 1 件も書かない（冪等。編集差分が無駄に膨らまない）
+      if (Math.abs(top - oldTop) < 1e-3 && Math.abs(base - oldLo) < 1e-3) continue
+
       const gx = i0 + i
-      // 元の地表の 1 つ下から新しい地表の 1 つ上までを、半空間 `top - y` と union する。
-      // 範囲を切っているので、下にある洞窟は埋まらない。
-      const y0 = Math.max(yBottom, Math.floor(base))
-      const y1 = Math.min(yLimit, Math.ceil(top))
+      const mat = colMat[idx]
+      const y0 = Math.max(yBottom, Math.floor(Math.min(base, oldLo)))
+      const y1 = Math.min(yLimit, Math.ceil(Math.max(top, oldTop)))
       for (let y = y0; y <= y1; y++) {
         const cur = readD(gx, y, gz)
-        const next = Math.max(cur, top - y)
-        if (next === cur) continue
-        write(gx, y, gz, next, next > 0 ? material : readMat(gx, y, gz))
+        const curMat = readMat(gx, y, gz)
+        const target = top - y
+        // 元から緩かった格子点と空気は作り直す。それ以外の固体は union しかしない
+        const wasLoose = cur <= 0 || (y > oldLo && y <= oldTop)
+        const next = wasLoose ? target : Math.max(cur, target)
+        const nextMat = wasLoose ? (target > 0 ? mat : MAT_NONE) : curMat
+        if (next === cur && nextMat === curMat) continue
+        write(gx, y, gz, next, nextMat)
         bounds.touched++
         if (cur <= 0 && next > 0) bounds.solidified++
+        else if (cur > 0 && next <= 0) bounds.cleared++
         if (gx < bounds.minX) bounds.minX = gx
         if (y < bounds.minY) bounds.minY = y
         if (gz < bounds.minZ) bounds.minZ = gz
@@ -651,6 +838,56 @@ export function applyPileBrush(
   }
 
   return bounds
+}
+
+/**
+ * 粒状の素材を盛る。普通に union してから {@link settleLoose} を掛けるだけ。
+ * 置いた格子点には素材 ID が刻まれるので、あとから掘っても同じように崩れる。
+ */
+export function applyPileBrush(
+  wx: number,
+  wy: number,
+  wz: number,
+  shape: BrushShape,
+  material: number,
+  readD: CornerReader,
+  readMat: CornerMatReader,
+  readNaturalLoose: NaturalLooseReader,
+  write: CornerWriter,
+  clampMinY: number,
+  clampMaxY: number,
+): BrushBounds {
+  const placed = applyBrush(
+    wx,
+    wy,
+    wz,
+    shape,
+    'place',
+    material,
+    readD,
+    readMat,
+    write,
+    clampMinY,
+    clampMaxY,
+  )
+  mergeBounds(
+    placed,
+    settleLoose(
+      wx,
+      wy,
+      wz,
+      shape.ex,
+      shape.ey,
+      shape.ez,
+      readD,
+      readMat,
+      readNaturalLoose,
+      write,
+      clampMinY,
+      clampMaxY,
+    ),
+  )
+  return placed
 }
 
 const UNVISITED = 0

@@ -576,14 +576,10 @@ async function boot(): Promise<void> {
           editCooldown = 0.5
         } else {
           const shape = kind === 'box' ? boxBrush(half, half, half) : sphereBrush(radius)
+          // 粒状かどうかは素材 ID から決まるので、盛る側の呼び分けは要らない
           const bounds = smoothing
             ? world.applySmooth(cx, cy, cz, brushRadius, 1)
-            : dig
-              ? world.applyBrush(cx, cy, cz, shape, 'dig', MATERIAL_INFO[slot].id)
-              : repose > 0
-                ? // 粒状の素材は形のまま固まらず、落ちて安息角の山になる
-                  world.applyPile(cx, cy, cz, shape, MATERIAL_INFO[slot].id, repose)
-                : world.applyBrush(cx, cy, cz, shape, 'place', MATERIAL_INFO[slot].id)
+            : world.applyBrush(cx, cy, cz, shape, dig ? 'dig' : 'place', MATERIAL_INFO[slot].id)
           if (bounds) {
             if (smoothing) {
               // 収支なし
