@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Smooth World</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0f14; }
+      body {
+        font-family: ui-sans-serif, system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif;
+        color: #eef3f8;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      canvas { display: block; }
+
+      #hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+
+      #crosshair {
+        position: absolute; left: 50%; top: 50%;
+        width: 18px; height: 18px; margin: -9px 0 0 -9px;
+        opacity: .8;
+      }
+      #crosshair::before, #crosshair::after {
+        content: ''; position: absolute; background: #fff;
+        box-shadow: 0 0 2px rgba(0,0,0,.9);
+      }
+      #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
+      #crosshair::after { top: 8px; left: 0; height: 2px; width: 18px; }
+
+      #stats {
+        position: absolute; left: 12px; top: 12px;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: rgba(10,14,20,.5); padding: 8px 10px; border-radius: 8px;
+        backdrop-filter: blur(6px); white-space: pre;
+        border: 1px solid rgba(255,255,255,.08);
+      }
+
+      #hotbar {
+        position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
+        display: flex; gap: 8px;
+      }
+      .slot {
+        width: 58px; height: 58px; border-radius: 10px;
+        background: rgba(10,14,20,.5); border: 1px solid rgba(255,255,255,.14);
+        backdrop-filter: blur(6px);
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 3px; position: relative;
+      }
+      .slot.active { border-color: #ffd479; box-shadow: 0 0 0 2px rgba(255,212,121,.35); }
+      .slot .swatch { width: 24px; height: 24px; border-radius: 6px; border: 1px solid rgba(0,0,0,.35); }
+      .slot .label { font-size: 10px; opacity: .85; }
+      .slot .key { position: absolute; top: 2px; left: 5px; font-size: 9px; opacity: .5; }
+
+      #brush {
+        position: absolute; left: 50%; bottom: 90px; transform: translateX(-50%);
+        font: 12px ui-monospace, monospace; opacity: .8;
+        text-shadow: 0 1px 3px rgba(0,0,0,.8);
+      }
+
+      #overlay {
+        position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+        background: radial-gradient(120% 120% at 50% 30%, rgba(24,36,52,.82), rgba(6,9,13,.94));
+        pointer-events: auto; text-align: center; padding: 24px;
+      }
+      #overlay.hidden { display: none; }
+      #overlay .card { max-width: 520px; }
+      #overlay h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: .02em; font-weight: 650; }
+      #overlay .sub { opacity: .7; margin-bottom: 22px; font-size: 14px; }
+      #overlay table { margin: 0 auto 22px; border-collapse: collapse; font-size: 13px; }
+      #overlay td { padding: 3px 10px; text-align: left; }
+      #overlay td:first-child {
+        text-align: right; opacity: .95;
+        font-family: ui-monospace, monospace; color: #ffd479; white-space: nowrap;
+      }
+      #overlay td:last-child { opacity: .8; }
+      button {
+        font: inherit; font-size: 14px; padding: 10px 22px; border-radius: 999px;
+        border: 1px solid rgba(255,255,255,.18); background: #ffd479; color: #16202c;
+        cursor: pointer; font-weight: 600;
+      }
+      button.ghost { background: transparent; color: #eef3f8; font-weight: 400; }
+      #overlay .row { display: flex; gap: 10px; justify-content: center; }
+      #loading { font-size: 13px; opacity: .7; margin-top: 16px; height: 1em; }
+    </style>
+  </head>
+  <body>
+    <div id="hud">
+      <div id="crosshair"></div>
+      <div id="stats"></div>
+      <div id="brush"></div>
+      <div id="hotbar"></div>
+      <div id="overlay">
+        <div class="card">
+          <h1>Smooth World</h1>
+          <div class="sub">完全に滑らかな地形を掘り、盛る。</div>
+          <table>
+            <tr><td>W A S D</td><td>移動</td></tr>
+            <tr><td>Space</td><td>ジャンプ / 上昇（飛行中）</td></tr>
+            <tr><td>Space ×2</td><td>飛行モード切替</td></tr>
+            <tr><td>Shift</td><td>ダッシュ / 下降（飛行中）</td></tr>
+            <tr><td>左クリック</td><td>掘る</td></tr>
+            <tr><td>右クリック</td><td>盛る</td></tr>
+            <tr><td>ホイール</td><td>ブラシ半径</td></tr>
+            <tr><td>1 – 4</td><td>設置する素材の選択</td></tr>
+            <tr><td>F3</td><td>ステータス表示</td></tr>
+            <tr><td>Esc</td><td>ポーズ</td></tr>
+          </table>
+          <div class="row">
+            <button id="play">クリックして開始</button>
+            <button id="reset" class="ghost">ワールドをリセット</button>
+          </div>
+          <div id="loading"></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
