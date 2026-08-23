@@ -15,8 +15,8 @@ import { DensityField } from './density'
 import { Chunk, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
 import type { EditMap } from './Chunk'
 import { applySphereBrush } from './edits'
-import type { BrushMode } from './edits'
-import { TREE_STRIDE } from './vegetation'
+import type { BrushBounds, BrushMode } from './edits'
+import { TREE_CELL, TREE_STRIDE, treeCellKey } from './vegetation'
 import { WorkerPool } from './WorkerPool'
 import type { TreePrototype } from '../render/treeMeshes'
 import type { MeshResponse } from './chunk.worker'
@@ -63,6 +63,7 @@ export class World {
   private readonly edits = new Map<string, EditMap>()
   private readonly pending: PendingMesh[] = []
   private readonly heightCache = new Map<number, number>()
+  private readonly chopped = new Set<number>()
   private readonly ringOffsets: Array<[number, number]> = []
 
   private material: THREE.Material | null = null
@@ -116,9 +117,10 @@ export class World {
     for (let cz = cz0; cz <= cz1; cz++) {
       for (let cy = cy0; cy <= cy1; cy++) {
         for (let cx = cx0; cx <= cx1; cx++) {
-          const t = this.chunks.get(chunkKey(cx, cy, cz))?.trunks
-          if (!t) continue
-          for (let i = 0; i < t.length; i += 5) {
+          const chunk = this.chunks.get(chunkKey(cx, cy, cz))
+          const t = chunk?.trunks
+          if (!chunk || !t) continue
+          for (let i = 0; i < chunk.trunkLen; i += 8) {
             const dx = t[i] - x
             const dz = t[i + 2] - z
             if (dx * dx + dz * dz > r2) continue
@@ -271,7 +273,7 @@ export class World {
 
   // ------------------------------------------------------------------ 編集
 
-  /** 球ブラシを適用する。何か変化したら true。 */
+  /** 球ブラシを適用する。何も変化しなければ null。 */
   applyBrush(
     x: number,
     y: number,
@@ -279,7 +281,7 @@ export class World {
     radius: number,
     mode: BrushMode,
     material: number,
-  ): boolean {
+  ): BrushBounds | null {
     const bounds = applySphereBrush(
       x,
       y,
@@ -293,7 +295,7 @@ export class World {
       WORLD_MIN_Y + 2,
       WORLD_MAX_Y - 2,
     )
-    if (bounds.touched === 0) return false
+    if (bounds.touched === 0) return null
 
     // 編集されたコーナーを含むパディング済みグリッドを持つチャンクをすべて作り直す
     const cx0 = ownerChunkCoord(bounds.minX - PAD)
@@ -310,7 +312,7 @@ export class World {
         }
       }
     }
-    return true
+    return bounds
   }
 
   private setEdit(gx: number, gy: number, gz: number, d: number, mat: number): void {
@@ -470,6 +472,7 @@ export class World {
           editIdx: edits ? edits.idx : null,
           editD: edits ? edits.d : null,
           editMat: edits ? edits.mat : null,
+          chopped: this.collectChopped(chunk.cx, chunk.cz),
         },
         priority,
       )
@@ -546,6 +549,9 @@ export class World {
           trees[i + 2],
           proto.trunkRadius * s,
           proto.trunkHeight * s,
+          proto.hitRadius * s,
+          proto.hitHeight * s,
+          t * 65536 + k,
         )
       }
       im.instanceMatrix.needsUpdate = true
@@ -555,6 +561,147 @@ export class World {
       this.treeCount += list.length
     }
     chunk.trunks = new Float32Array(trunks)
+    chunk.trunkLen = trunks.length
+  }
+
+  // ------------------------------------------------------------------ 伐採
+
+  /** 保存されていた伐採状態を復元する。 */
+  setChopped(keys: Iterable<number>): void {
+    this.chopped.clear()
+    for (const k of keys) this.chopped.add(k)
+  }
+
+  get choppedList(): number[] {
+    return [...this.chopped]
+  }
+
+  get choppedCount(): number {
+    return this.chopped.size
+  }
+
+  /** チャンクの範囲にかかる伐採済みセルだけを抜き出す。 */
+  private collectChopped(cx: number, cz: number): Float64Array | null {
+    if (this.chopped.size === 0) return null
+    const x0 = cx * CHUNK_WORLD - 8
+    const x1 = (cx + 1) * CHUNK_WORLD + 8
+    const z0 = cz * CHUNK_WORLD - 8
+    const z1 = (cz + 1) * CHUNK_WORLD + 8
+    const out: number[] = []
+    for (const key of this.chopped) {
+      const cellX = Math.floor(key / 1048576)
+      const cellZ = key - cellX * 1048576 - 524288
+      const wx = cellX * TREE_CELL
+      const wz = cellZ * TREE_CELL
+      if (wx + TREE_CELL < x0 || wx > x1) continue
+      if (wz + TREE_CELL < z0 || wz > z1) continue
+      out.push(key)
+    }
+    return out.length > 0 ? new Float64Array(out) : null
+  }
+
+  /**
+   * 木に照準を合わせているかを調べる。木全体を覆う垂直円柱との交差判定。
+   */
+  raycastTree(
+    ox: number,
+    oy: number,
+    oz: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    maxDist: number,
+    out: TreeHit,
+  ): TreeHit | null {
+    const ex = ox + dx * maxDist
+    const ez = oz + dz * maxDist
+    const cx0 = Math.floor((Math.min(ox, ex) - 3) / CHUNK_WORLD)
+    const cx1 = Math.floor((Math.max(ox, ex) + 3) / CHUNK_WORLD)
+    const cz0 = Math.floor((Math.min(oz, ez) - 3) / CHUNK_WORLD)
+    const cz1 = Math.floor((Math.max(oz, ez) + 3) / CHUNK_WORLD)
+    const ey = oy + dy * maxDist
+    const cy0 = Math.floor((Math.min(oy, ey) - 10) / CHUNK_WORLD)
+    const cy1 = Math.floor((Math.max(oy, ey) + 10) / CHUNK_WORLD)
+
+    let best = Infinity
+    let found = false
+    const a = dx * dx + dz * dz
+    if (a < 1e-8) return null
+
+    for (let cz = cz0; cz <= cz1; cz++) {
+      for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const chunk = this.chunks.get(chunkKey(cx, cy, cz))
+          const t = chunk?.trunks
+          if (!chunk || !t) continue
+          for (let i = 0; i < chunk.trunkLen; i += 8) {
+            const r = t[i + 5]
+            const px = ox - t[i]
+            const pz = oz - t[i + 2]
+            const b = 2 * (px * dx + pz * dz)
+            const c = px * px + pz * pz - r * r
+            const disc = b * b - 4 * a * c
+            if (disc < 0) continue
+            const sq = Math.sqrt(disc)
+            let tt = (-b - sq) / (2 * a)
+            if (tt < 0) tt = (-b + sq) / (2 * a)
+            if (tt < 0 || tt > maxDist || tt >= best) continue
+            const y = oy + dy * tt
+            if (y < t[i + 1] || y > t[i + 1] + t[i + 6]) continue
+            best = tt
+            found = true
+            out.distance = tt
+            out.x = t[i]
+            out.y = t[i + 1]
+            out.z = t[i + 2]
+            out.chunkKey = chunk.key
+            out.index = i
+          }
+        }
+      }
+    }
+    return found ? out : null
+  }
+
+  /**
+   * 木を 1 本切り倒す。InstancedMesh からは即座に取り除き、
+   * セルキーを記録して再メッシュ後も生えてこないようにする。
+   */
+  chopTree(hit: TreeHit): boolean {
+    const chunk = this.chunks.get(hit.chunkKey)
+    const t = chunk?.trunks
+    if (!chunk || !t || hit.index >= chunk.trunkLen) return false
+
+    const packed = t[hit.index + 7]
+    const meshIndex = Math.floor(packed / 65536)
+    const instanceIndex = packed - meshIndex * 65536
+    const im = chunk.treeMeshes[meshIndex]
+    if (im && im.count > 0) {
+      const last = im.count - 1
+      if (instanceIndex !== last) {
+        im.getMatrixAt(last, this.dummy.matrix)
+        im.setMatrixAt(instanceIndex, this.dummy.matrix)
+        // 末尾を指していたレコードを差し替える
+        const lastPacked = meshIndex * 65536 + last
+        for (let k = 0; k < chunk.trunkLen; k += 8) {
+          if (t[k + 7] === lastPacked) {
+            t[k + 7] = meshIndex * 65536 + instanceIndex
+            break
+          }
+        }
+      }
+      im.count = last
+      im.instanceMatrix.needsUpdate = true
+    }
+
+    const lastOff = chunk.trunkLen - 8
+    if (hit.index !== lastOff) {
+      for (let k = 0; k < 8; k++) t[hit.index + k] = t[lastOff + k]
+    }
+    chunk.trunkLen = lastOff
+    this.treeCount--
+    this.chopped.add(treeCellKey(hit.x, hit.z))
+    return true
   }
 
   /** 指定位置を含むチャンクがメッシュ化済みか。 */
@@ -584,4 +731,18 @@ function countInstances(chunk: Chunk): number {
   let n = 0
   for (const im of chunk.treeMeshes) n += im.count
   return n
+}
+
+/** `raycastTree` の結果。x, y, z は木の根元の位置。 */
+export interface TreeHit {
+  distance: number
+  x: number
+  y: number
+  z: number
+  chunkKey: string
+  index: number
+}
+
+export function createTreeHit(): TreeHit {
+  return { distance: 0, x: 0, y: 0, z: 0, chunkKey: '', index: 0 }
 }

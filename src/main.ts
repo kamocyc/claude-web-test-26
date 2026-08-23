@@ -7,9 +7,15 @@ import { createNoiseTexture } from './render/proceduralTextures'
 import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
 import { VillageManager } from './world/VillageManager'
 import type { Box } from './world/village'
-import { World } from './world/World'
+import { World, createTreeHit } from './world/World'
 import { WorldStore } from './world/storage'
-import { CHUNK_SIZE, MATERIAL_INFO, SEA_LEVEL, VILLAGE_CELL } from './world/constants'
+import {
+  CHUNK_SIZE,
+  MATERIAL_INFO,
+  SAMPLE_SEED,
+  SEA_LEVEL,
+  VILLAGE_CELL,
+} from './world/constants'
 import { Player, PLAYER_EYE } from './player/Player'
 import { Controls } from './player/Controls'
 import { createRayHit, raycastTerrain } from './player/terrainRaycast'
@@ -20,16 +26,57 @@ const REACH = 9
 const MIN_BRUSH = 1
 const MAX_BRUSH = 6
 const EDIT_INTERVAL = 0.09
+const CHOP_INTERVAL = 0.25
+const SEED_STORAGE_KEY = 'smooth-world:seed'
+
+/**
+ * シード文字列を数値に変換する。
+ * 整数はそのまま、それ以外の文字列は FNV-1a でハッシュするので
+ * `?seed=demo` のような指定もできる。`random` だけ特別扱い。
+ */
+export function parseSeed(raw: string | null | undefined): number | null {
+  if (raw == null) return null
+  const t = raw.trim()
+  if (t === '') return null
+  if (t.toLowerCase() === 'random') return Math.floor(Math.random() * 2147483647)
+  if (/^-?\d+$/.test(t)) return Math.abs(Number(t)) % 2147483647
+  let h = 2166136261
+  for (let i = 0; i < t.length; i++) {
+    h ^= t.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0) % 2147483647
+}
+
+/** URL → 前回のシード → サンプル用の固定シード、の順で決める。 */
+function resolveSeed(): number {
+  const fromUrl = parseSeed(new URLSearchParams(location.search).get('seed'))
+  if (fromUrl !== null) return fromUrl
+  try {
+    const saved = parseSeed(localStorage.getItem(SEED_STORAGE_KEY))
+    if (saved !== null) return saved
+  } catch {
+    // localStorage が使えない環境ではサンプルシードにフォールバックする
+  }
+  return SAMPLE_SEED
+}
 
 async function boot(): Promise<void> {
   const hud = new Hud()
   hud.setPlayEnabled(false)
   hud.setLoading('ワールドを準備しています…')
 
-  const store = new WorldStore()
+  const seed = resolveSeed()
+  try {
+    localStorage.setItem(SEED_STORAGE_KEY, String(seed))
+  } catch {
+    // 保存できなくても動作には影響しない
+  }
+  hud.setSeed(seed)
+
+  const store = new WorldStore(seed)
   const hasDb = await store.open()
   const meta = hasDb ? await store.loadMeta() : null
-  const seed = meta?.seed ?? Math.floor(Math.random() * 1_000_000_000)
 
   const engine = new Renderer(VIEW_DISTANCE)
   const scene = engine.scene
@@ -44,6 +91,14 @@ async function boot(): Promise<void> {
   scene.add(villages.group)
   store.setEditSource((key) => world.getEdits(key))
   if (hasDb) world.setEdits(await store.loadAllEdits())
+  if (meta?.chopped) world.setChopped(meta.chopped)
+
+  // 素材の手持ち量。掘ると増え、盛ると減る。
+  const inventory = new Float32Array(MATERIAL_INFO.length)
+  if (meta?.inventory) {
+    for (let i = 0; i < inventory.length; i++) inventory[i] = meta.inventory[i] ?? 0
+  }
+  hud.setInventory(inventory)
 
   const sky = new SkyDayNight(scene, camera.far * 0.5)
   if (meta) sky.timeOfDay = meta.timeOfDay
@@ -96,6 +151,9 @@ async function boot(): Promise<void> {
     hud.setSlot(i)
   }
   controls.onToggleFly = () => player.toggleFly()
+  controls.onWarpVillage = () => {
+    hud.showToast(stats.gotoVillage() ? '最寄りの村へワープしました' : '近くに村が見つかりません')
+  }
   controls.onToggleStats = () => {
     statsVisible = !statsVisible
     hud.setStatsVisible(statsVisible)
@@ -114,9 +172,25 @@ async function boot(): Promise<void> {
     hud.setLoading('リセット中…')
     await store.clear()
     world.setEdits(new Map())
+    world.setChopped([])
+    inventory.fill(0)
+    hud.setInventory(inventory)
     player.spawnAt(world, 0.5, 0.5)
     hud.setLoading('')
     hud.setPlayEnabled(true)
+  }
+
+  hud.onApplySeed = (value) => {
+    const next = parseSeed(value)
+    if (next === null) {
+      hud.showToast('シードを入力してください')
+      return
+    }
+    void store.flush()
+    void store.saveMeta(snapshot())
+    const url = new URL(location.href)
+    url.searchParams.set('seed', String(next))
+    location.href = url.toString()
   }
 
   window.addEventListener('beforeunload', () => {
@@ -134,6 +208,8 @@ async function boot(): Promise<void> {
       pitch: controls.pitch,
       timeOfDay: sky.timeOfDay,
       flying: player.flying,
+      inventory: [...inventory],
+      chopped: world.choppedList,
     }
   }
 
@@ -149,6 +225,10 @@ async function boot(): Promise<void> {
     trees: 0,
     villages: 0,
     villageBoxes: 0,
+    chopped: 0,
+    seed,
+    /** 素材の手持ち量（grass, dirt, rock, sand）。 */
+    inventory: [0, 0, 0, 0] as number[],
     /** 視線角を直接設定する。 */
     look(yaw: number, pitch: number) {
       controls.yaw = yaw
@@ -174,6 +254,31 @@ async function boot(): Promise<void> {
       // 落下待ちを挟まずすぐ接地するよう、地面のすぐ上に置く
       player.position.y -= 1.0
       world.update(x, player.position.y, z)
+    },
+    /** 一番近い木の根元の位置（デバッグ／テスト用）。 */
+    nearestTree(): { x: number; y: number; z: number } | null {
+      const t = world.collectTrunks(
+        player.position.x,
+        player.position.y,
+        player.position.z,
+        14,
+      )
+      let best: { x: number; y: number; z: number } | null = null
+      let bestD = Infinity
+      for (let i = 0; i < t.length; i += 5) {
+        const d = Math.hypot(t[i] - player.position.x, t[i + 2] - player.position.z)
+        if (d < bestD) {
+          bestD = d
+          best = { x: t[i], y: t[i + 1], z: t[i + 2] }
+        }
+      }
+      return best
+    },
+    /** 手持ち量を直接与える（テスト用）。 */
+    giveMaterial(index: number, amount: number) {
+      if (index < 0 || index >= inventory.length) return
+      inventory[index] = amount
+      hud.setInventory(inventory)
     },
     /** 最寄りの村の広場へ移動する。見つからなければ false。 */
     gotoVillage(): boolean {
@@ -202,6 +307,8 @@ async function boot(): Promise<void> {
   ;(window as unknown as Record<string, unknown>).__smooth = stats
 
   const hit = createRayHit()
+  const treeHit = createTreeHit()
+  const matScratch = new Float32Array(6)
   const lookDir = new THREE.Vector3()
   const eye = new THREE.Vector3()
   const clock = new THREE.Clock()
@@ -210,9 +317,31 @@ async function boot(): Promise<void> {
   let fpsAccum = 0
   let fpsFrames = 0
   let saveTimer = 0
+  /** 0 より大きい間はカウントダウンし、0 になったらメタ情報を保存する。 */
+  let metaDirty = 0
   let ready = false
 
+  /** 手持ちや伐採が変わったら、少し待ってから保存する。 */
+  function markMetaDirty(): void {
+    metaDirty = 1.2
+  }
+
   const surfaceFogDensity = engine.fog.density
+
+  /**
+   * 掘った体積を素材ごとの手持ちに足す。
+   * プレイヤーが設置した素材があればそれを、無ければ地形本来の素材の比率で分ける。
+   */
+  function creditDig(x: number, y: number, z: number, ny: number, amount: number): void {
+    if (amount <= 0) return
+    const placed = world.cornerMaterial(Math.round(x), Math.round(y), Math.round(z))
+    if (placed < inventory.length) {
+      inventory[placed] += amount
+      return
+    }
+    world.field.surfaceSample(x, y, z, ny, matScratch, 0)
+    for (let i = 0; i < inventory.length; i++) inventory[i] += amount * matScratch[i]
+  }
 
   function tick(): void {
     requestAnimationFrame(tick)
@@ -251,34 +380,70 @@ async function boot(): Promise<void> {
 
       camera.getWorldDirection(lookDir)
       const target = raycastTerrain(world, eye, lookDir, REACH, hit)
-      if (target) {
+      const tree = world.raycastTree(
+        eye.x,
+        eye.y,
+        eye.z,
+        lookDir.x,
+        lookDir.y,
+        lookDir.z,
+        REACH,
+        treeHit,
+      )
+      // 木のほうが手前なら、左クリックは伐採になる
+      const onTree = tree !== null && tree.distance < (target ? target.distance : Infinity)
+
+      // 手持ちが足りないぶんブラシを小さくする（盛れる量 = 掘った量）
+      const stock = inventory[slot]
+      const placeRadius = Math.min(brushRadius, Math.cbrt((stock * 3) / (4 * Math.PI)))
+
+      if (target && !onTree) {
         ghost.visible = true
         ghost.position.copy(target.point)
-        ghost.scale.setScalar(brushRadius)
+        ghost.scale.setScalar(controls.placing ? Math.max(placeRadius, 0.15) : brushRadius)
       } else {
         ghost.visible = false
       }
+      hud.setBrush(brushRadius, onTree ? '木（左クリックで伐採）' : null)
 
       editCooldown -= dt
-      if (target && editCooldown <= 0 && (controls.digging || controls.placing)) {
+      if (editCooldown <= 0 && controls.digging && onTree && tree) {
+        if (world.chopTree(tree)) {
+          hud.showToast('木を切り倒した')
+          markMetaDirty()
+          editCooldown = CHOP_INTERVAL
+        }
+      } else if (target && editCooldown <= 0 && (controls.digging || controls.placing)) {
         const dig = controls.digging
-        // 掘るときは表面のわずかに内側、置くときはわずかに外側を中心にする
-        const off = dig ? -0.25 : 0.35
-        const cx = target.point.x + target.normal.x * off
-        const cy = target.point.y + target.normal.y * off
-        const cz = target.point.z + target.normal.z * off
-        const changed = world.applyBrush(
-          cx,
-          cy,
-          cz,
-          brushRadius,
-          dig ? 'dig' : 'place',
-          MATERIAL_INFO[slot].id,
-        )
-        if (changed) editCooldown = EDIT_INTERVAL
+        if (!dig && stock < 1) {
+          hud.showToast(`${MATERIAL_INFO[slot].name}が足りません（掘って集める）`)
+          editCooldown = 0.5
+        } else {
+          // 掘るときは表面のわずかに内側、置くときはわずかに外側を中心にする
+          const off = dig ? -0.25 : 0.35
+          const cx = target.point.x + target.normal.x * off
+          const cy = target.point.y + target.normal.y * off
+          const cz = target.point.z + target.normal.z * off
+          const bounds = world.applyBrush(
+            cx,
+            cy,
+            cz,
+            dig ? brushRadius : placeRadius,
+            dig ? 'dig' : 'place',
+            MATERIAL_INFO[slot].id,
+          )
+          if (bounds) {
+            if (dig) creditDig(cx, cy, cz, target.normal.y, bounds.cleared)
+            else inventory[slot] = Math.max(0, inventory[slot] - bounds.solidified)
+            hud.setInventory(inventory)
+            markMetaDirty()
+            editCooldown = EDIT_INTERVAL
+          }
+        }
       }
     } else {
       ghost.visible = false
+      hud.setBrush(brushRadius)
     }
 
     // --- HUD ---
@@ -311,10 +476,16 @@ async function boot(): Promise<void> {
           `Mesh  ${world.loadedChunks}/${world.desiredCount}  queue ${world.pendingJobs}`,
           `Mode  ${player.flying ? '飛行' : player.inWater ? '水中' : player.onGround ? '接地' : '空中'}`,
           `Env   ${biomeName(world, player.position.x, player.position.z)}  村 ${villages.activeCount}`,
+          `Tree  ${world.treeCount}  伐採 ${world.choppedCount}`,
           `Time  ${String(h).padStart(2, '0')}:00`,
           `Seed  ${seed}`,
         ].join('\n'),
       )
+    }
+
+    if (metaDirty > 0) {
+      metaDirty -= dt
+      if (metaDirty <= 0) void store.saveMeta(snapshot())
     }
 
     saveTimer += dt
@@ -331,6 +502,8 @@ async function boot(): Promise<void> {
     stats.desired = world.desiredCount
     stats.villages = villages.activeCount
     stats.villageBoxes = villages.colliderCount
+    stats.chopped = world.choppedCount
+    for (let i = 0; i < inventory.length; i++) stats.inventory[i] = inventory[i]
     stats.trees = world.treeCount
   }
 

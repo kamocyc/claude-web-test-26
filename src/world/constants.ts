@@ -48,6 +48,12 @@ export const MATERIAL_INFO = [
   { id: MAT_SAND, name: '砂', color: '#d8c48a' },
 ] as const
 
+/**
+ * シードを指定しなかったときに使う固定シード。
+ * スクリーンショットやテストで同じワールドを再現するためのもの。
+ */
+export const SAMPLE_SEED = 20260823
+
 /** 村を配置する粗いグリッドの一辺（m）。 */
 export const VILLAGE_CELL = 420
 

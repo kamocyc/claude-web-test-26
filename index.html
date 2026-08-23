@@ -54,6 +54,21 @@
       .slot .swatch { width: 24px; height: 24px; border-radius: 6px; border: 1px solid rgba(0,0,0,.35); }
       .slot .label { font-size: 10px; opacity: .85; }
       .slot .key { position: absolute; top: 2px; left: 5px; font-size: 9px; opacity: .5; }
+      .slot .count {
+        position: absolute; bottom: 2px; right: 5px;
+        font: 600 11px/1 ui-monospace, monospace;
+        text-shadow: 0 1px 2px rgba(0,0,0,.9);
+      }
+      .slot.empty .swatch { filter: grayscale(1); opacity: .35; }
+      .slot.empty .count { opacity: .45; }
+
+      #toast {
+        position: absolute; left: 50%; bottom: 122px; transform: translateX(-50%);
+        font-size: 13px; padding: 7px 16px; border-radius: 999px;
+        background: rgba(10,14,20,.72); border: 1px solid rgba(255,255,255,.12);
+        opacity: 0; transition: opacity .25s; white-space: nowrap;
+      }
+      #toast.show { opacity: 1; }
 
       #brush {
         position: absolute; left: 50%; bottom: 90px; transform: translateX(-50%);
@@ -85,6 +100,17 @@
       button.ghost { background: transparent; color: #eef3f8; font-weight: 400; }
       #overlay .row { display: flex; gap: 10px; justify-content: center; }
       #loading { font-size: 13px; opacity: .7; margin-top: 16px; height: 1em; }
+      #seedRow {
+        display: flex; gap: 8px; align-items: center; justify-content: center;
+        margin-bottom: 16px; font-size: 13px;
+      }
+      #seedRow label { opacity: .7; }
+      #seedRow input {
+        font: inherit; font-family: ui-monospace, monospace; font-size: 13px;
+        width: 170px; padding: 7px 12px; border-radius: 999px; color: inherit;
+        background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.18);
+      }
+      #seedRow button { padding: 7px 14px; font-size: 13px; }
     </style>
   </head>
   <body>
@@ -92,6 +118,7 @@
       <div id="crosshair"></div>
       <div id="stats"></div>
       <div id="brush"></div>
+      <div id="toast"></div>
       <div id="hotbar"></div>
       <div id="overlay">
         <div class="card">
@@ -102,16 +129,22 @@
             <tr><td>Space</td><td>ジャンプ / 上昇（飛行中）</td></tr>
             <tr><td>Space ×2</td><td>飛行モード切替</td></tr>
             <tr><td>Shift</td><td>ダッシュ / 下降（飛行中）</td></tr>
-            <tr><td>左クリック</td><td>掘る</td></tr>
-            <tr><td>右クリック</td><td>盛る</td></tr>
+            <tr><td>左クリック</td><td>掘る（木に合わせると伐採）</td></tr>
+            <tr><td>右クリック</td><td>盛る（掘って貯めた分だけ）</td></tr>
             <tr><td>ホイール</td><td>ブラシ半径</td></tr>
             <tr><td>1 – 4</td><td>設置する素材の選択</td></tr>
+            <tr><td>V</td><td>最寄りの村へワープ（デバッグ）</td></tr>
             <tr><td>F3</td><td>ステータス表示</td></tr>
             <tr><td>Esc</td><td>ポーズ</td></tr>
           </table>
+          <div id="seedRow">
+            <label for="seed">シード</label>
+            <input id="seed" type="text" spellcheck="false" />
+            <button id="apply-seed" class="ghost">このシードで開始</button>
+          </div>
           <div class="row">
             <button id="play">クリックして開始</button>
-            <button id="reset" class="ghost">ワールドをリセット</button>
+            <button id="reset" class="ghost">このワールドをリセット</button>
           </div>
           <div id="loading"></div>
         </div>

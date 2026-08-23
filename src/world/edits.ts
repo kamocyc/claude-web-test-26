@@ -15,6 +15,10 @@ export interface BrushBounds {
   maxY: number
   maxZ: number
   touched: number
+  /** 空 → 固体 に変わった格子点の数（= 盛った体積） */
+  solidified: number
+  /** 固体 → 空 に変わった格子点の数（= 掘った体積） */
+  cleared: number
 }
 
 /**
@@ -60,6 +64,8 @@ export function applySphereBrush(
     maxY: -Infinity,
     maxZ: -Infinity,
     touched: 0,
+    solidified: 0,
+    cleared: 0,
   }
 
   for (let k = k0; k <= k1; k++) {
@@ -81,6 +87,8 @@ export function applySphereBrush(
 
         write(i, j, k, next, nextMat)
         bounds.touched++
+        if (cur <= 0 && next > 0) bounds.solidified++
+        else if (cur > 0 && next <= 0) bounds.cleared++
         if (i < bounds.minX) bounds.minX = i
         if (j < bounds.minY) bounds.minY = j
         if (k < bounds.minZ) bounds.minZ = k

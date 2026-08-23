@@ -20,10 +20,15 @@ export interface SmoothDebug {
   trees: number
   villages: number
   villageBoxes: number
+  chopped: number
+  seed: number
+  inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
   teleport(x: number, z: number): void
   gotoVillage(): boolean
+  nearestTree(): { x: number; y: number; z: number } | null
+  giveMaterial(index: number, amount: number): void
 }
 
 declare global {

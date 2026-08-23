@@ -21,6 +21,8 @@ export class Controls {
   onToggleFly: (() => void) | null = null
   onLockChange: ((locked: boolean) => void) | null = null
   onToggleStats: (() => void) | null = null
+  /** デバッグ: 最寄りの村へワープ */
+  onWarpVillage: (() => void) | null = null
 
   private lastSpace = 0
 
@@ -95,6 +97,11 @@ export class Controls {
       } else {
         this.lastSpace = now
       }
+    }
+
+    if (e.code === 'KeyV') {
+      this.onWarpVillage?.()
+      return
     }
 
     if (e.code.startsWith('Digit')) {

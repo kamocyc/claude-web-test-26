@@ -74,6 +74,7 @@ export class WorkerPool {
       if (best.req.editIdx) transfer.push(best.req.editIdx.buffer)
       if (best.req.editD) transfer.push(best.req.editD.buffer)
       if (best.req.editMat) transfer.push(best.req.editMat.buffer)
+      if (best.req.chopped) transfer.push(best.req.chopped.buffer)
       worker.postMessage(best.req, transfer)
     }
   }

@@ -13,9 +13,15 @@ export const TREE_CACTUS = 2
 export const TREE_TYPE_COUNT = 3
 
 /** 木を 1 本まで置ける格子の一辺（m）。 */
-const CELL = 4.6
+export const TREE_CELL = 4.6
+const CELL = TREE_CELL
 /** これより急な面には生えない。 */
 const MIN_NY = 0.8
+
+/** ワールド座標から、その点が属する木のセルキーを求める。 */
+export function treeCellKey(x: number, z: number): number {
+  return Math.floor(x / CELL) * 1048576 + (Math.floor(z / CELL) + 524288)
+}
 
 interface CellPlan {
   /** 置くならジッタ後の目標位置、置かないなら null */
@@ -40,7 +46,9 @@ export function scatterTrees(
   oy: number,
   oz: number,
   seed: number,
+  chopped: Float64Array | null,
 ): Float32Array {
+  const removed = chopped && chopped.length > 0 ? new Set<number>(chopped) : null
   const plans = new Map<number, CellPlan | null>()
   const best = new Map<number, { vi: number; d2: number }>()
   const bio: Biome = { temp: 0, humid: 0, mountain: 0 }
@@ -59,7 +67,7 @@ export function scatterTrees(
 
     let plan = plans.get(key)
     if (plan === undefined) {
-      plan = planCell(field, cellX, cellZ, seed, bio)
+      plan = removed?.has(key) ? null : planCell(field, cellX, cellZ, seed, bio)
       plans.set(key, plan)
     }
     if (plan === null) continue

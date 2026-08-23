@@ -34,8 +34,14 @@ export class Chunk {
   mesh: THREE.Mesh | null = null
   /** 木の InstancedMesh（種類ごと）。 */
   treeMeshes: THREE.InstancedMesh[] = []
-  /** 幹の当たり判定 (x, y, z, 半径, 高さ) の並び。 */
+  /**
+   * 木の情報。8 要素で 1 本:
+   * x, y, z, 幹の半径, 幹の高さ, 照準判定の半径, 照準判定の高さ,
+   * (InstancedMesh の番号 * 65536 + インスタンス番号)
+   */
   trunks: Float32Array | null = null
+  /** trunks のうち有効な長さ（伐採で縮む）。 */
+  trunkLen = 0
   /** 最後に投入したジョブの世代。古い結果を破棄するために使う。 */
   requested = 0
   /** 一度でもメッシュ化が完了したか（初期ロード待ちの判定に使う）。 */
@@ -60,5 +66,6 @@ export class Chunk {
     }
     this.treeMeshes.length = 0
     this.trunks = null
+    this.trunkLen = 0
   }
 }

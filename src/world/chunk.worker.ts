@@ -14,6 +14,8 @@ export interface MeshRequest {
   editIdx: Int32Array | null
   editD: Float32Array | null
   editMat: Uint8Array | null
+  /** 伐採済みの木のセルキー。 */
+  chopped: Float64Array | null
 }
 
 export interface MeshResponse {
@@ -77,7 +79,7 @@ self.onmessage = (ev: MessageEvent<MeshRequest>) => {
     return
   }
 
-  const trees = scatterTrees(f, mesh, ox, oy, oz, req.seed)
+  const trees = scatterTrees(f, mesh, ox, oy, oz, req.seed, req.chopped)
 
   const res: MeshResponse = {
     id: req.id,

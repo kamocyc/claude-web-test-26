@@ -1,7 +1,7 @@
 import type { EditMap } from './Chunk'
 
 const DB_NAME = 'smooth-world'
-const DB_VERSION = 1
+const DB_VERSION = 2
 const STORE_META = 'meta'
 const STORE_EDITS = 'edits'
 
@@ -14,6 +14,10 @@ export interface SaveMeta {
   pitch: number
   timeOfDay: number
   flying: boolean
+  /** 素材ごとの手持ち量（採掘して貯まる）。 */
+  inventory: number[]
+  /** 伐採した木のセルキー。 */
+  chopped: number[]
 }
 
 interface PackedEdits {
@@ -31,6 +35,12 @@ export class WorldStore {
   private readonly dirty = new Set<string>()
   private timer: ReturnType<typeof setTimeout> | null = null
   private source: ((key: string) => EditMap | undefined) | null = null
+  private prefix = ''
+
+  /** シードごとに保存領域を分ける。別シードのワールドに編集が混ざらないようにするため。 */
+  constructor(seed: number) {
+    this.prefix = `${seed}:`
+  }
 
   async open(): Promise<boolean> {
     if (typeof indexedDB === 'undefined') return false
@@ -39,8 +49,11 @@ export class WorldStore {
         const req = indexedDB.open(DB_NAME, DB_VERSION)
         req.onupgradeneeded = () => {
           const db = req.result
-          if (!db.objectStoreNames.contains(STORE_META)) db.createObjectStore(STORE_META)
-          if (!db.objectStoreNames.contains(STORE_EDITS)) db.createObjectStore(STORE_EDITS)
+          // v1 はシードで区切られていなかったので作り直す
+          if (db.objectStoreNames.contains(STORE_META)) db.deleteObjectStore(STORE_META)
+          if (db.objectStoreNames.contains(STORE_EDITS)) db.deleteObjectStore(STORE_EDITS)
+          db.createObjectStore(STORE_META)
+          db.createObjectStore(STORE_EDITS)
         }
         req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
@@ -58,12 +71,12 @@ export class WorldStore {
 
   async loadMeta(): Promise<SaveMeta | null> {
     if (!this.db) return null
-    return this.get<SaveMeta>(STORE_META, 'state')
+    return this.get<SaveMeta>(STORE_META, `${this.prefix}state`)
   }
 
   async saveMeta(meta: SaveMeta): Promise<void> {
     if (!this.db) return
-    await this.put(STORE_META, 'state', meta)
+    await this.put(STORE_META, `${this.prefix}state`, meta)
   }
 
   async loadAllEdits(): Promise<Map<string, EditMap>> {
@@ -80,7 +93,12 @@ export class WorldStore {
           resolve()
           return
         }
-        const key = String(cursor.key)
+        const raw = String(cursor.key)
+        if (!raw.startsWith(this.prefix)) {
+          cursor.continue()
+          return
+        }
+        const key = raw.slice(this.prefix.length)
         const packed = cursor.value as PackedEdits
         const map: EditMap = new Map()
         for (let i = 0; i < packed.idx.length; i++) {
@@ -116,7 +134,7 @@ export class WorldStore {
       for (const key of keys) {
         const map = this.source!(key)
         if (!map || map.size === 0) {
-          store.delete(key)
+          store.delete(this.prefix + key)
           continue
         }
         const n = map.size
@@ -132,21 +150,29 @@ export class WorldStore {
           packed.mat[i] = rec.mat
           i++
         }
-        store.put(packed, key)
+        store.put(packed, this.prefix + key)
       }
       tx.oncomplete = () => resolve()
       tx.onerror = () => reject(tx.error)
     })
   }
 
+  /** このシードのワールドの保存内容だけを消す。 */
   async clear(): Promise<void> {
     if (!this.db) return
     this.dirty.clear()
     const db = this.db
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction([STORE_EDITS, STORE_META], 'readwrite')
-      tx.objectStore(STORE_EDITS).clear()
-      tx.objectStore(STORE_META).clear()
+      const edits = tx.objectStore(STORE_EDITS)
+      const req = edits.openKeyCursor()
+      req.onsuccess = () => {
+        const cursor = req.result
+        if (!cursor) return
+        if (String(cursor.key).startsWith(this.prefix)) edits.delete(cursor.key)
+        cursor.continue()
+      }
+      tx.objectStore(STORE_META).delete(`${this.prefix}state`)
       tx.oncomplete = () => resolve()
       tx.onerror = () => reject(tx.error)
     })
