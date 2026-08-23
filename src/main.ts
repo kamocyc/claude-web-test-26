@@ -8,6 +8,7 @@ import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
 import { VillageManager } from './world/VillageManager'
 import type { Box } from './world/village'
 import { World, createTreeHit } from './world/World'
+import { boxBrush, snapBoxCenter, sphereBrush } from './world/edits'
 import { WorldStore } from './world/storage'
 import {
   CHUNK_SIZE,
@@ -27,6 +28,27 @@ const MIN_BRUSH = 1
 const MAX_BRUSH = 6
 const EDIT_INTERVAL = 0.09
 const CHOP_INTERVAL = 0.25
+
+/** B キーで切り替わるブラシ。 */
+const TOOLS = [
+  { id: 'sphere', name: '球' },
+  { id: 'box', name: '直方体' },
+  { id: 'smooth', name: 'ならし' },
+] as const
+
+const MIN_BOX_EDGE = 2
+/** これ以上大きくすると 1 回の掘削が 10ms を超えてカクつく。 */
+const MAX_BOX_EDGE = 8
+
+/**
+ * ホイールのブラシ半径を直方体の一辺（m）に写す。
+ * 整数にしておくと半サイズが 0.5 の倍数になり、
+ * 面を格子平面にぴったり乗せられる（= 稜が丸まらない）。
+ */
+export function boxEdge(radius: number): number {
+  const t = Math.max(0, Math.min(1, (radius - MIN_BRUSH) / (MAX_BRUSH - MIN_BRUSH)))
+  return Math.round(MIN_BOX_EDGE + t * (MAX_BOX_EDGE - MIN_BOX_EDGE))
+}
 const SEED_STORAGE_KEY = 'smooth-world:seed'
 
 /**
@@ -138,12 +160,38 @@ async function boot(): Promise<void> {
   ghost.visible = false
   scene.add(ghost)
 
+  // 直方体ブラシは実際に削れる範囲（格子に合わせて丸めたあとの箱）をそのまま出す
+  const boxGhost = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+    new THREE.LineBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+      fog: false,
+    }),
+  )
+  boxGhost.visible = false
+  scene.add(boxGhost)
+
+  /** HUD に出すブラシの説明。 */
+  function brushLabel(note: string | null = null): string {
+    if (note) return note
+    const t = TOOLS[tool]
+    if (t.id === 'box') {
+      const n = boxEdge(brushRadius)
+      return `${t.name} ${n}×${n}×${n} m`
+    }
+    return `${t.name} 半径 ${brushRadius.toFixed(1)} m`
+  }
+
   let brushRadius = 2.5
+  let tool = 0
   let slot = 0
   let statsVisible = true
   let started = false
   let editCooldown = 0
-  hud.setBrush(brushRadius)
+  hud.setBrush(brushLabel())
 
   controls.onSlot = (i) => {
     if (i >= MATERIAL_INFO.length) return
@@ -151,6 +199,10 @@ async function boot(): Promise<void> {
     hud.setSlot(i)
   }
   controls.onToggleFly = () => player.toggleFly()
+  controls.onCycleTool = () => {
+    tool = (tool + 1) % TOOLS.length
+    hud.showToast(`ブラシ: ${TOOLS[tool].name}`)
+  }
   controls.onWarpVillage = () => {
     hud.showToast(stats.gotoVillage() ? '最寄りの村へワープしました' : '近くに村が見つかりません')
   }
@@ -227,6 +279,8 @@ async function boot(): Promise<void> {
     villageBoxes: 0,
     chopped: 0,
     seed,
+    /** 現在のブラシ。 */
+    tool: TOOLS[0].id as string,
     /** 素材の手持ち量（grass, dirt, rock, sand）。 */
     inventory: [0, 0, 0, 0] as number[],
     /** 視線角を直接設定する。 */
@@ -273,6 +327,23 @@ async function boot(): Promise<void> {
         }
       }
       return best
+    },
+    /** ブラシを切り替える（テスト用）。 */
+    setTool(name: string) {
+      const i = TOOLS.findIndex((t) => t.id === name)
+      if (i >= 0) {
+        tool = i
+        hud.setBrush(brushLabel())
+      }
+    },
+    /** ブラシの大きさを設定する（テスト用）。 */
+    setBrushRadius(r: number) {
+      brushRadius = clamp(r, MIN_BRUSH, MAX_BRUSH)
+      hud.setBrush(brushLabel())
+    },
+    /** 密度場の値。> 0 が固体。 */
+    density(x: number, y: number, z: number): number {
+      return world.densityAt(x, y, z)
     },
     /** 手持ち量を直接与える（テスト用）。 */
     giveMaterial(index: number, amount: number) {
@@ -375,7 +446,6 @@ async function boot(): Promise<void> {
       if (controls.wheel !== 0) {
         brushRadius = clamp(brushRadius - Math.sign(controls.wheel) * 0.5, MIN_BRUSH, MAX_BRUSH)
         controls.wheel = 0
-        hud.setBrush(brushRadius)
       }
 
       camera.getWorldDirection(lookDir)
@@ -393,18 +463,48 @@ async function boot(): Promise<void> {
       // 木のほうが手前なら、左クリックは伐採になる
       const onTree = tree !== null && tree.distance < (target ? target.distance : Infinity)
 
+      const kind = TOOLS[tool].id
+      const smoothing = kind === 'smooth'
+      // ならしは体積の帰属が曖昧なので手持ちを増減させない。左右どちらのボタンでもならす。
+      const dig = smoothing || controls.digging
+      const acting = controls.digging || controls.placing
+
       // 手持ちが足りないぶんブラシを小さくする（盛れる量 = 掘った量）
       const stock = inventory[slot]
-      const placeRadius = Math.min(brushRadius, Math.cbrt((stock * 3) / (4 * Math.PI)))
+      const edge = boxEdge(brushRadius)
+      const half = dig ? edge / 2 : Math.min(edge, Math.floor(Math.cbrt(stock))) / 2
+      const radius = dig ? brushRadius : Math.min(brushRadius, Math.cbrt((stock * 3) / (4 * Math.PI)))
 
-      if (target && !onTree) {
-        ghost.visible = true
-        ghost.position.copy(target.point)
-        ghost.scale.setScalar(controls.placing ? Math.max(placeRadius, 0.15) : brushRadius)
-      } else {
-        ghost.visible = false
+      // 掘るときは表面のわずかに内側、置くときはわずかに外側を中心にする
+      const off = dig ? -0.25 : 0.35
+      let cx = 0
+      let cy = 0
+      let cz = 0
+      if (target) {
+        cx = target.point.x + target.normal.x * off
+        cy = target.point.y + target.normal.y * off
+        cz = target.point.z + target.normal.z * off
+        if (kind === 'box') {
+          // 面が格子平面に乗るように中心を丸める。ここを丸めないと稜が面取りされる。
+          cx = snapBoxCenter(cx, half)
+          cy = snapBoxCenter(cy, half)
+          cz = snapBoxCenter(cz, half)
+        }
       }
-      hud.setBrush(brushRadius, onTree ? '木（左クリックで伐採）' : null)
+
+      const showBox = kind === 'box' && target !== null && !onTree && half > 0
+      const showSphere = kind !== 'box' && target !== null && !onTree
+      boxGhost.visible = showBox
+      ghost.visible = showSphere
+      if (showBox) {
+        boxGhost.position.set(cx, cy, cz)
+        boxGhost.scale.setScalar(half * 2)
+      }
+      if (showSphere) {
+        ghost.position.set(cx, cy, cz)
+        ghost.scale.setScalar(Math.max(radius, 0.15))
+      }
+      hud.setBrush(brushLabel(onTree ? '木（左クリックで伐採）' : null))
 
       editCooldown -= dt
       if (editCooldown <= 0 && controls.digging && onTree && tree) {
@@ -413,28 +513,29 @@ async function boot(): Promise<void> {
           markMetaDirty()
           editCooldown = CHOP_INTERVAL
         }
-      } else if (target && editCooldown <= 0 && (controls.digging || controls.placing)) {
-        const dig = controls.digging
+      } else if (target && editCooldown <= 0 && acting) {
         if (!dig && stock < 1) {
           hud.showToast(`${MATERIAL_INFO[slot].name}が足りません（掘って集める）`)
           editCooldown = 0.5
         } else {
-          // 掘るときは表面のわずかに内側、置くときはわずかに外側を中心にする
-          const off = dig ? -0.25 : 0.35
-          const cx = target.point.x + target.normal.x * off
-          const cy = target.point.y + target.normal.y * off
-          const cz = target.point.z + target.normal.z * off
-          const bounds = world.applyBrush(
-            cx,
-            cy,
-            cz,
-            dig ? brushRadius : placeRadius,
-            dig ? 'dig' : 'place',
-            MATERIAL_INFO[slot].id,
-          )
+          const bounds = smoothing
+            ? world.applySmooth(cx, cy, cz, brushRadius, 1)
+            : world.applyBrush(
+                cx,
+                cy,
+                cz,
+                kind === 'box' ? boxBrush(half, half, half) : sphereBrush(radius),
+                dig ? 'dig' : 'place',
+                MATERIAL_INFO[slot].id,
+              )
           if (bounds) {
-            if (dig) creditDig(cx, cy, cz, target.normal.y, bounds.cleared)
-            else inventory[slot] = Math.max(0, inventory[slot] - bounds.solidified)
+            if (smoothing) {
+              // 収支なし
+            } else if (dig) {
+              creditDig(cx, cy, cz, target.normal.y, bounds.cleared)
+            } else {
+              inventory[slot] = Math.max(0, inventory[slot] - bounds.solidified)
+            }
             hud.setInventory(inventory)
             markMetaDirty()
             editCooldown = EDIT_INTERVAL
@@ -443,7 +544,8 @@ async function boot(): Promise<void> {
       }
     } else {
       ghost.visible = false
-      hud.setBrush(brushRadius)
+      boxGhost.visible = false
+      hud.setBrush(brushLabel())
     }
 
     // --- HUD ---
@@ -505,6 +607,7 @@ async function boot(): Promise<void> {
     stats.chopped = world.choppedCount
     for (let i = 0; i < inventory.length; i++) stats.inventory[i] = inventory[i]
     stats.trees = world.treeCount
+    stats.tool = TOOLS[tool].id
   }
 
   tick()

@@ -19,6 +19,8 @@ export class Controls {
 
   onSlot: ((index: number) => void) | null = null
   onToggleFly: (() => void) | null = null
+  /** B キー: ブラシの切り替え */
+  onCycleTool: (() => void) | null = null
   onLockChange: ((locked: boolean) => void) | null = null
   onToggleStats: (() => void) | null = null
   /** デバッグ: 最寄りの村へワープ */
@@ -97,6 +99,11 @@ export class Controls {
       } else {
         this.lastSpace = now
       }
+    }
+
+    if (e.code === 'KeyB') {
+      this.onCycleTool?.()
+      return
     }
 
     if (e.code === 'KeyV') {

@@ -24,22 +24,104 @@ export interface BrushBounds {
 }
 
 /**
+ * ブラシの形。中心を原点とするローカル座標（格子単位）の符号付き距離で表す。
+ * 外側が正・内側が負で、値が実距離とほぼ一致していること（正確な SDF）が条件。
+ * 掘削・設置・掃除の範囲判定をすべてこの値だけで行う。
+ */
+export interface BrushShape {
+  /** 走査範囲の半サイズ。 */
+  readonly ex: number
+  readonly ey: number
+  readonly ez: number
+  sdf(dx: number, dy: number, dz: number): number
+}
+
+export function sphereBrush(radius: number): BrushShape {
+  const r = radius / VOXEL_SIZE
+  return {
+    ex: r,
+    ey: r,
+    ez: r,
+    sdf: (dx, dy, dz) => Math.sqrt(dx * dx + dy * dy + dz * dz) - r,
+  }
+}
+
+/**
+ * 軸に沿った直方体ブラシ。半サイズは格子単位。
+ *
+ * 面が格子平面にちょうど乗るように中心を置くと（{@link snapBoxCenter}）、
+ * Surface Nets の頂点は面・稜・角の上に厳密に乗り、完全に鋭い直方体になる。
+ * 格子からずらすと稜が最大 0.5 格子ぶん面取りされる。
+ */
+export function boxBrush(hx: number, hy: number, hz: number): BrushShape {
+  const ax = hx / VOXEL_SIZE
+  const ay = hy / VOXEL_SIZE
+  const az = hz / VOXEL_SIZE
+  return {
+    ex: ax,
+    ey: ay,
+    ez: az,
+    sdf: (dx, dy, dz) => {
+      const qx = Math.abs(dx) - ax
+      const qy = Math.abs(dy) - ay
+      const qz = Math.abs(dz) - az
+      const ox = qx > 0 ? qx : 0
+      const oy = qy > 0 ? qy : 0
+      const oz = qz > 0 ? qz : 0
+      const outside = Math.sqrt(ox * ox + oy * oy + oz * oz)
+      const inside = Math.min(Math.max(qx, qy, qz), 0)
+      return outside + inside
+    },
+  }
+}
+
+/**
+ * 直方体の面が格子平面に乗るように中心座標を丸める。
+ * 半サイズが整数なら中心も整数に、0.5 刻みなら中心も 0.5 刻みになる。
+ */
+export function snapBoxCenter(center: number, half: number): number {
+  const h = half / VOXEL_SIZE
+  const c = center / VOXEL_SIZE
+  return (Math.round(c - h) + h) * VOXEL_SIZE
+}
+
+/**
  * この数以下の格子点しか持たない塊は切れ端とみなして消す。
  * 8 点 = だいたい 1m 角。掘ったときに残る目に見えるゴミはほぼこの大きさ以下。
  */
 export const MAX_FRAGMENT_CORNERS = 8
 
 /**
- * ブラシ球からこの距離までを掃除の対象にする。外側は絶対に削らない。
- * 読み込み範囲は r + 2 なので、面隣接を数える 1 格子ぶんの余裕がある。
+ * ブラシ表面からこの距離までを掃除の対象にする。外側は絶対に削らない。
+ * 読み込み範囲は表面から REACH_PAD なので、面隣接を数える余裕がある。
  */
 const CLEAN_BAND = 1.0
+
+/** ブラシ表面から何格子ぶん外まで読み込むか。 */
+const REACH_PAD = 2
 
 /** 読み込んでいない格子点の印。空気として扱われ、書き戻されない。 */
 const OUTSIDE = -1e9
 
+/**
+ * 設置のときブラシ表面をわずかに固体側へ寄せる量。
+ *
+ * 等値面の判定は「密度 > 0」なので、ちょうど 0 の格子点は空気に入る。
+ * 掘削 (min) ではブラシ表面が空気になるのが正しいが、設置 (max) では
+ * 表面まで埋まってほしいので、ここだけ符号を跨がせる。これが無いと
+ * 直方体の角が 2/3 格子ぶん欠ける。
+ */
+const SURFACE_BIAS = 1e-4
+
 /** とげを削る回数。2 回で「幅 1 格子の触手」まで消える。 */
 const ERODE_PASSES = 2
+
+/** ならしブラシの反復回数と 1 回あたりの強さ（0.5 を超えると振動する）。 */
+const SMOOTH_PASSES = 2
+const SMOOTH_RATE = 0.5
+
+/** この値より小さい変化は書き戻さない。編集差分の肥大化を防ぐ。 */
+const SMOOTH_EPSILON = 1e-3
 
 // 呼び出しごとの確保を避けるための作業バッファ
 let bufD: Float32Array = new Float32Array(0)
@@ -47,6 +129,8 @@ let bufOrigD: Float32Array = new Float32Array(0)
 let bufMat: Uint8Array = new Uint8Array(0)
 let bufOrigMat: Uint8Array = new Uint8Array(0)
 let bufState: Uint8Array = new Uint8Array(0)
+let bufSdf: Float32Array = new Float32Array(0)
+let bufNext: Float32Array = new Float32Array(0)
 const stack: number[] = []
 const component: number[] = []
 
@@ -57,48 +141,12 @@ function ensure(n: number): void {
   bufMat = new Uint8Array(n)
   bufOrigMat = new Uint8Array(n)
   bufState = new Uint8Array(n)
+  bufSdf = new Float32Array(n)
+  bufNext = new Float32Array(n)
 }
 
-/**
- * 球ブラシを密度場に適用する。
- *
- * ブラシを符号付き距離場として扱い、
- *   設置 = union      : d = max(d,  r - dist)
- *   掘削 = subtraction: d = min(d, dist - r)
- * とすることで、何度掛けても値が発散せず、常に真円のくぼみ・膨らみになる。
- *
- * 掘ったあとは、影響範囲の中で本体から切り離された小さな塊を取り除く。
- * 地形の等値面は「密度が正の格子点」があるところにしか生まれないので、
- * 格子点の連結成分を見れば目に見える切れ端を漏れなく検出できる。
- */
-export function applySphereBrush(
-  wx: number,
-  wy: number,
-  wz: number,
-  radius: number,
-  mode: BrushMode,
-  material: number,
-  readD: CornerReader,
-  readMat: CornerMatReader,
-  write: CornerWriter,
-  clampMinY: number,
-  clampMaxY: number,
-): BrushBounds {
-  const cx = wx / VOXEL_SIZE
-  const cy = wy / VOXEL_SIZE
-  const cz = wz / VOXEL_SIZE
-  const r = radius / VOXEL_SIZE
-  // 影響範囲より少し広く走査して、境界のコーナーも滑らかに更新する
-  const reach = r + 2
-
-  const i0 = Math.floor(cx - reach)
-  const i1 = Math.ceil(cx + reach)
-  const j0 = Math.max(Math.floor(clampMinY / VOXEL_SIZE), Math.floor(cy - reach))
-  const j1 = Math.min(Math.ceil(clampMaxY / VOXEL_SIZE), Math.ceil(cy + reach))
-  const k0 = Math.floor(cz - reach)
-  const k1 = Math.ceil(cz + reach)
-
-  const bounds: BrushBounds = {
+function emptyBounds(): BrushBounds {
+  return {
     minX: Infinity,
     minY: Infinity,
     minZ: Infinity,
@@ -110,61 +158,49 @@ export function applySphereBrush(
     cleared: 0,
     fragmentsRemoved: 0,
   }
+}
 
+/** 走査範囲。ブラシの半サイズ + REACH_PAD を格子に切り上げたもの。 */
+interface Region {
+  i0: number
+  j0: number
+  k0: number
+  w: number
+  h: number
+  d: number
+  ox: number
+  oy: number
+  oz: number
+}
+
+function region(
+  cx: number,
+  cy: number,
+  cz: number,
+  ex: number,
+  ey: number,
+  ez: number,
+  clampMinY: number,
+  clampMaxY: number,
+): Region | null {
+  const i0 = Math.floor(cx - ex - REACH_PAD)
+  const i1 = Math.ceil(cx + ex + REACH_PAD)
+  const j0 = Math.max(Math.floor(clampMinY / VOXEL_SIZE), Math.floor(cy - ey - REACH_PAD))
+  const j1 = Math.min(Math.ceil(clampMaxY / VOXEL_SIZE), Math.ceil(cy + ey + REACH_PAD))
+  const k0 = Math.floor(cz - ez - REACH_PAD)
+  const k1 = Math.ceil(cz + ez + REACH_PAD)
   const w = i1 - i0 + 1
   const h = j1 - j0 + 1
-  const dz = k1 - k0 + 1
-  if (w <= 0 || h <= 0 || dz <= 0) return bounds
-  ensure(w * h * dz)
+  const d = k1 - k0 + 1
+  if (w <= 0 || h <= 0 || d <= 0) return null
+  ensure(w * h * d)
+  return { i0, j0, k0, w, h, d, ox: i0 - cx, oy: j0 - cy, oz: k0 - cz }
+}
 
-  // --- 1. ブラシの届く範囲だけ現在の値を読み込み、その場で球を合成する ---
-  // 範囲外は OUTSIDE のままにしておく。書き戻されず、掃除の対象にもならない。
-  const ox = i0 - cx
-  const oy = j0 - cy
-  const oz = k0 - cz
-  const reach2 = reach * reach
-  for (let k = 0; k < dz; k++) {
-    const dzz = oz + k
-    for (let j = 0; j < h; j++) {
-      const dyy = oy + j
-      const row = (j + k * h) * w
-      const planar = dyy * dyy + dzz * dzz
-      for (let i = 0; i < w; i++) {
-        const idx = row + i
-        const dxx = ox + i
-        const dist2 = dxx * dxx + planar
-        if (dist2 > reach2) {
-          bufD[idx] = OUTSIDE
-          bufOrigD[idx] = OUTSIDE
-          bufMat[idx] = MAT_NONE
-          bufOrigMat[idx] = MAT_NONE
-          continue
-        }
-        const gx = i0 + i
-        const gy = j0 + j
-        const gz = k0 + k
-        const cur = readD(gx, gy, gz)
-        const m = readMat(gx, gy, gz)
-        bufOrigD[idx] = cur
-        bufOrigMat[idx] = m
-        const sphere = r - Math.sqrt(dist2)
-        const next = mode === 'place' ? Math.max(cur, sphere) : Math.min(cur, -sphere)
-        bufD[idx] = next
-        bufMat[idx] = mode === 'place' && next > 0 && sphere > -0.5 ? material : m
-      }
-    }
-  }
-
-  // --- 2. 掘ったときは切れ端を掃除する ---
-  if (mode === 'dig') {
-    const limit = r + CLEAN_BAND
-    bounds.fragmentsRemoved =
-      erodeThinShards(w, h, dz, ox, oy, oz, limit * limit) +
-      removeSmallFragments(w, h, dz, ox, oy, oz, reach, MAX_FRAGMENT_CORNERS)
-  }
-
-  // --- 3. 変化した格子点だけ書き戻す ---
-  for (let k = 0; k < dz; k++) {
+/** 変化した格子点だけ書き戻し、影響範囲を記録する。 */
+function writeBack(reg: Region, bounds: BrushBounds, write: CornerWriter): void {
+  const { w, h, d, i0, j0, k0 } = reg
+  for (let k = 0; k < d; k++) {
     for (let j = 0; j < h; j++) {
       const row = (j + k * h) * w
       for (let i = 0; i < w; i++) {
@@ -190,7 +226,220 @@ export function applySphereBrush(
       }
     }
   }
+}
 
+/**
+ * ブラシを密度場に適用する。
+ *
+ * ブラシを符号付き距離場として扱い、
+ *   設置 = union      : d = max(d, -s)
+ *   掘削 = subtraction: d = min(d,  s)
+ * （s はブラシの符号付き距離、外側が正）とすることで、
+ * 何度掛けても値が発散せず、常にブラシの形そのままのくぼみ・膨らみになる。
+ *
+ * 掘ったあとは、影響範囲の中で本体から切り離された小さな塊を取り除く。
+ * 地形の等値面は「密度が正の格子点」があるところにしか生まれないので、
+ * 格子点の連結成分を見れば目に見える切れ端を漏れなく検出できる。
+ */
+export function applyBrush(
+  wx: number,
+  wy: number,
+  wz: number,
+  shape: BrushShape,
+  mode: BrushMode,
+  material: number,
+  readD: CornerReader,
+  readMat: CornerMatReader,
+  write: CornerWriter,
+  clampMinY: number,
+  clampMaxY: number,
+): BrushBounds {
+  const cx = wx / VOXEL_SIZE
+  const cy = wy / VOXEL_SIZE
+  const cz = wz / VOXEL_SIZE
+
+  const bounds = emptyBounds()
+  const reg = region(cx, cy, cz, shape.ex, shape.ey, shape.ez, clampMinY, clampMaxY)
+  if (!reg) return bounds
+  const { w, h, d, i0, j0, k0, ox, oy, oz } = reg
+
+  // --- 1. ブラシの届く範囲だけ現在の値を読み込み、その場でブラシを合成する ---
+  // 範囲外は OUTSIDE のままにしておく。書き戻されず、掃除の対象にもならない。
+  const place = mode === 'place'
+  for (let k = 0; k < d; k++) {
+    const dzz = oz + k
+    for (let j = 0; j < h; j++) {
+      const dyy = oy + j
+      const row = (j + k * h) * w
+      for (let i = 0; i < w; i++) {
+        const idx = row + i
+        const s = shape.sdf(ox + i, dyy, dzz)
+        bufSdf[idx] = s
+        if (s > REACH_PAD) {
+          bufD[idx] = OUTSIDE
+          bufOrigD[idx] = OUTSIDE
+          bufMat[idx] = MAT_NONE
+          bufOrigMat[idx] = MAT_NONE
+          continue
+        }
+        const gx = i0 + i
+        const gy = j0 + j
+        const gz = k0 + k
+        const cur = readD(gx, gy, gz)
+        const m = readMat(gx, gy, gz)
+        bufOrigD[idx] = cur
+        bufOrigMat[idx] = m
+        const next = place ? Math.max(cur, SURFACE_BIAS - s) : Math.min(cur, s)
+        bufD[idx] = next
+        bufMat[idx] = place && next > 0 && s < 0.5 ? material : m
+      }
+    }
+  }
+
+  // --- 2. 掘ったときは切れ端を掃除する ---
+  if (!place) {
+    bounds.fragmentsRemoved =
+      erodeThinShards(w, h, d) + removeSmallFragments(w, h, d, MAX_FRAGMENT_CORNERS)
+  }
+
+  // --- 3. 変化した格子点だけ書き戻す ---
+  writeBack(reg, bounds, write)
+  return bounds
+}
+
+/** 球ブラシ。既存の呼び出し向けの薄いラッパ。 */
+export function applySphereBrush(
+  wx: number,
+  wy: number,
+  wz: number,
+  radius: number,
+  mode: BrushMode,
+  material: number,
+  readD: CornerReader,
+  readMat: CornerMatReader,
+  write: CornerWriter,
+  clampMinY: number,
+  clampMaxY: number,
+): BrushBounds {
+  return applyBrush(
+    wx,
+    wy,
+    wz,
+    sphereBrush(radius),
+    mode,
+    material,
+    readD,
+    readMat,
+    write,
+    clampMinY,
+    clampMaxY,
+  )
+}
+
+/**
+ * 凸凹をならすブラシ。密度場をその場で平滑化する。
+ *
+ * 密度に対するラプラシアン平滑化（`d += λ (隣接 6 点の平均 - d)`）は、
+ * 等値面に対しては平均曲率流になる。つまり出っ張りは削れ、へこみは埋まり、
+ * 平らな面・一定の傾斜は動かない（一次関数のラプラシアンは 0）。
+ * 素材と体積の帰属が曖昧なので、掘削・設置とは違い手持ち量は増減させない。
+ *
+ * @param strength 0..1。中心での効き具合。
+ */
+export function applySmoothBrush(
+  wx: number,
+  wy: number,
+  wz: number,
+  radius: number,
+  strength: number,
+  readD: CornerReader,
+  readMat: CornerMatReader,
+  write: CornerWriter,
+  clampMinY: number,
+  clampMaxY: number,
+): BrushBounds {
+  const cx = wx / VOXEL_SIZE
+  const cy = wy / VOXEL_SIZE
+  const cz = wz / VOXEL_SIZE
+  const r = radius / VOXEL_SIZE
+
+  const bounds = emptyBounds()
+  const reg = region(cx, cy, cz, r, r, r, clampMinY, clampMaxY)
+  if (!reg) return bounds
+  const { w, h, d, i0, j0, k0, ox, oy, oz } = reg
+  const n = w * h * d
+  const strideK = w * h
+
+  // --- 1. 読み込み。効き具合を bufSdf に入れておく（縁で 0 になるので継ぎ目が出ない） ---
+  const inner = r * 0.55
+  const span = Math.max(1e-6, r - inner)
+  const amount = Math.max(0, Math.min(1, strength)) * SMOOTH_RATE
+  let active = false
+  for (let k = 0; k < d; k++) {
+    const dzz = oz + k
+    for (let j = 0; j < h; j++) {
+      const dyy = oy + j
+      const row = (j + k * h) * w
+      const planar = dyy * dyy + dzz * dzz
+      for (let i = 0; i < w; i++) {
+        const idx = row + i
+        const dxx = ox + i
+        const dist = Math.sqrt(dxx * dxx + planar)
+        if (dist > r + REACH_PAD) {
+          bufD[idx] = OUTSIDE
+          bufOrigD[idx] = OUTSIDE
+          bufMat[idx] = MAT_NONE
+          bufOrigMat[idx] = MAT_NONE
+          bufSdf[idx] = 0
+          continue
+        }
+        const cur = readD(i0 + i, j0 + j, k0 + k)
+        const m = readMat(i0 + i, j0 + j, k0 + k)
+        bufD[idx] = cur
+        bufOrigD[idx] = cur
+        bufMat[idx] = m
+        bufOrigMat[idx] = m
+        const t = Math.max(0, Math.min(1, (r - dist) / span))
+        const wgt = t * t * (3 - 2 * t) * amount
+        bufSdf[idx] = wgt
+        if (wgt > 0) active = true
+      }
+    }
+  }
+  if (!active) return bounds
+
+  // --- 2. ラプラシアン平滑化を数回。同時更新にするため別バッファへ書く ---
+  for (let pass = 0; pass < SMOOTH_PASSES; pass++) {
+    bufNext.set(bufD.subarray(0, n))
+    for (let k = 1; k < d - 1; k++) {
+      for (let j = 1; j < h - 1; j++) {
+        const row = (j + k * h) * w
+        for (let i = 1; i < w - 1; i++) {
+          const idx = row + i
+          const wgt = bufSdf[idx]
+          if (wgt <= 0) continue
+          const a = bufD[idx - 1]
+          const b = bufD[idx + 1]
+          const c = bufD[idx - w]
+          const e = bufD[idx + w]
+          const f = bufD[idx - strideK]
+          const g = bufD[idx + strideK]
+          // 読み込み範囲の外が混ざったら平滑化しない（OUTSIDE は密度ではない）
+          if (a === OUTSIDE || b === OUTSIDE || c === OUTSIDE) continue
+          if (e === OUTSIDE || f === OUTSIDE || g === OUTSIDE) continue
+          const avg = (a + b + c + e + f + g) / 6
+          bufNext[idx] = bufD[idx] + (avg - bufD[idx]) * wgt
+        }
+      }
+    }
+    bufD.set(bufNext.subarray(0, n))
+  }
+
+  // --- 3. 誤差程度の変化は捨てて書き戻す ---
+  for (let idx = 0; idx < n; idx++) {
+    if (Math.abs(bufD[idx] - bufOrigD[idx]) < SMOOTH_EPSILON) bufD[idx] = bufOrigD[idx]
+  }
+  writeBack(reg, bounds, write)
   return bounds
 }
 
@@ -203,19 +452,11 @@ const FLOATING = 2
  * これがブラシの縁に残る「とげ」「薄片の先端」の正体で、
  * 小さな塊として描画されてしまう。
  *
- * 対象をブラシ球の近傍（limit2 の内側）に限っているので、
+ * 対象をブラシ表面の近傍（CLEAN_BAND の内側）に限っているので、
  * 押しっぱなしで何度適用しても穴がそれ以上広がることはない。
  * 幅 1 格子の触手だけが消え、板状の壁（面隣接が 4 個ある）はそのまま残る。
  */
-function erodeThinShards(
-  w: number,
-  h: number,
-  d: number,
-  ox: number,
-  oy: number,
-  oz: number,
-  limit2: number,
-): number {
+function erodeThinShards(w: number, h: number, d: number): number {
   const n = w * h * d
   const strideK = w * h
   let total = 0
@@ -225,16 +466,12 @@ function erodeThinShards(
     for (let i = 0; i < n; i++) bufState[i] = bufD[i] > 0 ? 1 : 0
     let removed = 0
     for (let k = 1; k < d - 1; k++) {
-      const dz = oz + k
       for (let j = 1; j < h - 1; j++) {
-        const dy = oy + j
         const row = (j + k * h) * w
-        const planar = dy * dy + dz * dz
         for (let i = 1; i < w - 1; i++) {
           const idx = row + i
           if (bufState[idx] === 0) continue
-          const dx = ox + i
-          if (dx * dx + planar > limit2) continue
+          if (bufSdf[idx] > CLEAN_BAND) continue
           let c = 0
           if (bufState[idx - 1] !== 0) c++
           if (bufState[idx + 1] !== 0) c++
@@ -255,50 +492,30 @@ function erodeThinShards(
 }
 
 /**
- * 箱の外へつながっていない固体の連結成分のうち、小さいものを空にする。
- * 箱の面に接している成分は本体につながっている可能性があるので必ず残す。
+ * 読み込み範囲の外へつながっていない固体の連結成分のうち、小さいものを空にする。
+ * 外殻に接している成分は本体につながっている可能性があるので必ず残す。
  *
  * 連結は 6 近傍（面で接している）で見る。斜めでしか繋がっていない小塊は
  * 見た目には本体から切り離された切れ端に見えるので、消す側に倒す。
  *
  * @returns 空にした格子点の数
  */
-function removeSmallFragments(
-  w: number,
-  h: number,
-  d: number,
-  ox: number,
-  oy: number,
-  oz: number,
-  reach: number,
-  maxSize: number,
-): number {
+function removeSmallFragments(w: number, h: number, d: number, maxSize: number): number {
   const n = w * h * d
   bufState.fill(UNVISITED, 0, n)
 
   // 読み込み範囲の外殻にある固体を起点に、本体側を塗る。
   // ブラシの外へ抜ける経路は必ずこの殻を通るので、これで本体との連結が分かる。
-  const shell2 = (reach - 1) * (reach - 1)
   stack.length = 0
-  for (let k = 0; k < d; k++) {
-    const dz = oz + k
-    for (let j = 0; j < h; j++) {
-      const dy = oy + j
-      const row = (j + k * h) * w
-      const planar = dy * dy + dz * dz
-      for (let i = 0; i < w; i++) {
-        const idx = row + i
-        if (bufD[idx] <= 0 || bufState[idx] !== UNVISITED) continue
-        const dx = ox + i
-        if (dx * dx + planar < shell2) continue
-        bufState[idx] = ANCHORED
-        stack.push(idx)
-      }
-    }
+  for (let idx = 0; idx < n; idx++) {
+    if (bufD[idx] <= 0 || bufState[idx] !== UNVISITED) continue
+    if (bufSdf[idx] < REACH_PAD - 1) continue
+    bufState[idx] = ANCHORED
+    stack.push(idx)
   }
   flood(w, h, d, ANCHORED)
 
-  // 残った固体は箱の中で浮いている塊
+  // 残った固体は読み込み範囲の中で浮いている塊
   let removed = 0
   for (let idx = 0; idx < n; idx++) {
     if (bufD[idx] <= 0 || bufState[idx] !== UNVISITED) continue

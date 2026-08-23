@@ -22,6 +22,7 @@ export interface SmoothDebug {
   villageBoxes: number
   chopped: number
   seed: number
+  tool: string
   inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
@@ -29,6 +30,9 @@ export interface SmoothDebug {
   gotoVillage(): boolean
   nearestTree(): { x: number; y: number; z: number } | null
   giveMaterial(index: number, amount: number): void
+  setTool(name: string): void
+  setBrushRadius(r: number): void
+  density(x: number, y: number, z: number): number
 }
 
 declare global {

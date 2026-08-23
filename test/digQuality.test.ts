@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { applySphereBrush } from '../src/world/edits'
+import { applyBrush, applySmoothBrush, applySphereBrush, boxBrush, snapBoxCenter } from '../src/world/edits'
 import { DensityField } from '../src/world/density'
 import { SAMPLE_SEED } from '../src/world/constants'
 
@@ -92,6 +92,36 @@ describe('掘ったあとの地形の質', () => {
 
       const after = countWeak(w.readD, sx, sy, sz, 8)
       expect(after, `掘る前 ${before} → 掘った後 ${after}`).toBeLessThanOrEqual(before)
+    })
+
+    it(`(${sx}, ${sz}) を直方体で掘っても切れ端が増えない`, () => {
+      const w = makeWorld(field)
+      const sy = Math.round(field.height(sx, sz))
+      const before = countWeak(w.readD, sx, sy, sz, 8)
+
+      const half = 1.5
+      for (let i = -2; i <= 2; i++) {
+        const x = snapBoxCenter(sx + i * 2, half)
+        const z = snapBoxCenter(sz + Math.sin(i * 0.7) * 1.5, half)
+        const y = snapBoxCenter(field.height(x, z) - 0.3, half)
+        applyBrush(x, y, z, boxBrush(half, half, half), 'dig', 0, w.readD, w.readMat, w.write, -120, 180)
+      }
+
+      const after = countWeak(w.readD, sx, sy, sz, 8)
+      expect(after, `掘る前 ${before} → 掘った後 ${after}`).toBeLessThanOrEqual(before)
+    })
+
+    it(`(${sx}, ${sz}) をならしても切れ端が増えない`, () => {
+      const w = makeWorld(field)
+      const sy = Math.round(field.height(sx, sz))
+      const before = countWeak(w.readD, sx, sy, sz, 8)
+
+      for (let i = 0; i < 4; i++) {
+        applySmoothBrush(sx, sy, sz, 4, 1, w.readD, w.readMat, w.write, -120, 180)
+      }
+
+      const after = countWeak(w.readD, sx, sy, sz, 8)
+      expect(after, `ならす前 ${before} → ならした後 ${after}`).toBeLessThanOrEqual(before)
     })
   }
 })

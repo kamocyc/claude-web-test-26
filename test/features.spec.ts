@@ -153,3 +153,80 @@ test.describe('採掘量', () => {
     expect(placed.inventory[best], '盛っても手持ちが減らない').toBeLessThan(dug.inventory[best])
   })
 })
+
+/** 中心 c のまわりの密度を格子状に読む。 */
+async function probe(page: Page, c: { x: number; y: number; z: number }): Promise<number[]> {
+  return page.evaluate((p) => {
+    const s = window.__smooth!
+    const out: number[] = []
+    for (let dy = -4; dy <= 1; dy++) {
+      for (let dz = -3; dz <= 3; dz++) {
+        for (let dx = -3; dx <= 3; dx++) out.push(s.density(p.x + dx, p.y + dy, p.z + dz))
+      }
+    }
+    return out
+  }, c)
+}
+
+function changed(a: number[], b: number[]): number {
+  let n = 0
+  for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > 1e-3) n++
+  return n
+}
+
+/** 真下を向く。 */
+async function lookDown(page: Page): Promise<void> {
+  await page.evaluate(() =>
+    document.dispatchEvent(new MouseEvent('mousemove', { movementX: 0, movementY: 620 })),
+  )
+  await page.waitForTimeout(600)
+}
+
+test.describe('ブラシの切り替え', () => {
+  test('B キーで 球 → 直方体 → ならし と巡回する', async ({ page }) => {
+    await start(page)
+    expect((await api(page)).tool).toBe('sphere')
+    for (const expected of ['box', 'smooth', 'sphere']) {
+      await page.keyboard.press('KeyB')
+      // 数 fps しか出ないので、次のフレームで stats が更新されるまで待つ
+      await page.waitForFunction((t) => window.__smooth?.tool === t, expected, { timeout: 10_000 })
+    }
+  })
+
+  test('直方体ブラシは大きさを一辺で表示し、地形を削る', async ({ page }) => {
+    await start(page)
+    await page.evaluate(() => window.__smooth!.setTool('box'))
+    await page.waitForTimeout(200)
+    expect(await page.textContent('#brush')).toMatch(/直方体 \d+×\d+×\d+ m/)
+
+    await lookDown(page)
+    const c = await page.evaluate(() => window.__smooth!.state())
+    const before = await probe(page, c)
+    await click(page, 0, 900)
+    expect(changed(before, await probe(page, c)), '直方体で掘っても地形が変わらない').toBeGreaterThan(
+      20,
+    )
+  })
+})
+
+test.describe('ならしブラシ', () => {
+  test('地形は変わるが手持ちは増減しない', async ({ page }) => {
+    await start(page)
+    await lookDown(page)
+
+    // まず掘って、ならす対象の凹凸と手持ちを作る
+    await click(page, 0, 2000)
+    const dug = await api(page)
+    expect(dug.inventory.reduce((a, b) => a + b, 0)).toBeGreaterThan(5)
+
+    await page.evaluate(() => window.__smooth!.setTool('smooth'))
+    await lookDown(page)
+    const c = await page.evaluate(() => window.__smooth!.state())
+    const before = await probe(page, c)
+    await click(page, 0, 1500)
+    const after = await api(page)
+
+    expect(changed(before, await probe(page, c)), 'ならしても地形が変わらない').toBeGreaterThan(20)
+    expect(after.inventory, 'ならしで手持ちが増減した').toEqual(dug.inventory)
+  })
+})

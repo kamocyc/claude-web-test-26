@@ -14,8 +14,8 @@ import {
 import { DensityField } from './density'
 import { Chunk, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
 import type { EditMap } from './Chunk'
-import { applySphereBrush } from './edits'
-import type { BrushBounds, BrushMode } from './edits'
+import { applyBrush, applySmoothBrush } from './edits'
+import type { BrushBounds, BrushMode, BrushShape } from './edits'
 import { TREE_CELL, TREE_STRIDE, treeCellKey } from './vegetation'
 import { WorkerPool } from './WorkerPool'
 import type { TreePrototype } from '../render/treeMeshes'
@@ -273,28 +273,64 @@ export class World {
 
   // ------------------------------------------------------------------ 編集
 
-  /** 球ブラシを適用する。何も変化しなければ null。 */
+  /** ブラシを適用する。何も変化しなければ null。 */
   applyBrush(
     x: number,
     y: number,
     z: number,
-    radius: number,
+    shape: BrushShape,
     mode: BrushMode,
     material: number,
   ): BrushBounds | null {
-    const bounds = applySphereBrush(
-      x,
-      y,
-      z,
-      radius,
-      mode,
-      material,
-      (gx, gy, gz) => this.cornerDensity(gx, gy, gz),
-      (gx, gy, gz) => this.cornerMaterial(gx, gy, gz),
-      (gx, gy, gz, d, mat) => this.setEdit(gx, gy, gz, d, mat),
-      WORLD_MIN_Y + 2,
-      WORLD_MAX_Y - 2,
+    return this.finishEdit(
+      applyBrush(
+        x,
+        y,
+        z,
+        shape,
+        mode,
+        material,
+        this.readD,
+        this.readMat,
+        this.writeCorner,
+        WORLD_MIN_Y + 2,
+        WORLD_MAX_Y - 2,
+      ),
     )
+  }
+
+  /** 凸凹をならす。何も変化しなければ null。 */
+  applySmooth(x: number, y: number, z: number, radius: number, strength: number): BrushBounds | null {
+    return this.finishEdit(
+      applySmoothBrush(
+        x,
+        y,
+        z,
+        radius,
+        strength,
+        this.readD,
+        this.readMat,
+        this.writeCorner,
+        WORLD_MIN_Y + 2,
+        WORLD_MAX_Y - 2,
+      ),
+    )
+  }
+
+  private readonly readD = (gx: number, gy: number, gz: number): number =>
+    this.cornerDensity(gx, gy, gz)
+  private readonly readMat = (gx: number, gy: number, gz: number): number =>
+    this.cornerMaterial(gx, gy, gz)
+  private readonly writeCorner = (
+    gx: number,
+    gy: number,
+    gz: number,
+    d: number,
+    mat: number,
+  ): void => this.setEdit(gx, gy, gz, d, mat)
+
+  /** 編集されたコーナーを含むチャンクを作り直す。 */
+  private finishEdit(bounds: BrushBounds): BrushBounds | null {
     if (bounds.touched === 0) return null
 
     // 編集されたコーナーを含むパディング済みグリッドを持つチャンクをすべて作り直す

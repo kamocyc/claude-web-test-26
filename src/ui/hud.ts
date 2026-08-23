@@ -55,8 +55,8 @@ export class Hud {
     }
   }
 
-  setBrush(radius: number, note: string | null = null): void {
-    this.brush.textContent = note ?? `ブラシ半径 ${radius.toFixed(1)} m`
+  setBrush(label: string): void {
+    this.brush.textContent = label
   }
 
   /** 短いメッセージを一時表示する。 */
