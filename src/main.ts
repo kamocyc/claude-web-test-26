@@ -36,6 +36,21 @@ const TOOLS = [
   { id: 'smooth', name: 'ならし' },
 ] as const
 
+/** T キーで巡回するデバッグ用の時刻。`null` は自動で進む状態。 */
+const TIME_PRESETS: Array<{ name: string; t: number } | null> = [
+  null,
+  { name: '朝', t: 7 / 24 },
+  { name: '昼', t: 12 / 24 },
+  { name: '夕', t: 18 / 24 },
+  { name: '夜', t: 0 },
+]
+
+/**
+ * 粒状の素材のブラシ半径の上限。
+ * どのみち崩れて広がるので、これ以上大きくしても山の形は変わらず計算量だけ増える。
+ */
+const MAX_PILE_RADIUS = 3.5
+
 const MIN_BOX_EDGE = 2
 /** これ以上大きくすると 1 回の掘削が 10ms を超えてカクつく。 */
 const MAX_BOX_EDGE = 8
@@ -178,11 +193,13 @@ async function boot(): Promise<void> {
   function brushLabel(note: string | null = null): string {
     if (note) return note
     const t = TOOLS[tool]
+    const m = MATERIAL_INFO[slot]
+    const grain = t.id !== 'smooth' && m.repose > 0 ? `　${m.name}は崩れて積もる` : ''
     if (t.id === 'box') {
       const n = boxEdge(brushRadius)
-      return `${t.name} ${n}×${n}×${n} m`
+      return `${t.name} ${n}×${n}×${n} m${grain}`
     }
-    return `${t.name} 半径 ${brushRadius.toFixed(1)} m`
+    return `${t.name} 半径 ${brushRadius.toFixed(1)} m${grain}`
   }
 
   let brushRadius = 2.5
@@ -199,6 +216,19 @@ async function boot(): Promise<void> {
     hud.setSlot(i)
   }
   controls.onToggleFly = () => player.toggleFly()
+  let timePreset = 0
+  function applyTimePreset(): void {
+    const p = TIME_PRESETS[timePreset]
+    sky.paused = p !== null
+    if (p) sky.timeOfDay = p.t
+    markMetaDirty()
+  }
+  controls.onCycleTime = () => {
+    timePreset = (timePreset + 1) % TIME_PRESETS.length
+    applyTimePreset()
+    const p = TIME_PRESETS[timePreset]
+    hud.showToast(p ? `時刻: ${p.name}（固定）` : '時刻: 自動で進む')
+  }
   controls.onCycleTool = () => {
     tool = (tool + 1) % TOOLS.length
     hud.showToast(`ブラシ: ${TOOLS[tool].name}`)
@@ -281,6 +311,10 @@ async function boot(): Promise<void> {
     seed,
     /** 現在のブラシ。 */
     tool: TOOLS[0].id as string,
+    /** 時刻 [0,1)。0.5 が正午。 */
+    timeOfDay: 0,
+    /** 時刻を固定しているか。 */
+    timeFrozen: false,
     /** 素材の手持ち量（grass, dirt, rock, sand）。 */
     inventory: [0, 0, 0, 0] as number[],
     /** 視線角を直接設定する。 */
@@ -327,6 +361,17 @@ async function boot(): Promise<void> {
         }
       }
       return best
+    },
+    /** 時刻を時（0〜24）で固定する。null で自動に戻す。 */
+    setTime(hours: number | null) {
+      if (hours === null) {
+        timePreset = 0
+      } else {
+        timePreset = -1
+        sky.timeOfDay = ((hours / 24) % 1 + 1) % 1
+      }
+      sky.paused = hours !== null
+      markMetaDirty()
     },
     /** ブラシを切り替える（テスト用）。 */
     setTool(name: string) {
@@ -471,9 +516,11 @@ async function boot(): Promise<void> {
 
       // 手持ちが足りないぶんブラシを小さくする（盛れる量 = 掘った量）
       const stock = inventory[slot]
-      const edge = boxEdge(brushRadius)
-      const half = dig ? edge / 2 : Math.min(edge, Math.floor(Math.cbrt(stock))) / 2
-      const radius = dig ? brushRadius : Math.min(brushRadius, Math.cbrt((stock * 3) / (4 * Math.PI)))
+      const repose = MATERIAL_INFO[slot].repose
+      const cap = repose > 0 ? Math.min(brushRadius, MAX_PILE_RADIUS) : brushRadius
+      const edge = Math.min(boxEdge(brushRadius), Math.floor(cap * 2))
+      const half = dig ? boxEdge(brushRadius) / 2 : Math.min(edge, Math.floor(Math.cbrt(stock))) / 2
+      const radius = dig ? brushRadius : Math.min(cap, Math.cbrt((stock * 3) / (4 * Math.PI)))
 
       // 掘るときは表面のわずかに内側、置くときはわずかに外側を中心にする
       const off = dig ? -0.25 : 0.35
@@ -492,8 +539,18 @@ async function boot(): Promise<void> {
         }
       }
 
-      const showBox = kind === 'box' && target !== null && !onTree && half > 0
-      const showSphere = kind !== 'box' && target !== null && !onTree
+      // カメラがゴーストの内側に入ると、ワイヤーが視界を覆って邪魔になるだけなので隠す
+      const toGhost = Math.max(
+        Math.abs(eye.x - cx),
+        Math.abs(eye.y - cy),
+        Math.abs(eye.z - cz),
+      )
+      const inside =
+        kind === 'box'
+          ? toGhost < half + 0.3
+          : Math.hypot(eye.x - cx, eye.y - cy, eye.z - cz) < radius + 0.3
+      const showBox = kind === 'box' && target !== null && !onTree && half > 0 && !inside
+      const showSphere = kind !== 'box' && target !== null && !onTree && !inside
       boxGhost.visible = showBox
       ghost.visible = showSphere
       if (showBox) {
@@ -518,16 +575,15 @@ async function boot(): Promise<void> {
           hud.showToast(`${MATERIAL_INFO[slot].name}が足りません（掘って集める）`)
           editCooldown = 0.5
         } else {
+          const shape = kind === 'box' ? boxBrush(half, half, half) : sphereBrush(radius)
           const bounds = smoothing
             ? world.applySmooth(cx, cy, cz, brushRadius, 1)
-            : world.applyBrush(
-                cx,
-                cy,
-                cz,
-                kind === 'box' ? boxBrush(half, half, half) : sphereBrush(radius),
-                dig ? 'dig' : 'place',
-                MATERIAL_INFO[slot].id,
-              )
+            : dig
+              ? world.applyBrush(cx, cy, cz, shape, 'dig', MATERIAL_INFO[slot].id)
+              : repose > 0
+                ? // 粒状の素材は形のまま固まらず、落ちて安息角の山になる
+                  world.applyPile(cx, cy, cz, shape, MATERIAL_INFO[slot].id, repose)
+                : world.applyBrush(cx, cy, cz, shape, 'place', MATERIAL_INFO[slot].id)
           if (bounds) {
             if (smoothing) {
               // 収支なし
@@ -579,7 +635,7 @@ async function boot(): Promise<void> {
           `Mode  ${player.flying ? '飛行' : player.inWater ? '水中' : player.onGround ? '接地' : '空中'}`,
           `Env   ${biomeName(world, player.position.x, player.position.z)}  村 ${villages.activeCount}`,
           `Tree  ${world.treeCount}  伐採 ${world.choppedCount}`,
-          `Time  ${String(h).padStart(2, '0')}:00`,
+          `Time  ${String(h % 24).padStart(2, '0')}:00${sky.paused ? '  固定' : ''}`,
           `Seed  ${seed}`,
         ].join('\n'),
       )
@@ -608,6 +664,8 @@ async function boot(): Promise<void> {
     for (let i = 0; i < inventory.length; i++) stats.inventory[i] = inventory[i]
     stats.trees = world.treeCount
     stats.tool = TOOLS[tool].id
+    stats.timeOfDay = sky.timeOfDay
+    stats.timeFrozen = sky.paused
   }
 
   tick()

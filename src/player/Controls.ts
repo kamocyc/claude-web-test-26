@@ -21,6 +21,8 @@ export class Controls {
   onToggleFly: (() => void) | null = null
   /** B キー: ブラシの切り替え */
   onCycleTool: (() => void) | null = null
+  /** T キー: 時刻の切り替え（デバッグ） */
+  onCycleTime: (() => void) | null = null
   onLockChange: ((locked: boolean) => void) | null = null
   onToggleStats: (() => void) | null = null
   /** デバッグ: 最寄りの村へワープ */
@@ -103,6 +105,11 @@ export class Controls {
 
     if (e.code === 'KeyB') {
       this.onCycleTool?.()
+      return
+    }
+
+    if (e.code === 'KeyT') {
+      this.onCycleTime?.()
       return
     }
 

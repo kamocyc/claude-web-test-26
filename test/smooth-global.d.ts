@@ -23,6 +23,8 @@ export interface SmoothDebug {
   chopped: number
   seed: number
   tool: string
+  timeOfDay: number
+  timeFrozen: boolean
   inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
@@ -31,6 +33,7 @@ export interface SmoothDebug {
   nearestTree(): { x: number; y: number; z: number } | null
   giveMaterial(index: number, amount: number): void
   setTool(name: string): void
+  setTime(hours: number | null): void
   setBrushRadius(r: number): void
   density(x: number, y: number, z: number): number
 }

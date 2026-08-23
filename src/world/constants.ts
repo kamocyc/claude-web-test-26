@@ -41,11 +41,15 @@ export const MAT_NONE = 255
 
 export const MATERIAL_COUNT = 4
 
+/**
+ * 素材の一覧。`repose` は安息角（度）で、0 でない素材は
+ * 盛ると落ちてその傾斜の山になる（粒状の素材）。
+ */
 export const MATERIAL_INFO = [
-  { id: MAT_GRASS, name: '草', color: '#6f9c46' },
-  { id: MAT_DIRT, name: '土', color: '#7d5a3c' },
-  { id: MAT_ROCK, name: '岩', color: '#8a8f96' },
-  { id: MAT_SAND, name: '砂', color: '#d8c48a' },
+  { id: MAT_GRASS, name: '草', color: '#6f9c46', repose: 0 },
+  { id: MAT_DIRT, name: '土', color: '#7d5a3c', repose: 38 },
+  { id: MAT_ROCK, name: '岩', color: '#8a8f96', repose: 0 },
+  { id: MAT_SAND, name: '砂', color: '#d8c48a', repose: 32 },
 ] as const
 
 /**

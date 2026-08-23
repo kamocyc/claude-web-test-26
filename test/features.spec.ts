@@ -230,3 +230,71 @@ test.describe('ならしブラシ', () => {
     expect(after.inventory, 'ならしで手持ちが増減した').toEqual(dug.inventory)
   })
 })
+
+test.describe('昼夜', () => {
+  test('T キーで 朝 → 昼 → 夕 → 夜 → 自動 と切り替わる', async ({ page }) => {
+    await start(page)
+    expect((await api(page)).timeFrozen).toBe(false)
+
+    for (const hour of [7, 12, 18, 0]) {
+      await page.keyboard.press('KeyT')
+      await page.waitForFunction(
+        (h) => window.__smooth?.timeFrozen === true && Math.abs(window.__smooth.timeOfDay - h / 24) < 1e-6,
+        hour,
+        { timeout: 10_000 },
+      )
+    }
+    await page.keyboard.press('KeyT')
+    await page.waitForFunction(() => window.__smooth?.timeFrozen === false, null, { timeout: 10_000 })
+  })
+
+  test('固定した時刻は進まない', async ({ page }) => {
+    await start(page)
+    await page.evaluate(() => window.__smooth!.setTime(0))
+    await page.waitForTimeout(2500)
+    expect((await api(page)).timeOfDay).toBe(0)
+  })
+})
+
+test.describe('土砂', () => {
+  test('盛った土はブラシの外まで崩れて広がる', async ({ page }) => {
+    await start(page)
+    await lookDown(page)
+    // 土（スロット 2）をたっぷり与えて選ぶ
+    await page.evaluate(() => window.__smooth!.giveMaterial(1, 5000))
+    await page.keyboard.press('Digit2')
+    await page.waitForTimeout(400)
+
+    const c = await page.evaluate(() => window.__smooth!.state())
+    /** 中心から +x 方向の地表の高さ。 */
+    const profile = () =>
+      page.evaluate((p) => {
+        const s = window.__smooth!
+        const out: number[] = []
+        for (let dx = 0; dx <= 6; dx++) {
+          let h = -99
+          for (let y = p.y + 8; y > p.y - 10; y -= 0.2) {
+            if (s.density(p.x + dx, y, p.z) > 0) {
+              h = y
+              break
+            }
+          }
+          out.push(h)
+        }
+        return out
+      }, c)
+
+    const before = await profile()
+    await click(page, 2, 900)
+    const after = await profile()
+
+    // ブラシ半径の上限は 3.5 m。その外側が持ち上がっていれば「崩れて広がった」
+    expect(after[5], `4〜5m 先が持ち上がっていない before=${before[5]} after=${after[5]}`).toBeGreaterThan(
+      before[5] + 0.15,
+    )
+    // 元の地形は削れない
+    for (let i = 0; i < before.length; i++) {
+      expect(after[i], `${i}m の地面が下がった`).toBeGreaterThan(before[i] - 0.25)
+    }
+  })
+})

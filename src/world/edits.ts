@@ -34,6 +34,16 @@ export interface BrushShape {
   readonly ey: number
   readonly ez: number
   sdf(dx: number, dy: number, dz: number): number
+  /**
+   * ローカル座標 (dx, dz) の柱がブラシと交わる y 区間 `[lo, hi]`。
+   * 交わらなければ `lo > hi` を返す。土砂を柱ごとに積むときに使う。
+   */
+  span(dx: number, dz: number, out: Span): Span
+}
+
+export interface Span {
+  lo: number
+  hi: number
 }
 
 export function sphereBrush(radius: number): BrushShape {
@@ -43,6 +53,13 @@ export function sphereBrush(radius: number): BrushShape {
     ey: r,
     ez: r,
     sdf: (dx, dy, dz) => Math.sqrt(dx * dx + dy * dy + dz * dz) - r,
+    span: (dx, dz, out) => {
+      const t = r * r - dx * dx - dz * dz
+      const hc = t > 0 ? Math.sqrt(t) : -1
+      out.lo = -hc
+      out.hi = hc
+      return out
+    },
   }
 }
 
@@ -71,6 +88,12 @@ export function boxBrush(hx: number, hy: number, hz: number): BrushShape {
       const outside = Math.sqrt(ox * ox + oy * oy + oz * oz)
       const inside = Math.min(Math.max(qx, qy, qz), 0)
       return outside + inside
+    },
+    span: (dx, dz, out) => {
+      const hit = Math.abs(dx) <= ax && Math.abs(dz) <= az
+      out.lo = hit ? -ay : 1
+      out.hi = hit ? ay : -1
+      return out
     },
   }
 }
@@ -440,6 +463,193 @@ export function applySmoothBrush(
     if (Math.abs(bufD[idx] - bufOrigD[idx]) < SMOOTH_EPSILON) bufD[idx] = bufOrigD[idx]
   }
   writeBack(reg, bounds, write)
+  return bounds
+}
+
+/** 土砂が横に広がれる距離（m）。これより外へは流れない。 */
+const PILE_SPREAD = 8
+
+/** ブラシの底からこの深さまで落ちる。 */
+const PILE_FALL = 6
+
+/** 安息角に達するまでの緩和回数と 1 回あたりの移動割合。 */
+const PILE_PASSES = 64
+const PILE_RELAX = 0.25
+
+const COL_UNSCANNED = 0
+const COL_OPEN = 1
+const COL_BLOCKED = 2
+
+// 柱ごとの作業配列
+let colBase: Float32Array = new Float32Array(0)
+let colTop: Float32Array = new Float32Array(0)
+let colState: Uint8Array = new Uint8Array(0)
+const scratchSpan: Span = { lo: 0, hi: 0 }
+
+function ensureColumns(n: number): void {
+  if (colBase.length >= n) return
+  colBase = new Float32Array(n)
+  colTop = new Float32Array(n)
+  colState = new Uint8Array(n)
+}
+
+/**
+ * 粒状の素材（土・砂）を盛る。ブラシの形に固まらず、**落ちて安息角の山になる**。
+ *
+ * 密度場を直接崩すのではなく、柱ごとの高さ場に置き換えて解く:
+ *
+ * 1. ブラシの footprint の各柱について、いまの地表の高さ `base` を求める
+ *    （上から下へ最初に固体になるところ。線形補間するので段差にならない）
+ * 2. ブラシがその柱を貫く長さのうち **地表より上の分** を、その柱に積む
+ *    （地表より下はもともと固体なので、置いても何も増えない）
+ * 3. 隣り合う柱の高さ差が `tan(安息角)` を超えているあいだ、超過分を隣へ流す。
+ *    流せるのは今回積んだ分だけなので、元の地形は削れない
+ * 4. 柱ごとに、元の地表の 1 つ下から新しい地表までを密度場に union する
+ *
+ * 落下は 1 の時点で織り込まれている。空中に置いても、その柱の地表の上に積まれる。
+ * 地表の探索は必要になった柱だけ遅延して行う（山が届かない柱は読まない）。
+ *
+ * @param repose 安息角（度）。土 38°、砂 32° 程度。
+ */
+export function applyPileBrush(
+  wx: number,
+  wy: number,
+  wz: number,
+  shape: BrushShape,
+  material: number,
+  repose: number,
+  readD: CornerReader,
+  readMat: CornerMatReader,
+  write: CornerWriter,
+  clampMinY: number,
+  clampMaxY: number,
+): BrushBounds {
+  const cx = wx / VOXEL_SIZE
+  const cy = wy / VOXEL_SIZE
+  const cz = wz / VOXEL_SIZE
+  const bounds = emptyBounds()
+
+  const rx = shape.ex + PILE_SPREAD / VOXEL_SIZE
+  const rz = shape.ez + PILE_SPREAD / VOXEL_SIZE
+  const i0 = Math.floor(cx - rx)
+  const i1 = Math.ceil(cx + rx)
+  const k0 = Math.floor(cz - rz)
+  const k1 = Math.ceil(cz + rz)
+  const yTop = Math.min(Math.ceil(clampMaxY / VOXEL_SIZE), Math.ceil(cy + shape.ey) + 1)
+  const yBottom = Math.max(
+    Math.floor(clampMinY / VOXEL_SIZE),
+    Math.floor(cy - shape.ey - PILE_FALL / VOXEL_SIZE),
+  )
+  const w = i1 - i0 + 1
+  const d = k1 - k0 + 1
+  if (w <= 0 || d <= 0 || yTop <= yBottom) return bounds
+  const n = w * d
+  ensureColumns(n)
+  colState.fill(COL_UNSCANNED, 0, n)
+
+  /** 柱の地表を測る。天井まで詰まっていれば壁として扱う。 */
+  function scan(idx: number): boolean {
+    if (colState[idx] !== COL_UNSCANNED) return colState[idx] === COL_OPEN
+    const i = idx % w
+    const gx = i0 + i
+    const gz = k0 + (idx - i) / w
+    let prev = readD(gx, yTop, gz)
+    if (prev > 0) {
+      colState[idx] = COL_BLOCKED
+      return false
+    }
+    let base = yBottom
+    for (let y = yTop - 1; y >= yBottom; y--) {
+      const cur = readD(gx, y, gz)
+      if (cur > 0) {
+        base = y + cur / (cur - prev)
+        break
+      }
+      prev = cur
+    }
+    colState[idx] = COL_OPEN
+    colBase[idx] = base
+    colTop[idx] = base
+    return true
+  }
+
+  // --- 1〜2. ブラシが当たる柱だけ測って、地表より上の分を積む ---
+  for (let k = 0; k < d; k++) {
+    const dz = k0 + k - cz
+    for (let i = 0; i < w; i++) {
+      const span = shape.span(i0 + i - cx, dz, scratchSpan)
+      if (span.hi <= span.lo) continue
+      const idx = i + k * w
+      if (!scan(idx)) continue
+      const hi = cy + span.hi
+      const lo = Math.max(colBase[idx], cy + span.lo)
+      if (hi > lo) colTop[idx] = colBase[idx] + (hi - lo)
+    }
+  }
+
+  // --- 3. 安息角まで崩す ---
+  const maxStep = Math.tan((repose * Math.PI) / 180) * VOXEL_SIZE
+  for (let pass = 0; pass < PILE_PASSES; pass++) {
+    let moved = 0
+    for (let k = 0; k < d; k++) {
+      for (let i = 0; i < w; i++) {
+        const idx = i + k * w
+        if (colState[idx] !== COL_OPEN) continue
+        let loose = colTop[idx] - colBase[idx]
+        if (loose <= 1e-4) continue
+        for (let dir = 0; dir < 4; dir++) {
+          const ni = i + (dir === 0 ? 1 : dir === 1 ? -1 : 0)
+          const nk = k + (dir === 2 ? 1 : dir === 3 ? -1 : 0)
+          if (ni < 0 || ni >= w || nk < 0 || nk >= d) continue
+          const nIdx = ni + nk * w
+          if (!scan(nIdx)) continue
+          const diff = colTop[idx] - colTop[nIdx] - maxStep
+          if (diff <= 0) continue
+          const m = Math.min(diff * PILE_RELAX, loose)
+          if (m <= 1e-5) continue
+          colTop[idx] -= m
+          colTop[nIdx] += m
+          loose -= m
+          moved += m
+          if (loose <= 1e-4) break
+        }
+      }
+    }
+    if (moved < 1e-3) break
+  }
+
+  // --- 4. 柱ごとに密度場へ union する ---
+  const yLimit = Math.ceil(clampMaxY / VOXEL_SIZE)
+  for (let k = 0; k < d; k++) {
+    const gz = k0 + k
+    for (let i = 0; i < w; i++) {
+      const idx = i + k * w
+      if (colState[idx] !== COL_OPEN) continue
+      const base = colBase[idx]
+      const top = colTop[idx]
+      if (top - base < 1e-3) continue
+      const gx = i0 + i
+      // 元の地表の 1 つ下から新しい地表の 1 つ上までを、半空間 `top - y` と union する。
+      // 範囲を切っているので、下にある洞窟は埋まらない。
+      const y0 = Math.max(yBottom, Math.floor(base))
+      const y1 = Math.min(yLimit, Math.ceil(top))
+      for (let y = y0; y <= y1; y++) {
+        const cur = readD(gx, y, gz)
+        const next = Math.max(cur, top - y)
+        if (next === cur) continue
+        write(gx, y, gz, next, next > 0 ? material : readMat(gx, y, gz))
+        bounds.touched++
+        if (cur <= 0 && next > 0) bounds.solidified++
+        if (gx < bounds.minX) bounds.minX = gx
+        if (y < bounds.minY) bounds.minY = y
+        if (gz < bounds.minZ) bounds.minZ = gz
+        if (gx > bounds.maxX) bounds.maxX = gx
+        if (y > bounds.maxY) bounds.maxY = y
+        if (gz > bounds.maxZ) bounds.maxZ = gz
+      }
+    }
+  }
+
   return bounds
 }
 

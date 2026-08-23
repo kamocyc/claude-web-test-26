@@ -14,7 +14,7 @@ import {
 import { DensityField } from './density'
 import { Chunk, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
 import type { EditMap } from './Chunk'
-import { applyBrush, applySmoothBrush } from './edits'
+import { applyBrush, applyPileBrush, applySmoothBrush } from './edits'
 import type { BrushBounds, BrushMode, BrushShape } from './edits'
 import { TREE_CELL, TREE_STRIDE, treeCellKey } from './vegetation'
 import { WorkerPool } from './WorkerPool'
@@ -290,6 +290,32 @@ export class World {
         shape,
         mode,
         material,
+        this.readD,
+        this.readMat,
+        this.writeCorner,
+        WORLD_MIN_Y + 2,
+        WORLD_MAX_Y - 2,
+      ),
+    )
+  }
+
+  /** 粒状の素材を盛る。落ちて安息角の山になる。何も変化しなければ null。 */
+  applyPile(
+    x: number,
+    y: number,
+    z: number,
+    shape: BrushShape,
+    material: number,
+    repose: number,
+  ): BrushBounds | null {
+    return this.finishEdit(
+      applyPileBrush(
+        x,
+        y,
+        z,
+        shape,
+        material,
+        repose,
         this.readD,
         this.readMat,
         this.writeCorner,

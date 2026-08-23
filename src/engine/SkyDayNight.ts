@@ -52,6 +52,8 @@ export class SkyDayNight {
   timeOfDay = 0.32
   /** 1 周にかかる実時間（秒）。 */
   dayLength = 900
+  /** true の間は時刻が進まない（デバッグ用の固定）。 */
+  paused = false
 
   readonly sun: THREE.DirectionalLight
   readonly hemi: THREE.HemisphereLight
@@ -116,7 +118,7 @@ export class SkyDayNight {
   }
 
   update(dt: number, cameraPos: THREE.Vector3, fog: THREE.FogExp2): void {
-    this.timeOfDay = (this.timeOfDay + dt / this.dayLength) % 1
+    if (!this.paused) this.timeOfDay = (this.timeOfDay + dt / this.dayLength) % 1
 
     const theta = (this.timeOfDay - 0.25) * Math.PI * 2
     this.sunDir.set(Math.cos(theta) * 0.36, Math.sin(theta), Math.cos(theta) * 0.93).normalize()
