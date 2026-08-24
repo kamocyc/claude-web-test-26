@@ -7,6 +7,10 @@ export interface TreePrototype {
   /** プレイヤーが押し出される幹の円柱。 */
   trunkRadius: number
   trunkHeight: number
+  /** 葉や枝の当たり判定の円柱（根元からの高さで指定）。半径 0 なら無し。 */
+  crownRadius: number
+  crownBase: number
+  crownTop: number
   /** 伐採の照準判定に使う、木全体を覆う円柱。 */
   hitRadius: number
   hitHeight: number
@@ -36,7 +40,16 @@ function broadleaf(): TreePrototype {
     tint(new THREE.IcosahedronGeometry(1.25, 0), 0x3d6a2a, at(0.95, 3.85, 0.5)),
     tint(new THREE.IcosahedronGeometry(1.15, 0), 0x477a2b, at(-0.85, 4.05, -0.6)),
   ]
-  return { geometry: merge(parts), trunkRadius: 0.34, trunkHeight: 3.4, hitRadius: 1.5, hitHeight: 6.2 }
+  return {
+    geometry: merge(parts),
+    trunkRadius: 0.34,
+    trunkHeight: 3.6,
+    crownRadius: 1.45,
+    crownBase: 2.9,
+    crownTop: 6.1,
+    hitRadius: 1.5,
+    hitHeight: 6.2,
+  }
 }
 
 function conifer(): TreePrototype {
@@ -46,7 +59,17 @@ function conifer(): TreePrototype {
     tint(new THREE.ConeGeometry(1.4, 2.2, 8), 0x336030, at(0, 4.3, 0)),
     tint(new THREE.ConeGeometry(0.95, 2.0, 8), 0x3b6d35, at(0, 5.5, 0)),
   ]
-  return { geometry: merge(parts), trunkRadius: 0.3, trunkHeight: 4.6, hitRadius: 1.4, hitHeight: 6.6 }
+  return {
+    geometry: merge(parts),
+    trunkRadius: 0.3,
+    trunkHeight: 4.6,
+    // いちばん下の枝は半径 1.75 から先細るので、太さ 1.35 に見合う高さから始める
+    crownRadius: 1.35,
+    crownBase: 2.35,
+    crownTop: 6.3,
+    hitRadius: 1.4,
+    hitHeight: 6.6,
+  }
 }
 
 function cactus(): TreePrototype {
@@ -56,7 +79,16 @@ function cactus(): TreePrototype {
     tint(new THREE.CylinderGeometry(0.2, 0.2, 0.9, 6), 0x548244, at(-0.5, 2.0, 0, 0, 0, -Math.PI / 2.6)),
     tint(new THREE.CylinderGeometry(0.2, 0.2, 0.8, 6), 0x548244, at(0.85, 2.15, 0)),
   ]
-  return { geometry: merge(parts), trunkRadius: 0.45, trunkHeight: 2.8, hitRadius: 0.8, hitHeight: 2.9 }
+  return {
+    geometry: merge(parts),
+    trunkRadius: 0.45,
+    trunkHeight: 2.8,
+    crownRadius: 0.7,
+    crownBase: 1.1,
+    crownTop: 2.6,
+    hitRadius: 0.8,
+    hitHeight: 2.9,
+  }
 }
 
 function at(x: number, y: number, z: number, rx = 0, ry = 0, rz = 0): THREE.Matrix4 {

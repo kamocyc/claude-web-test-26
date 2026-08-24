@@ -114,3 +114,119 @@ test.describe('移動', () => {
     expect(Math.hypot(after.x - before.x, after.z - before.z), '全く動けていない').toBeGreaterThan(0.4)
   })
 })
+
+test.describe('地形と木の当たり判定', () => {
+  test('急な坂は登れず、滑り落ちる', async ({ page }) => {
+    await start(page)
+    // 傾斜 55°以上の斜面を探して、いちばん上りのきつい向きを向く
+    const spot = await page.evaluate(async () => {
+      const api = window.__smooth!
+      const surface = (x: number, z: number, from: number): number | null => {
+        let prev = api.density(x, from, z)
+        for (let y = from; y > from - 40; y -= 0.25) {
+          const d = api.density(x, y, z)
+          if (d > 0 && prev <= 0) return y
+          prev = d
+        }
+        return null
+      }
+      for (let i = 1; i <= 14; i++) {
+        const x = Math.cos(i * 2.4) * i * 41 + 5
+        const z = Math.sin(i * 2.4) * i * 41 + 5
+        api.teleport(x, z)
+        for (let t = 0; t < 40 && !api.state().onGround; t++) {
+          await new Promise((r) => setTimeout(r, 60))
+        }
+        const s = api.state()
+        if (s.inWater) continue
+        const h0 = surface(s.x, s.z, s.y + 6)
+        if (h0 === null) continue
+        let bestAng = 0
+        let bestH = -Infinity
+        for (let a = 0; a < 16; a++) {
+          const ang = (a / 16) * Math.PI * 2
+          const h = surface(s.x + Math.cos(ang) * 2.5, s.z + Math.sin(ang) * 2.5, s.y + 22)
+          if (h !== null && h > bestH) {
+            bestH = h
+            bestAng = ang
+          }
+        }
+        const slope = (Math.atan2(bestH - h0, 2.5) * 180) / Math.PI
+        if (slope < 55) continue
+        api.look(Math.atan2(-Math.cos(bestAng), -Math.sin(bestAng)), 0)
+        return { y: s.y, slope }
+      }
+      return null
+    })
+    expect(spot, '55°以上の斜面が見つからなかった').not.toBeNull()
+
+    await page.keyboard.down('KeyW')
+    await page.waitForTimeout(7000)
+    await page.keyboard.up('KeyW')
+    const after = await state(page)
+    const dy = after.y - spot!.y
+    expect(dy, `${spot!.slope.toFixed(0)}°の坂を ${dy.toFixed(2)}m よじ登った`).toBeLessThan(0.6)
+  })
+
+  test('木の当たり判定が幹と枝葉に分かれている', async ({ page }) => {
+    await start(page)
+    const cyl = await page.evaluate(async () => {
+      const api = window.__smooth!
+      const origin = api.state()
+      for (let i = 0; i < 20; i++) {
+        const c = api.treeColliders()
+        if (c.length >= 10) return c
+        api.teleport(origin.x + Math.cos(i * 1.3) * i * 30, origin.z + Math.sin(i * 1.3) * i * 30)
+        await new Promise((r) => setTimeout(r, 400))
+      }
+      return api.treeColliders()
+    })
+    expect(cyl.length, '木の当たり判定が集まっていない').toBeGreaterThanOrEqual(10)
+    expect(cyl.length % 5, '5 要素で 1 本になっていない').toBe(0)
+
+    // 同じ軸に幹と枝葉の 2 本が並び、木のてっぺん近くまで判定が届いていること
+    const axes = new Map<string, { base: number; top: number; n: number }>()
+    for (let i = 0; i < cyl.length; i += 5) {
+      const key = `${cyl[i].toFixed(2)},${cyl[i + 2].toFixed(2)}`
+      const a = axes.get(key) ?? { base: Infinity, top: -Infinity, n: 0 }
+      a.base = Math.min(a.base, cyl[i + 1])
+      a.top = Math.max(a.top, cyl[i + 1] + cyl[i + 4])
+      a.n++
+      axes.set(key, a)
+    }
+    const pairs = [...axes.values()].filter((a) => a.n >= 2)
+    expect(pairs.length, '幹だけで枝葉の判定が無い').toBeGreaterThan(0)
+    const tallest = Math.max(...pairs.map((a) => a.top - a.base))
+    expect(tallest, `判定が ${tallest.toFixed(1)}m しか無く、梢まで届いていない`).toBeGreaterThan(4)
+  })
+
+  test('木に正面から歩いても通り抜けない', async ({ page }) => {
+    await start(page)
+    const tree = await page.evaluate(async () => {
+      const api = window.__smooth!
+      const origin = api.state()
+      for (let i = 1; i < 24; i++) {
+        api.teleport(origin.x + Math.cos(i * 1.7) * i * 33, origin.z + Math.sin(i * 1.7) * i * 33)
+        for (let t = 0; t < 30 && !api.state().onGround; t++) {
+          await new Promise((r) => setTimeout(r, 60))
+        }
+        const t0 = api.nearestTree()
+        const s = api.state()
+        if (!t0 || s.inWater) continue
+        const d = Math.hypot(t0.x - s.x, t0.z - s.z)
+        if (d < 1.5 || d > 8 || Math.abs(t0.y - s.y) > 3) continue
+        api.look(Math.atan2(-(t0.x - s.x), -(t0.z - s.z)), 0)
+        return t0
+      }
+      return null
+    })
+    expect(tree, '手ごろな木が見つからなかった').not.toBeNull()
+
+    await page.keyboard.down('KeyW')
+    await page.waitForTimeout(8000)
+    await page.keyboard.up('KeyW')
+    const s = await state(page)
+    const d = Math.hypot(tree!.x - s.x, tree!.z - s.z)
+    expect(d, `幹をすり抜けた (中心から ${d.toFixed(2)}m)`).toBeGreaterThan(tree!.r + 0.3)
+  })
+})

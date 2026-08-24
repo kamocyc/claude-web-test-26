@@ -147,6 +147,8 @@ async function boot(): Promise<void> {
   hud.bind(inventory)
 
   const mobs = new MobManager()
+  // MOB 用の木バッファ。プレイヤーの分を上書きしないよう別に持つ
+  const mobTrunkBuf = new Float32Array(200 * 5)
   scene.add(mobs.group)
   const torches = new TorchManager(scene)
   if (meta?.torches) torches.load(meta.torches)
@@ -377,24 +379,31 @@ async function boot(): Promise<void> {
       player.position.y -= 1.0
       world.update(x, player.position.y, z)
     },
-    /** 一番近い木の根元の位置（デバッグ／テスト用）。 */
-    nearestTree(): { x: number; y: number; z: number } | null {
+    /** 一番近い木の根元の位置と幹の当たり判定（デバッグ／テスト用）。 */
+    nearestTree(): { x: number; y: number; z: number; r: number; h: number } | null {
       const t = world.collectTrunks(
         player.position.x,
         player.position.y,
         player.position.z,
         14,
       )
-      let best: { x: number; y: number; z: number } | null = null
+      let best: { x: number; y: number; z: number; r: number; h: number } | null = null
       let bestD = Infinity
+      // 1 本の木は幹→枝葉の順に並ぶ。距離が同じなら先勝ちなので必ず幹が返る
       for (let i = 0; i < t.length; i += 5) {
         const d = Math.hypot(t[i] - player.position.x, t[i + 2] - player.position.z)
         if (d < bestD) {
           bestD = d
-          best = { x: t[i], y: t[i + 1], z: t[i + 2] }
+          best = { x: t[i], y: t[i + 1], z: t[i + 2], r: t[i + 3], h: t[i + 4] }
         }
       }
       return best
+    },
+    /** 近くの木の当たり判定（縦円柱。x, y, 半径, 高さ の順で 5 要素ずつ）。 */
+    treeColliders(): number[] {
+      return Array.from(
+        world.collectTrunks(player.position.x, player.position.y, player.position.z, 10),
+      )
     },
     /** 時刻を時（0〜24）で固定する。null で自動に戻す。 */
     setTime(hours: number | null) {
@@ -570,6 +579,12 @@ async function boot(): Promise<void> {
     hud.setHealth(health, MAX_HEALTH)
     hud.showToast(v ? 'やられた… 最寄りの村で目を覚ました' : 'やられた… 最初の地点に戻った', 2600)
     markMetaDirty()
+  }
+
+  // MOB も木と建物にぶつかり、登れない坂や壁を避けて歩く
+  mobs.obstacles = {
+    trunksNear: (x, y, z, r) => world.collectTrunks(x, y, z, r, mobTrunkBuf),
+    boxesNear: (x, z, r, out) => villages.collidersNear(x, z, r, out),
   }
 
   mobs.onAttack = (damage) => hurtPlayer(damage)

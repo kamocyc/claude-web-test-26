@@ -30,13 +30,17 @@ export function unpackLocalIndex(i: number): [number, number, number] {
   return [lx, ly, lz]
 }
 
+/** Chunk.trunks の 1 本あたりの要素数。 */
+export const TREE_FIELDS = 11
+
 export class Chunk {
   mesh: THREE.Mesh | null = null
   /** 木の InstancedMesh（種類ごと）。 */
   treeMeshes: THREE.InstancedMesh[] = []
   /**
-   * 木の情報。8 要素で 1 本:
-   * x, y, z, 幹の半径, 幹の高さ, 照準判定の半径, 照準判定の高さ,
+   * 木の情報。`TREE_FIELDS` 要素で 1 本:
+   * x, y, z, 幹の半径, 幹の高さ, 枝葉の半径, 枝葉の下端, 枝葉の上端,
+   * 照準判定の半径, 照準判定の高さ,
    * (InstancedMesh の番号 * 65536 + インスタンス番号)
    */
   trunks: Float32Array | null = null

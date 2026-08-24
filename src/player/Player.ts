@@ -1,6 +1,6 @@
 import * as THREE from 'three'
 import type { World, FieldSample } from '../world/World'
-import { SEA_LEVEL, WORLD_MIN_Y } from '../world/constants'
+import { SEA_LEVEL, WALKABLE_NY, WORLD_MIN_Y } from '../world/constants'
 import type { Controls } from './Controls'
 import type { Box } from '../world/village'
 
@@ -21,10 +21,14 @@ const AIR_ACCEL = 5
 /** 入力が無いときの制動。これが無いと坂でずり落ちる。 */
 const GROUND_FRICTION = 18
 const STOP_SPEED = 0.35
-/** これより急な斜面は「立てない」ので滑り落ちる。 */
-const WALKABLE_NY = 0.5
 /** 接地判定と地面への吸着に使う距離。 */
 const GROUND_PROBE = 0.3
+/** 急斜面に触れているあいだ、斜面を下る向きへ押される加速度。 */
+const SLIDE_ACCEL = 15
+/** 滑り落ちる速さの上限。自由落下ほどは速くならない。 */
+const SLIDE_MAX_FALL = 13
+/** よじ登れる段差の候補。これ以下の出っ張りは乗り越えられる。 */
+const STEP_HEIGHTS = [0.22, 0.4, 0.58]
 
 const MAX_STEP = 1 / 90
 const MAX_SUBSTEPS = 6
@@ -37,6 +41,8 @@ const AXIS = [RADIUS, HEIGHT * 0.38, HEIGHT * 0.68, HEIGHT - RADIUS]
  *
  * 地形が滑らかなので、ブロック地形のような「段差を登る」特別処理は不要で、
  * 勾配方向へ押し出すだけで坂も洞窟の天井も自然に扱える。
+ * ただし立てないほど急な面（`WALKABLE_NY` より上向きが弱い面）だけは
+ * 押し出しを水平に倒し、代わりに低い段差の乗り上げを別途持つ。
  *
  * 接地判定は「押し出しが起きたか」ではなく足元への独立したプローブで行う。
  * こうすると接地中に重力を溜めずに済み、斜面で押し出しベクトルの水平成分に
@@ -51,6 +57,8 @@ export class Player {
   inWater = false
   flying = false
   headUnderwater = false
+  /** 立てないほど急な面に触れていて、滑り落ちている最中か。 */
+  sliding = false
 
   /** 木の幹（x, y, z, 半径, 高さ の 5 要素ずつ）。毎フレーム World から受け取る。 */
   trunks: Float32Array | null = null
@@ -58,6 +66,9 @@ export class Player {
   boxes: Box[] = []
 
   private accumulator = 0
+  /** 滑っている向き（斜面を下る水平方向）。 */
+  private slideX = 0
+  private slideZ = 0
   private readonly sample: FieldSample = { d: 0, gx: 0, gy: 0, gz: 0 }
 
   get eyeY(): number {
@@ -143,6 +154,15 @@ export class Player {
       this.velocity.x += (wishX * speed - this.velocity.x) * a
       this.velocity.z += (wishZ * speed - this.velocity.z) * a
 
+      // 立てない斜面に触れている間は、登れないだけでなく下へ流される
+      if (this.sliding && !grounded) {
+        const sl = Math.hypot(this.slideX, this.slideZ)
+        if (sl > 1e-4) {
+          this.velocity.x += (this.slideX / sl) * SLIDE_ACCEL * dt
+          this.velocity.z += (this.slideZ / sl) * SLIDE_ACCEL * dt
+        }
+      }
+
       if (grounded) {
         // 接地中は重力を溜めない。溜めると押し出しの水平成分で斜面を滑る。
         if (this.velocity.y < 0) this.velocity.y = 0
@@ -162,7 +182,12 @@ export class Player {
       } else {
         this.velocity.y -= GRAVITY * dt
         if (this.velocity.y < -68) this.velocity.y = -68
+        // 斜面ずりは自由落下ではなく「滑り」なので速さを抑える
+        if (this.sliding && this.velocity.y < -SLIDE_MAX_FALL) this.velocity.y = -SLIDE_MAX_FALL
       }
+
+      // 急斜面と判定された壁でも、腰より低い出っ張りなら乗り越えられる
+      if (this.sliding && mag > 0) this.tryStepUp(world, wishX, wishZ)
     }
 
     this.position.addScaledVector(this.velocity, dt)
@@ -211,6 +236,9 @@ export class Player {
    */
   private resolveTerrain(world: World): void {
     const s = this.sample
+    this.sliding = false
+    this.slideX = 0
+    this.slideZ = 0
 
     for (let iter = 0; iter < 4; iter++) {
       let moved = 0
@@ -219,12 +247,28 @@ export class Player {
         const g = Math.hypot(s.gx, s.gy, s.gz)
         if (g < 1e-5) continue
 
-        const penetration = s.d / g + RADIUS
+        let penetration = s.d / g + RADIUS
         if (penetration <= 0) continue
 
-        const nx = -s.gx / g
-        const ny = -s.gy / g
-        const nz = -s.gz / g
+        let nx = -s.gx / g
+        let ny = -s.gy / g
+        let nz = -s.gz / g
+
+        // 立てないほど急な上向き面は、押し出しに鉛直成分を持たせない。
+        // 法線どおりに押すと壁へ歩くだけで体が持ち上がり、
+        // どんな崖でもじりじりよじ登れてしまう。
+        const nh = Math.hypot(nx, nz)
+        if (ny > 0 && ny <= WALKABLE_NY && nh > 1e-3 && s.d <= 0) {
+          this.sliding = true
+          this.slideX += nx / nh
+          this.slideZ += nz / nh
+          // 平面なら水平移動だけで抜けきる量に直す
+          penetration /= nh
+          nx /= nh
+          nz /= nh
+          ny = 0
+        }
+
         const push = Math.min(penetration, 0.6)
         this.position.x += nx * push
         this.position.y += ny * push
@@ -241,6 +285,45 @@ export class Player {
       }
       if (moved < 1e-4) break
     }
+  }
+
+  /**
+   * 進行方向の低い出っ張りに乗り上げる。
+   *
+   * 急斜面を登れなくすると、岩の縁のような膝下の段差まで越えられなくなる。
+   * そこで「少し前・少し上にカプセルがまるごと入るか」を低い方から順に試し、
+   * 入る高さが見つかったらそこへ移す。60°より急な斜面では 0.44 m 先が
+   * 0.76 m 以上せり上がるのでどの候補にも入らず、崖をよじ登る抜け道にはならない。
+   */
+  private tryStepUp(world: World, wishX: number, wishZ: number): void {
+    const near = RADIUS + 0.06
+    const far = RADIUS + 0.3
+    const nx = this.position.x + wishX * near
+    const nz = this.position.z + wishZ * near
+    const fx = this.position.x + wishX * far
+    const fz = this.position.z + wishZ * far
+    for (const lift of STEP_HEIGHTS) {
+      const feet = this.position.y + lift
+      // 手前だけ見ると段の縁に爪先立ちしてしまうので、少し先も空いていることを確かめる
+      if (!this.capsuleFree(world, nx, feet, nz)) continue
+      if (!this.capsuleFree(world, fx, feet, fz)) continue
+      this.position.set(nx, feet, nz)
+      if (this.velocity.y < 0) this.velocity.y = 0
+      this.sliding = false
+      return
+    }
+  }
+
+  /** 足元 feet に立ったカプセルが地形に触れずに収まるか。 */
+  private capsuleFree(world: World, x: number, feet: number, z: number): boolean {
+    const s = this.sample
+    for (let a = 0; a < AXIS.length; a++) {
+      world.sample(x, feet + AXIS[a], z, s)
+      const g = Math.hypot(s.gx, s.gy, s.gz)
+      if (g < 1e-5) continue
+      if (s.d / g + RADIUS > 0) return false
+    }
+    return true
   }
 
   /** 木の幹（垂直な円柱）から水平に押し出す。 */

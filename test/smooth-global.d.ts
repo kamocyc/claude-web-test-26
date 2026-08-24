@@ -33,7 +33,8 @@ export interface SmoothDebug {
   state(): SmoothState
   teleport(x: number, z: number): void
   gotoVillage(): boolean
-  nearestTree(): { x: number; y: number; z: number } | null
+  nearestTree(): { x: number; y: number; z: number; r: number; h: number } | null
+  treeColliders(): number[]
   giveMaterial(index: number, amount: number): void
   give(id: string, amount: number): void
   itemCount(id: string): number

@@ -14,7 +14,7 @@ import {
   gridIndex,
 } from './constants'
 import { DensityField } from './density'
-import { Chunk, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
+import { Chunk, TREE_FIELDS, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
 import type { EditMap } from './Chunk'
 import { applyBrush, applySmoothBrush, isLooseMaterial, settleLoose } from './edits'
 import type { BrushBounds, BrushMode, BrushShape } from './edits'
@@ -105,10 +105,13 @@ export class World {
   }
 
   /**
-   * 半径 r 以内にある木の幹を集める。
-   * 毎フレーム 1 回だけ呼んで Player に渡す想定なので、バッファを使い回す。
+   * 半径 r 以内にある木の当たり判定（幹と枝葉の縦円柱）を集める。
+   * 1 本につき 5 要素 × 最大 2 本（x, y, z, 半径, 高さ）。
+   *
+   * 返り値は使い回しのバッファなので、次に呼ぶまでの間しか有効でない。
+   * プレイヤーはフレームをまたいで持ち続けるため、MOB 側は別の `out` を渡すこと。
    */
-  collectTrunks(x: number, y: number, z: number, r: number): Float32Array {
+  collectTrunks(x: number, y: number, z: number, r: number, out?: Float32Array): Float32Array {
     let n = 0
     const r2 = r * r
     const cx0 = Math.floor((x - r) / CHUNK_WORLD)
@@ -117,24 +120,34 @@ export class World {
     const cz1 = Math.floor((z + r) / CHUNK_WORLD)
     const cy0 = Math.floor((y - 8) / CHUNK_WORLD)
     const cy1 = Math.floor((y + 8) / CHUNK_WORLD)
-    const buf = this.trunkBuf
+    const buf = out ?? this.trunkBuf
     for (let cz = cz0; cz <= cz1; cz++) {
       for (let cy = cy0; cy <= cy1; cy++) {
         for (let cx = cx0; cx <= cx1; cx++) {
           const chunk = this.chunks.get(chunkKey(cx, cy, cz))
           const t = chunk?.trunks
           if (!chunk || !t) continue
-          for (let i = 0; i < chunk.trunkLen; i += 8) {
+          for (let i = 0; i < chunk.trunkLen; i += TREE_FIELDS) {
             const dx = t[i] - x
             const dz = t[i + 2] - z
             if (dx * dx + dz * dz > r2) continue
-            if (n + 5 > buf.length) return buf.subarray(0, n)
+            if (n + 10 > buf.length) return buf.subarray(0, n)
+            // 幹
             buf[n] = t[i]
             buf[n + 1] = t[i + 1]
             buf[n + 2] = t[i + 2]
             buf[n + 3] = t[i + 3]
             buf[n + 4] = t[i + 4]
             n += 5
+            // 枝葉。幹だけだと斜面の上から梢を通り抜けられてしまう
+            if (t[i + 5] > 0) {
+              buf[n] = t[i]
+              buf[n + 1] = t[i + 1] + t[i + 6]
+              buf[n + 2] = t[i + 2]
+              buf[n + 3] = t[i + 5]
+              buf[n + 4] = t[i + 7] - t[i + 6]
+              n += 5
+            }
           }
         }
       }
@@ -664,6 +677,9 @@ export class World {
           trees[i + 2],
           proto.trunkRadius * s,
           proto.trunkHeight * s,
+          proto.crownRadius * s,
+          proto.crownBase * s,
+          proto.crownTop * s,
           proto.hitRadius * s,
           proto.hitHeight * s,
           t * 65536 + k,
@@ -749,8 +765,8 @@ export class World {
           const chunk = this.chunks.get(chunkKey(cx, cy, cz))
           const t = chunk?.trunks
           if (!chunk || !t) continue
-          for (let i = 0; i < chunk.trunkLen; i += 8) {
-            const r = t[i + 5]
+          for (let i = 0; i < chunk.trunkLen; i += TREE_FIELDS) {
+            const r = t[i + 8]
             const px = ox - t[i]
             const pz = oz - t[i + 2]
             const b = 2 * (px * dx + pz * dz)
@@ -762,7 +778,7 @@ export class World {
             if (tt < 0) tt = (-b + sq) / (2 * a)
             if (tt < 0 || tt > maxDist || tt >= best) continue
             const y = oy + dy * tt
-            if (y < t[i + 1] || y > t[i + 1] + t[i + 6]) continue
+            if (y < t[i + 1] || y > t[i + 1] + t[i + 9]) continue
             best = tt
             found = true
             out.distance = tt
@@ -787,7 +803,7 @@ export class World {
     const t = chunk?.trunks
     if (!chunk || !t || hit.index >= chunk.trunkLen) return false
 
-    const packed = t[hit.index + 7]
+    const packed = t[hit.index + TREE_FIELDS - 1]
     const meshIndex = Math.floor(packed / 65536)
     const instanceIndex = packed - meshIndex * 65536
     const im = chunk.treeMeshes[meshIndex]
@@ -798,9 +814,9 @@ export class World {
         im.setMatrixAt(instanceIndex, this.dummy.matrix)
         // 末尾を指していたレコードを差し替える
         const lastPacked = meshIndex * 65536 + last
-        for (let k = 0; k < chunk.trunkLen; k += 8) {
-          if (t[k + 7] === lastPacked) {
-            t[k + 7] = meshIndex * 65536 + instanceIndex
+        for (let k = 0; k < chunk.trunkLen; k += TREE_FIELDS) {
+          if (t[k + TREE_FIELDS - 1] === lastPacked) {
+            t[k + TREE_FIELDS - 1] = meshIndex * 65536 + instanceIndex
             break
           }
         }
@@ -809,9 +825,9 @@ export class World {
       im.instanceMatrix.needsUpdate = true
     }
 
-    const lastOff = chunk.trunkLen - 8
+    const lastOff = chunk.trunkLen - TREE_FIELDS
     if (hit.index !== lastOff) {
-      for (let k = 0; k < 8; k++) t[hit.index + k] = t[lastOff + k]
+      for (let k = 0; k < TREE_FIELDS; k++) t[hit.index + k] = t[lastOff + k]
     }
     chunk.trunkLen = lastOff
     this.treeCount--

@@ -81,3 +81,11 @@ export function chunkKey(cx: number, cy: number, cz: number): string {
 export function gridIndex(i: number, j: number, k: number): number {
   return i + GRID * (j + GRID * k)
 }
+
+/**
+ * これより上向きが弱い面には立てない（cos 50°）。
+ * プレイヤーも MOB もこれより急な坂は登れず、上にいると滑り落ちる。
+ * この地形では傾斜 50°以上が全体の約 13%（60°以上なら 7%）なので、
+ * 山の斜面が「迂回する対象」になり、丘はふつうに歩ける。
+ */
+export const WALKABLE_NY = 0.6428

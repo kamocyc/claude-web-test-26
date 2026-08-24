@@ -1,6 +1,7 @@
 import * as THREE from 'three'
-import { SEA_LEVEL } from '../world/constants'
+import { SEA_LEVEL, WALKABLE_NY } from '../world/constants'
 import type { FieldSample, World } from '../world/World'
+import type { Box } from '../world/village'
 import type { ItemId } from '../items/items'
 import { MOB_DEFS, type MobDef, type MobKind, type MobModel, buildMobModel } from './mobs'
 
@@ -10,6 +11,28 @@ const SPAWN_MIN = 22
 const SPAWN_MAX = 46
 /** 押し出しに使う球の当たり判定の反復回数。 */
 const RESOLVE_ITER = 3
+/** 進路を調べる距離（体の半径に足す）。 */
+const LOOKAHEAD = 1.3
+/** MOB がまたげる段差。これより高い壁は登れない扱いにする。 */
+const STEP_UP = 0.7
+/** これより下へ落ちる縁は避ける。 */
+const MAX_DROP = 3.2
+/** 進路を選び直す間隔。毎フレーム測り直すのは無駄なので間引く。 */
+const AVOID_INTERVAL = 0.2
+/** 迂回で試す曲がり角（ラジアン）。手前から順に試す。 */
+const TURNS = [0, 0.6, -0.6, 1.2, -1.2, 1.9, -1.9, 2.7, -2.7]
+/** 障害物を集める半径。 */
+const OBSTACLE_RANGE = 4
+
+/** 進路上の障害物（木の幹と建物の壁）を教えてくれるもの。 */
+export interface Obstacles {
+  /** 縦円柱（x, y, z, 半径, 高さ）を 5 要素ずつ並べた配列。 */
+  trunksNear(x: number, y: number, z: number, r: number): Float32Array
+  boxesNear(x: number, z: number, r: number, out: Box[]): Box[]
+}
+
+const NO_TRUNKS = new Float32Array(0)
+const NO_BOXES: Box[] = []
 
 export interface Mob {
   readonly def: MobDef
@@ -32,6 +55,9 @@ export interface Mob {
   homeX: number
   homeZ: number
   homeR: number
+  /** 迂回のために足している回転角と、その決め直しまでの残り時間。 */
+  avoidTurn: number
+  avoidCd: number
 }
 
 export interface MobHit {
@@ -45,6 +71,9 @@ export interface MobHit {
  * 地形は連続な密度場なので、経路探索は持たずに
  * 「行きたい向きへ加速して、めり込んだら勾配方向へ押し出す」だけで坂を歩ける。
  * プレイヤーと同じ仕組み（`密度 / |勾配|` を符号付き距離とみなす）を使う。
+ *
+ * 障害物も経路探索ではなく先読みで避ける。1 歩先に立てるかを扇状に試し、
+ * 通れる向きへ振るだけで、崖・登れない坂・木・建物を回り込む。
  */
 export class MobManager {
   readonly group = new THREE.Group()
@@ -55,7 +84,11 @@ export class MobManager {
   /** MOB を倒したときに呼ばれる。 */
   onDrop: ((id: ItemId, count: number, mob: Mob) => void) | null = null
 
+  /** 木と建物の当たり判定の供給元。未設定なら地形だけを見る。 */
+  obstacles: Obstacles | null = null
+
   private readonly sample: FieldSample = { d: 0, gx: 0, gy: 0, gz: 0 }
+  private readonly boxScratch: Box[] = []
   private spawnTimer = 0
 
   constructor() {
@@ -160,6 +193,25 @@ export class MobManager {
       }
     }
 
+    // 木と建物はここで一度だけ集める（返る配列は使い回しなので持ち越さない）
+    const obs = this.obstacles
+    const trunks = obs
+      ? obs.trunksNear(m.pos.x, m.pos.y, m.pos.z, OBSTACLE_RANGE)
+      : NO_TRUNKS
+    const boxes = obs ? obs.boxesNear(m.pos.x, m.pos.z, OBSTACLE_RANGE, this.boxScratch) : NO_BOXES
+
+    // 登れない坂・木・建物の手前で向きを振り直す
+    if (wishX !== 0 || wishZ !== 0) {
+      const turn = this.chooseTurn(m, dt, world, trunks, boxes, wishX, wishZ)
+      if (turn !== 0) {
+        const c = Math.cos(turn)
+        const sn = Math.sin(turn)
+        const nx = wishX * c - wishZ * sn
+        wishZ = wishX * sn + wishZ * c
+        wishX = nx
+      }
+    }
+
     const accel = m.onGround ? 12 : 3
     const a = Math.min(1, accel * dt)
     m.vel.x += (wishX * speed - m.vel.x) * a
@@ -172,6 +224,8 @@ export class MobManager {
     m.pos.z += m.vel.z * dt
 
     this.resolve(m, world)
+    this.resolveTrunks(m, trunks)
+    this.resolveBoxes(m, boxes)
 
     // 崖や壁に当たって止まったら向きを変える
     const moving = Math.hypot(m.vel.x, m.vel.z)
@@ -206,10 +260,20 @@ export class MobManager {
         if (g < 1e-5) continue
         const pen = s.d / g + r
         if (pen <= 0) continue
-        const nx = -s.gx / g
-        const ny = -s.gy / g
-        const nz = -s.gz / g
-        const push = Math.min(pen, 0.5)
+        let nx = -s.gx / g
+        let ny = -s.gy / g
+        let nz = -s.gz / g
+        // プレイヤーと同じく、立てないほど急な面では押し出しを水平だけにする。
+        // そうしないと壁に体を押しつけるだけで崖をよじ登れてしまう。
+        const nh = Math.hypot(nx, nz)
+        let depth = pen
+        if (ny > 0 && ny <= WALKABLE_NY && nh > 1e-3 && s.d <= 0) {
+          depth /= nh
+          nx /= nh
+          nz /= nh
+          ny = 0
+        }
+        const push = Math.min(depth, 0.5)
         m.pos.x += nx * push
         m.pos.y += ny * push
         m.pos.z += nz * push
@@ -220,12 +284,143 @@ export class MobManager {
           m.vel.y -= ny * vn
           m.vel.z -= nz * vn
         }
-        if (ny > 0.5) m.onGround = true
+        if (ny > WALKABLE_NY) m.onGround = true
       }
       if (moved < 1e-4) break
     }
     // 奈落に落ちたら消す
     if (m.pos.y < SEA_LEVEL - 90) m.hp = 0
+  }
+
+  /**
+   * 進みたい向きが通れるか調べ、駄目なら左右へ振った向きを返す。
+   *
+   * 経路探索はしない。「1.3 m 先に立てるか」を扇状に何本か試すだけで、
+   * 崖・壁・木を回り込み、行き止まりでは引き返す。
+   * 毎フレーム測ると無駄なので `AVOID_INTERVAL` ごとに選び直し、
+   * その間は同じ曲がり角を足し続ける（ふらつかずに壁沿いを歩く）。
+   */
+  private chooseTurn(
+    m: Mob,
+    dt: number,
+    world: World,
+    trunks: Float32Array,
+    boxes: readonly Box[],
+    wishX: number,
+    wishZ: number,
+  ): number {
+    m.avoidCd -= dt
+    if (m.avoidCd > 0) return m.avoidTurn
+    m.avoidCd = AVOID_INTERVAL
+    for (const turn of TURNS) {
+      const c = Math.cos(turn)
+      const sn = Math.sin(turn)
+      if (this.canGo(m, world, trunks, boxes, wishX * c - wishZ * sn, wishX * sn + wishZ * c)) {
+        m.avoidTurn = turn
+        return turn
+      }
+    }
+    // どこも塞がっていたら引き返す
+    m.avoidTurn = Math.PI
+    return Math.PI
+  }
+
+  /** その向きへ 1 歩進んだ先に立てるか。 */
+  private canGo(
+    m: Mob,
+    world: World,
+    trunks: Float32Array,
+    boxes: readonly Box[],
+    dx: number,
+    dz: number,
+  ): boolean {
+    const r = m.def.radius
+    const ax = m.pos.x + dx * (r + LOOKAHEAD)
+    const az = m.pos.z + dz * (r + LOOKAHEAD)
+    const s = this.sample
+
+    // またげない高さの地形（段差 STEP_UP より上に体が残るか）
+    world.sample(ax, m.pos.y + STEP_UP + r, az, s)
+    let g = Math.hypot(s.gx, s.gy, s.gz)
+    if (g > 1e-5 && s.d / g + r > 0) return false
+
+    // 落ちすぎる縁。空中にいるときは判定しない（着地の邪魔になる）
+    if (m.onGround) {
+      world.sample(ax, m.pos.y - MAX_DROP, az, s)
+      g = Math.hypot(s.gx, s.gy, s.gz)
+      if (g > 1e-5 && s.d / g < 0) return false
+    }
+
+    const feet = m.pos.y
+    const head = m.pos.y + m.def.height
+    for (let i = 0; i < trunks.length; i += 5) {
+      if (head < trunks[i + 1] || feet > trunks[i + 1] + trunks[i + 4]) continue
+      const tx = ax - trunks[i]
+      const tz = az - trunks[i + 2]
+      const rr = trunks[i + 3] + r
+      if (tx * tx + tz * tz < rr * rr) return false
+    }
+    for (const b of boxes) {
+      if (head <= b.minY || feet >= b.maxY) continue
+      if (ax > b.minX - r && ax < b.maxX + r && az > b.minZ - r && az < b.maxZ + r) return false
+    }
+    return true
+  }
+
+  /** 木の幹と枝葉（縦円柱）から水平に押し出す。 */
+  private resolveTrunks(m: Mob, trunks: Float32Array): void {
+    const r = m.def.radius
+    const feet = m.pos.y
+    const head = m.pos.y + m.def.height
+    for (let i = 0; i < trunks.length; i += 5) {
+      if (head < trunks[i + 1] || feet > trunks[i + 1] + trunks[i + 4]) continue
+      const dx = m.pos.x - trunks[i]
+      const dz = m.pos.z - trunks[i + 2]
+      const rr = trunks[i + 3] + r
+      const d2 = dx * dx + dz * dz
+      if (d2 >= rr * rr || d2 < 1e-8) continue
+      const d = Math.sqrt(d2)
+      const nx = dx / d
+      const nz = dz / d
+      m.pos.x += nx * (rr - d)
+      m.pos.z += nz * (rr - d)
+      const vn = m.vel.x * nx + m.vel.z * nz
+      if (vn < 0) {
+        m.vel.x -= nx * vn
+        m.vel.z -= nz * vn
+      }
+    }
+  }
+
+  /** 建物の壁から最小移動量で押し出す。屋根には乗らない。 */
+  private resolveBoxes(m: Mob, boxes: readonly Box[]): void {
+    const r = m.def.radius
+    for (const b of boxes) {
+      const minX = b.minX - r
+      const maxX = b.maxX + r
+      const minZ = b.minZ - r
+      const maxZ = b.maxZ + r
+      if (m.pos.x <= minX || m.pos.x >= maxX || m.pos.z <= minZ || m.pos.z >= maxZ) continue
+      if (m.pos.y + m.def.height <= b.minY || m.pos.y >= b.maxY) continue
+      const ox1 = m.pos.x - minX
+      const ox2 = maxX - m.pos.x
+      const oz1 = m.pos.z - minZ
+      const oz2 = maxZ - m.pos.z
+      const best = Math.min(ox1, ox2, oz1, oz2)
+      if (best === ox1) {
+        m.pos.x = minX
+        if (m.vel.x > 0) m.vel.x = 0
+      } else if (best === ox2) {
+        m.pos.x = maxX
+        if (m.vel.x < 0) m.vel.x = 0
+      } else if (best === oz1) {
+        m.pos.z = minZ
+        if (m.vel.z > 0) m.vel.z = 0
+      } else {
+        m.pos.z = maxZ
+        if (m.vel.z < 0) m.vel.z = 0
+      }
+    }
   }
 
   // ---------------------------------------------------------------- 湧き
@@ -319,6 +514,8 @@ export class MobManager {
       homeX,
       homeZ,
       homeR,
+      avoidTurn: 0,
+      avoidCd: 0,
     }
     this.mobs.push(mob)
     return mob
