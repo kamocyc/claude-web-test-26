@@ -30,6 +30,9 @@ const SLIDE_MAX_FALL = 13
 /** よじ登れる段差の候補。これ以下の出っ張りは乗り越えられる。 */
 const STEP_HEIGHTS = [0.22, 0.4, 0.58]
 
+/** 箱の当たり判定で乗り上げられる段差の高さ（m）。階段の 1 段はこれより低い。 */
+const BOX_STEP = 0.6
+
 const MAX_STEP = 1 / 90
 const MAX_SUBSTEPS = 6
 
@@ -70,6 +73,8 @@ export class Player {
   private slideX = 0
   private slideZ = 0
   private readonly sample: FieldSample = { d: 0, gx: 0, gy: 0, gz: 0 }
+  /** 立っている箱の天面の高さ。地形に立っているときは -Infinity。 */
+  private boxGroundY = -Infinity
 
   get eyeY(): number {
     return this.position.y + EYE
@@ -146,7 +151,9 @@ export class Player {
       this.velocity.multiplyScalar(1 - Math.min(1, 2.2 * dt))
       this.velocity.y = Math.max(this.velocity.y, -4.5)
     } else {
-      const grounded = this.probeGround(world)
+      // 箱の天面は「地形に立てていないとき」だけ見る（地形が優先）
+      this.boxGroundY = -Infinity
+      const grounded = this.probeGround(world) || this.probeBoxGround()
       this.onGround = grounded
 
       const speed = sprint ? SPRINT_SPEED : WALK_SPEED
@@ -220,8 +227,35 @@ export class Player {
     return this.groundNormalY > WALKABLE_NY
   }
 
+  /**
+   * 建てた床・階段・屋根（軸平行ボックス）の上に立っているか。
+   *
+   * `probeGround` は密度場しか見ないので、これが無いと自分で張った床の上が
+   * 「空中」扱いになり、ジャンプできず摩擦も効かない。押し出し自体は
+   * {@link resolveBoxes} が既にやっているので、ここでは接地の判定だけを足す。
+   */
+  private probeBoxGround(): boolean {
+    if (this.boxes.length === 0) return false
+    const feet = this.position.y
+    for (const b of this.boxes) {
+      if (feet < b.maxY - 0.06 || feet > b.maxY + GROUND_PROBE) continue
+      if (this.position.x <= b.minX - RADIUS || this.position.x >= b.maxX + RADIUS) continue
+      if (this.position.z <= b.minZ - RADIUS || this.position.z >= b.maxZ + RADIUS) continue
+      if (b.maxY > this.boxGroundY) this.boxGroundY = b.maxY
+    }
+    if (this.boxGroundY === -Infinity) return false
+    this.groundNormalY = 1
+    return true
+  }
+
   /** 接地しているのに浮いている分だけ真下に降ろす。 */
   private snapToGround(world: World): void {
+    // 建てた床・階段の上では、その天面へ降ろす。これが無いと最大 GROUND_PROBE ぶん浮く
+    if (this.boxGroundY > -Infinity) {
+      const gap = this.position.y - this.boxGroundY
+      if (gap > 0 && gap < GROUND_PROBE) this.position.y = this.boxGroundY
+      return
+    }
     const s = this.sample
     world.sample(this.position.x, this.position.y + RADIUS, this.position.z, s)
     const g = Math.hypot(s.gx, s.gy, s.gz)
@@ -354,13 +388,20 @@ export class Player {
     }
   }
 
-  /** 建物の壁（軸平行ボックス）から最小移動量で押し出す。 */
+  /**
+   * 建物の壁や建てたパーツ（軸平行ボックス）から最小移動量で押し出す。
+   *
+   * 膝下の段差は上が空いていれば乗り上げる。建てた階段の 1 段（0.5 m）がこれに当たるので、
+   * 置いた階段はそのまま歩いて登れる。
+   * 壁のように背の高い箱は乗り上げの対象にならず、水平に押し戻される。
+   */
   private resolveBoxes(): void {
     if (this.boxes.length === 0) return
-    const px = this.position.x
-    const pz = this.position.z
     for (const b of this.boxes) {
-      // カプセルを AABB に、ボックスを半径分だけ膨らませて判定する
+      // カプセルを AABB に、ボックスを半径分だけ膨らませて判定する。
+      // 押し出すたびに位置が動くので、箱ごとに読み直す
+      const px = this.position.x
+      const pz = this.position.z
       const minX = b.minX - RADIUS
       const maxX = b.maxX + RADIUS
       const minZ = b.minZ - RADIUS
@@ -370,20 +411,21 @@ export class Player {
       const head = this.position.y + HEIGHT
       if (head <= b.minY || feet >= b.maxY) continue
 
+      // 段差に乗る（屋根や台の上、階段の 1 段）
+      const oy = b.maxY - feet
+      if (oy > 0 && oy <= BOX_STEP && this.velocity.y <= 0 && this.boxFreeAbove(px, b.maxY, pz)) {
+        this.position.y = b.maxY
+        if (this.velocity.y < 0) this.velocity.y = 0
+        this.onGround = true
+        this.groundNormalY = 1
+        continue
+      }
+
       const ox1 = px - minX
       const ox2 = maxX - px
       const oz1 = pz - minZ
       const oz2 = maxZ - pz
-      const oy = b.maxY - feet // 上に乗る方向
-
-      let best = Math.min(ox1, ox2, oz1, oz2)
-      // 屋根や台の上には乗れるようにする
-      if (oy < best && oy < 0.6 && this.velocity.y <= 0) {
-        this.position.y = b.maxY
-        if (this.velocity.y < 0) this.velocity.y = 0
-        this.onGround = true
-        continue
-      }
+      const best = Math.min(ox1, ox2, oz1, oz2)
       if (best === ox1) {
         this.position.x = minX
         if (this.velocity.x > 0) this.velocity.x = 0
@@ -398,6 +440,17 @@ export class Player {
         if (this.velocity.z < 0) this.velocity.z = 0
       }
     }
+  }
+
+  /** 足元 `feet` に立ったとき、他の箱に頭や体がぶつからないか。 */
+  private boxFreeAbove(x: number, feet: number, z: number): boolean {
+    for (const b of this.boxes) {
+      if (b.maxY <= feet + 1e-3) continue
+      if (x <= b.minX - RADIUS || x >= b.maxX + RADIUS) continue
+      if (z <= b.minZ - RADIUS || z >= b.maxZ + RADIUS) continue
+      if (feet + HEIGHT > b.minY && feet < b.maxY) return false
+    }
+    return true
   }
 
   /** 指定の x,z 付近で海面より上の地表を探してプレイヤーを置く。 */

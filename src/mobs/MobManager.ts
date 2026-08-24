@@ -28,7 +28,8 @@ const OBSTACLE_RANGE = 4
 export interface Obstacles {
   /** 縦円柱（x, y, z, 半径, 高さ）を 5 要素ずつ並べた配列。 */
   trunksNear(x: number, y: number, z: number, r: number): Float32Array
-  boxesNear(x: number, z: number, r: number, out: Box[]): Box[]
+  /** 軸平行ボックスの当たり判定。y は「どの高さの帯を見ればよいか」の目安に使う。 */
+  boxesNear(x: number, y: number, z: number, r: number, out: Box[]): Box[]
 }
 
 const NO_TRUNKS = new Float32Array(0)
@@ -198,7 +199,9 @@ export class MobManager {
     const trunks = obs
       ? obs.trunksNear(m.pos.x, m.pos.y, m.pos.z, OBSTACLE_RANGE)
       : NO_TRUNKS
-    const boxes = obs ? obs.boxesNear(m.pos.x, m.pos.z, OBSTACLE_RANGE, this.boxScratch) : NO_BOXES
+    const boxes = obs
+      ? obs.boxesNear(m.pos.x, m.pos.y, m.pos.z, OBSTACLE_RANGE, this.boxScratch)
+      : NO_BOXES
 
     // 登れない坂・木・建物の手前で向きを振り直す
     if (wishX !== 0 || wishZ !== 0) {

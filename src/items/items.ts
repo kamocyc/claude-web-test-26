@@ -19,6 +19,11 @@ export interface ItemDef {
   readonly kind: ItemKind
   /** block: 設置に使う地形素材 ID。 */
   readonly material?: number
+  /**
+   * 建築パーツ（壁・床・階段…）の材料にできるか。
+   * 土と砂は安息角で崩れる素材なので、形を保つ建材にはしない。
+   */
+  readonly build?: boolean
   /** 掘削間隔の倍率。1 未満で速い。 */
   readonly dig?: number
   /** ブラシ半径に足す量（m）。 */
@@ -44,11 +49,11 @@ export interface ItemDef {
 export const ITEMS: readonly ItemDef[] = [
   { id: 'grass', name: '草', color: '#6f9c46', kind: 'block', material: MAT_GRASS },
   { id: 'dirt', name: '土', color: '#7d5a3c', kind: 'block', material: MAT_DIRT },
-  { id: 'rock', name: '岩', color: '#8a8f96', kind: 'block', material: MAT_ROCK },
+  { id: 'rock', name: '岩', color: '#8a8f96', kind: 'block', material: MAT_ROCK, build: true },
   { id: 'sand', name: '砂', color: '#d8c48a', kind: 'block', material: MAT_SAND },
-  { id: 'plank', name: '板', color: '#b8874a', kind: 'block', material: MAT_PLANK },
-  { id: 'brick', name: 'レンガ', color: '#a8503c', kind: 'block', material: MAT_BRICK },
-  { id: 'glass', name: 'ガラス', color: '#9fd6e8', kind: 'block', material: MAT_GLASS },
+  { id: 'plank', name: '板', color: '#b8874a', kind: 'block', material: MAT_PLANK, build: true },
+  { id: 'brick', name: 'レンガ', color: '#a8503c', kind: 'block', material: MAT_BRICK, build: true },
+  { id: 'glass', name: 'ガラス', color: '#9fd6e8', kind: 'block', material: MAT_GLASS, build: true },
 
   { id: 'wood', name: '木材', color: '#8a5c34', kind: 'resource', note: '木を伐ると採れる' },
   { id: 'coal', name: '石炭', color: '#2e3238', kind: 'resource', note: '岩を掘るとたまに出る' },

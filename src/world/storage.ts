@@ -20,6 +20,8 @@ export interface SaveMeta {
   torches?: { x: number; y: number; z: number; yaw: number }[]
   /** 体力。 */
   health?: number
+  /** 置いた建築パーツ（`BuildGrid.serialize()` の平坦配列）。 */
+  pieces?: number[]
   /** 伐採した木のセルキー。 */
   chopped: number[]
 }

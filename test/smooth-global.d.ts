@@ -28,6 +28,8 @@ export interface SmoothDebug {
   health: number
   mobs: number
   torches: number
+  /** 置いた建築パーツの数。 */
+  pieces: number
   inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
@@ -49,6 +51,19 @@ export interface SmoothDebug {
   hitNearestMob(): boolean
   hurt(amount: number): void
   torchCount(): number
+  setPiece(name: string): boolean
+  setBuildRot(rot: number): void
+  buildAt(
+    kind: string,
+    x: number,
+    y: number,
+    z: number,
+    itemId?: string,
+    rot?: number,
+  ): string
+  removePieceAt(x: number, y: number, z: number, range?: number): boolean
+  pieceCount(): number
+  buildColliders(): number
   craftedVertices(): number
   setTool(name: string): void
   setTime(hours: number | null): void
