@@ -35,6 +35,7 @@ export interface SmoothDebug {
   gotoVillage(): boolean
   nearestTree(): { x: number; y: number; z: number; r: number; h: number } | null
   treeColliders(): number[]
+  dig(x: number, y: number, z: number, r?: number): void
   giveMaterial(index: number, amount: number): void
   give(id: string, amount: number): void
   itemCount(id: string): number

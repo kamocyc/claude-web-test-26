@@ -38,6 +38,9 @@ interface CellPlan {
  * 地形の等値面はすでに Worker が持っているので、上向きの頂点をそのまま
  * 木の足場として使える。格子セルごとに 1 本までに絞ることで均等に散らばり、
  * 位置はセル座標のハッシュだけで決まるので再メッシュしても同じ場所に戻る。
+ *
+ * 足場に選ぶのは**編集されていない面だけ**。木の高さは毎回その足場から取り直すので、
+ * 掘った面まで足場に使うと、木の下を掘ったときに木が穴の底へ沈み込んでしまう。
  */
 export function scatterTrees(
   field: DensityField,
@@ -56,6 +59,9 @@ export function scatterTrees(
   const count = mesh.positions.length / 3
   for (let i = 0; i < count; i++) {
     if (mesh.normals[i * 3 + 1] < MIN_NY) continue
+    // 掘った跡・盛った土の上には生やさない。
+    // ここを通すと、木の下を掘ったときに木が穴の底へ沈み込む。
+    if (mesh.edited[i]) continue
     const wy = oy + mesh.positions[i * 3 + 1]
     if (wy < SEA_LEVEL + 0.6 || wy > 118) continue
     const wx = ox + mesh.positions[i * 3]

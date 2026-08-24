@@ -52,14 +52,18 @@ self.onmessage = (ev: MessageEvent<MeshRequest>) => {
   }
 
   let matOverride: Uint8Array | null = null
+  // 編集されたコーナーの目印。掘った跡や盛った土の上に木を生やさないために使う
+  let editedCorner: Uint8Array | null = null
   if (editCount > 0 && req.editIdx && req.editD) {
     const idx = req.editIdx
     const vals = req.editD
     const mats = req.editMat
+    editedCorner = new Uint8Array(GRID * GRID * GRID)
     for (let n = 0; n < editCount; n++) {
       const gi = idx[n]
       if (gi < 0 || gi >= density.length) continue
       density[gi] = vals[n]
+      editedCorner[gi] = 1
       const m = mats ? mats[n] : 255
       if (m < MATERIAL_COUNT) {
         if (!matOverride) matOverride = new Uint8Array(GRID * GRID * GRID).fill(255)
@@ -72,8 +76,14 @@ self.onmessage = (ev: MessageEvent<MeshRequest>) => {
   const oy = req.cy * CHUNK_SIZE * VOXEL_SIZE
   const oz = req.cz * CHUNK_SIZE * VOXEL_SIZE
 
-  const mesh = surfaceNets(density, ox, oy, oz, matOverride, (wx, wy, wz, ny, out, at) =>
-    f.surfaceSample(wx, wy, wz, ny, out, at),
+  const mesh = surfaceNets(
+    density,
+    ox,
+    oy,
+    oz,
+    matOverride,
+    (wx, wy, wz, ny, out, at) => f.surfaceSample(wx, wy, wz, ny, out, at),
+    editedCorner,
   )
 
   if (!mesh) {

@@ -15,6 +15,11 @@ export interface MeshData {
    * 透過マテリアルを別グループとして張るために分けてある。
    */
   glassStart: number
+  /**
+   * 頂点ごとに、その面を作ったセルの 8 コーナーに編集が入っていたか（1 = 入っていた）。
+   * 掘った跡に木を生やさないために使う。
+   */
+  edited: Uint8Array
 }
 
 /**
@@ -47,6 +52,7 @@ const EDGES: ReadonlyArray<readonly [number, number]> = [
  * @param ox,oy,oz チャンク原点（格子座標 0 のコーナー）のワールド座標
  * @param matOverride プレイヤーが設置した素材 ID（255 = なし）。省略可。
  * @param sampler 自然な素材の重みを返す関数。省略時は草 100%。
+ * @param editedCorner 編集されたコーナーの目印（1 = 編集済み）。省略可。
  */
 export function surfaceNets(
   density: Float32Array,
@@ -55,6 +61,7 @@ export function surfaceNets(
   oz: number,
   matOverride: Uint8Array | null,
   sampler: SurfaceSampler | null,
+  editedCorner: Uint8Array | null = null,
 ): MeshData | null {
   const cellVert = new Int32Array(CELLS * CELLS * CELLS).fill(-1)
 
@@ -66,6 +73,7 @@ export function surfaceNets(
   const biome: number[] = []
   const indices: number[] = []
   const glassIndices: number[] = []
+  const edited: number[] = []
 
   const d = new Float32Array(8)
   const cornerIdx = new Int32Array(8)
@@ -148,6 +156,18 @@ export function surfaceNets(
         const vi = positions.length / 3
         positions.push(lx, ly, lz)
         normals.push(nx, ny, nz)
+
+        // このセルのコーナーが 1 つでも編集されていれば「人が触った面」とみなす
+        let touched = 0
+        if (editedCorner) {
+          for (let b = 0; b < 8; b++) {
+            if (editedCorner[cornerIdx[b]]) {
+              touched = 1
+              break
+            }
+          }
+        }
+        edited.push(touched)
 
         // 素材：プレイヤー設置分を優先しつつ自然素材と混ぜる
         acc.fill(0)
@@ -270,6 +290,7 @@ export function surfaceNets(
     biome: new Float32Array(biome),
     indices: all,
     glassStart: opaque.length,
+    edited: new Uint8Array(edited),
   }
 }
 

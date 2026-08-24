@@ -399,6 +399,10 @@ async function boot(): Promise<void> {
       }
       return best
     },
+    /** 指定座標を球ブラシで掘る（テスト用。照準を通さず直接叩く）。 */
+    dig(x: number, y: number, z: number, r = 2.5) {
+      world.applyBrush(x, y, z, sphereBrush(r), 'dig', MATERIAL_INFO[0].id)
+    },
     /** 近くの木の当たり判定（縦円柱。x, y, 半径, 高さ の順で 5 要素ずつ）。 */
     treeColliders(): number[] {
       return Array.from(

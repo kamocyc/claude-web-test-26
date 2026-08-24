@@ -339,3 +339,64 @@ test.describe('崩落', () => {
     ).toBeLessThan(before[4] - 0.15)
   })
 })
+
+test.describe('木の足場', () => {
+  test('木の下を掘ると木は消え、穴の底へ沈まない', async ({ page }) => {
+    test.setTimeout(180_000)
+    await start(page)
+
+    // 周りのチャンクが出そろってから木を選ぶ（あとから近い木が現れると測り違える）
+    const tree = await page.evaluate(async () => {
+      const s = window.__smooth!
+      const origin = s.state()
+      for (let i = 1; i < 30; i++) {
+        s.teleport(origin.x + Math.cos(i * 1.7) * i * 27, origin.z + Math.sin(i * 1.7) * i * 27)
+        for (let t = 0; t < 30 && !s.state().onGround; t++) {
+          await new Promise((r) => setTimeout(r, 60))
+        }
+        for (let t = 0; t < 120 && s.loaded < s.desired; t++) {
+          await new Promise((r) => setTimeout(r, 250))
+        }
+        await new Promise((r) => setTimeout(r, 1200))
+        const t0 = s.nearestTree()
+        const p = s.state()
+        if (!t0 || p.inWater) continue
+        const dist = Math.hypot(t0.x - p.x, t0.z - p.z)
+        if (dist < 4 || dist > 11) continue
+        return t0
+      }
+      return null
+    })
+    expect(tree, '手ごろな木が見つからなかった').not.toBeNull()
+
+    /** 指定座標にいちばん近い木の幹。 */
+    const nearTree = (x: number, z: number) =>
+      page.evaluate(([tx, tz]) => {
+        const c = window.__smooth!.treeColliders()
+        let best: { y: number; d: number } | null = null
+        for (let i = 0; i < c.length; i += 5) {
+          const d = Math.hypot(c[i] - tx, c[i + 2] - tz)
+          if (!best || d < best.d) best = { y: c[i + 1], d }
+        }
+        return best
+      }, [x, z])
+
+    // 5m 離れた所を掘っても木は動かない
+    await page.evaluate((t) => window.__smooth!.dig(t!.x + 5, t!.y, t!.z + 5, 2.5), tree)
+    await page.waitForTimeout(2500)
+    const beside = await nearTree(tree!.x, tree!.z)
+    expect(beside!.d, '横を掘っただけで木が動いた').toBeLessThan(0.2)
+    expect(Math.abs(beside!.y - tree!.y), '横を掘っただけで木の高さが変わった').toBeLessThan(0.2)
+
+    // 真下を掘る。木は消えるのが正しく、穴の底に沈むのは間違い
+    await page.evaluate((t) => window.__smooth!.dig(t!.x, t!.y - 1.6, t!.z, 3.2), tree)
+    await page.waitForTimeout(3000)
+    const after = await nearTree(tree!.x, tree!.z)
+    if (after && after.d < 2) {
+      expect(
+        after.y,
+        `木が穴の底へ沈んだ (${tree!.y.toFixed(1)}m → ${after.y.toFixed(1)}m)`,
+      ).toBeGreaterThan(tree!.y - 0.5)
+    }
+  })
+})
