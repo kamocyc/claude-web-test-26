@@ -14,8 +14,12 @@ export interface SaveMeta {
   pitch: number
   timeOfDay: number
   flying: boolean
-  /** 素材ごとの手持ち量（採掘して貯まる）。 */
-  inventory: number[]
+  /** 持ち物（Inventory.toJSON の結果）。 */
+  inventory: unknown
+  /** 置いた松明。 */
+  torches?: { x: number; y: number; z: number; yaw: number }[]
+  /** 体力。 */
+  health?: number
   /** 伐採した木のセルキー。 */
   chopped: number[]
 }

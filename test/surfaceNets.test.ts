@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { surfaceNets } from '../src/world/surfaceNets'
-import { CHUNK_SIZE, GRID, PAD, VOXEL_SIZE, gridIndex } from '../src/world/constants'
+import {
+  CHUNK_SIZE,
+  GRID,
+  MAT_BRICK,
+  MAT_GLASS,
+  PAD,
+  VOXEL_SIZE,
+  gridIndex,
+} from '../src/world/constants'
 import { DensityField, generateChunkDensity } from '../src/world/density'
 
 /** 中心 c 半径 r の球を密度場として GRID^3 に焼く。座標はチャンクローカル。 */
@@ -132,5 +140,45 @@ describe('チャンク境界', () => {
       expect(left[i][1]).toBeCloseTo(right[i][1], 5)
       expect(left[i][2]).toBeCloseTo(right[i][2], 5)
     }
+  })
+})
+
+describe('クラフトした建材', () => {
+  const R = 10
+  const C = 16
+
+  /** 半径 R の球の密度場に、素材 ID を全面に塗ったメッシュを作る。 */
+  function meshWithMaterial(mat: number) {
+    const d = sphereGrid(C, C, C, R)
+    const over = new Uint8Array(GRID * GRID * GRID).fill(255)
+    for (let i = 0; i < over.length; i++) if (d[i] > 0) over[i] = mat
+    return surfaceNets(d, 0, 0, 0, over, null)!
+  }
+
+  it('4 番以降の素材が matw2 に乗る', () => {
+    const brick = meshWithMaterial(MAT_BRICK)
+    let worst = 0
+    for (let i = 0; i < brick.mats2.length; i += 4) {
+      // レンガは matw2 の y 成分
+      worst = Math.max(worst, 1 - brick.mats2[i + 1])
+    }
+    expect(worst, 'レンガの重みが matw2 に入っていない').toBeLessThan(0.02)
+    // 自然素材の側は空になる
+    for (let i = 0; i < brick.mats.length; i++) expect(brick.mats[i]).toBeLessThan(0.02)
+  })
+
+  it('ガラスの三角形だけ後ろにまとまる', () => {
+    const glass = meshWithMaterial(MAT_GLASS)
+    expect(glass.glassStart, 'ガラスが分けられていない').toBe(0)
+    expect(glass.indices.length).toBeGreaterThan(0)
+
+    const brick = meshWithMaterial(MAT_BRICK)
+    expect(brick.glassStart, 'ガラスでないのに分けられた').toBe(brick.indices.length)
+  })
+
+  it('自然地形はこれまでどおり matw だけを使う', () => {
+    const plain = surfaceNets(sphereGrid(C, C, C, R), 0, 0, 0, null, null)!
+    for (let i = 0; i < plain.mats2.length; i++) expect(plain.mats2[i]).toBe(0)
+    expect(plain.glassStart).toBe(plain.indices.length)
   })
 })

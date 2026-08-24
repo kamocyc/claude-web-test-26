@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { CHUNK_SIZE, GRID, VOXEL_SIZE } from './constants'
+import { CHUNK_SIZE, GRID, MATERIAL_COUNT, VOXEL_SIZE } from './constants'
 import { ColumnHeightCache, DensityField, generateChunkDensity } from './density'
 import { surfaceNets } from './surfaceNets'
 import { scatterTrees } from './vegetation'
@@ -24,8 +24,10 @@ export interface MeshResponse {
   positions?: Float32Array
   normals?: Float32Array
   mats?: Float32Array
+  mats2?: Float32Array
   biome?: Float32Array
   indices?: Uint32Array
+  glassStart?: number
   /** 木のインスタンス（TREE_STRIDE ごとに 1 本）。 */
   trees?: Float32Array
 }
@@ -59,7 +61,7 @@ self.onmessage = (ev: MessageEvent<MeshRequest>) => {
       if (gi < 0 || gi >= density.length) continue
       density[gi] = vals[n]
       const m = mats ? mats[n] : 255
-      if (m < 4) {
+      if (m < MATERIAL_COUNT) {
         if (!matOverride) matOverride = new Uint8Array(GRID * GRID * GRID).fill(255)
         matOverride[gi] = m
       }
@@ -87,14 +89,17 @@ self.onmessage = (ev: MessageEvent<MeshRequest>) => {
     positions: mesh.positions,
     normals: mesh.normals,
     mats: mesh.mats,
+    mats2: mesh.mats2,
     biome: mesh.biome,
     indices: mesh.indices,
+    glassStart: mesh.glassStart,
     trees,
   }
   ;(self as unknown as Worker).postMessage(res, [
     mesh.positions.buffer,
     mesh.normals.buffer,
     mesh.mats.buffer,
+    mesh.mats2.buffer,
     mesh.biome.buffer,
     mesh.indices.buffer,
     trees.buffer,

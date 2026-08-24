@@ -69,6 +69,7 @@ export class World {
   private readonly ringOffsets: Array<[number, number]> = []
 
   private material: THREE.Material | null = null
+  private glassMaterial: THREE.Material | null = null
   private treeProtos: TreePrototype[] | null = null
   private treeMaterial: THREE.Material | null = null
   private readonly dummy = new THREE.Object3D()
@@ -93,8 +94,9 @@ export class World {
     this.buildRingOffsets(16)
   }
 
-  setMaterial(material: THREE.Material): void {
+  setMaterial(material: THREE.Material, glass: THREE.Material): void {
     this.material = material
+    this.glassMaterial = glass
   }
 
   setTreeAssets(prototypes: TreePrototype[], material: THREE.Material): void {
@@ -276,6 +278,17 @@ export class World {
   // ------------------------------------------------------------------ 編集
 
   /** ブラシを適用する。何も変化しなければ null。 */
+  countCraftedVertices(): number {
+    let n = 0
+    for (const chunk of this.chunks.values()) {
+      const attr = chunk.mesh?.geometry.getAttribute('matw2')
+      if (!attr) continue
+      const a = attr.array as ArrayLike<number>
+      for (let i = 0; i < a.length; i += 4) if (a[i] + a[i + 1] + a[i + 2] > 0.5) n++
+    }
+    return n
+  }
+
   applyBrush(
     x: number,
     y: number,
@@ -591,11 +604,20 @@ export class World {
     geo.setAttribute('position', new THREE.BufferAttribute(res.positions, 3))
     geo.setAttribute('normal', new THREE.BufferAttribute(res.normals, 3))
     geo.setAttribute('matw', new THREE.BufferAttribute(res.mats, 4))
+    if (res.mats2) geo.setAttribute('matw2', new THREE.BufferAttribute(res.mats2, 4))
     if (res.biome) geo.setAttribute('abiome', new THREE.BufferAttribute(res.biome, 2))
     geo.setIndex(new THREE.BufferAttribute(res.indices, 1))
     geo.computeBoundingSphere()
 
-    const mesh = new THREE.Mesh(geo, this.material)
+    // ガラスは後ろにまとめてあるので、そこだけ透過マテリアルで描く
+    const glassStart = res.glassStart ?? res.indices.length
+    let material: THREE.Material | THREE.Material[] = this.material
+    if (this.glassMaterial && glassStart < res.indices.length) {
+      geo.addGroup(0, glassStart, 0)
+      geo.addGroup(glassStart, res.indices.length - glassStart, 1)
+      material = [this.material, this.glassMaterial]
+    }
+    const mesh = new THREE.Mesh(geo, material)
     mesh.position.set(chunk.cx * CHUNK_WORLD, chunk.cy * CHUNK_WORLD, chunk.cz * CHUNK_WORLD)
     mesh.castShadow = true
     mesh.receiveShadow = true

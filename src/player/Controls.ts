@@ -23,6 +23,10 @@ export class Controls {
   onCycleTool: (() => void) | null = null
   /** T キー: 時刻の切り替え（デバッグ） */
   onCycleTime: (() => void) | null = null
+  /** E キー: 持ち物とクラフトの画面 */
+  onTogglePanel: (() => void) | null = null
+  /** F キー: 目の前の相手と話す（村人との交換） */
+  onInteract: (() => void) | null = null
   onLockChange: ((locked: boolean) => void) | null = null
   onToggleStats: (() => void) | null = null
   /** デバッグ: 最寄りの村へワープ */
@@ -87,6 +91,16 @@ export class Controls {
     if (e.code === 'F3') {
       e.preventDefault()
       this.onToggleStats?.()
+      return
+    }
+    // 持ち物・交換の画面はポインタロックを外して開くので、
+    // ここだけはロックの有無に関係なく受け取る
+    if (e.code === 'KeyE' && !e.repeat) {
+      this.onTogglePanel?.()
+      return
+    }
+    if (e.code === 'KeyF' && !e.repeat) {
+      this.onInteract?.()
       return
     }
     if (!this.locked) return

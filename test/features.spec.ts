@@ -103,7 +103,7 @@ test.describe('伐採', () => {
     await click(page, 0, 700)
     const after = await api(page)
     expect(after.chopped, '伐採が記録されていない').toBeGreaterThan(0)
-    expect(await page.textContent('#toast')).toContain('切り倒した')
+    expect(await page.textContent('#toast')).toContain('伐った')
 
     // 切った木の位置に幹が残っていないこと
     const remaining = await page.evaluate(

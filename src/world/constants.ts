@@ -32,14 +32,23 @@ export const SEA_LEVEL = 0
 /** 洞窟が存在しうる最下部。 */
 export const CAVE_MIN_Y = -78
 
-/** 素材 ID。シェーダの vec4 の各チャンネルに対応する。 */
+/**
+ * 素材 ID。0〜3 は地形が自然に持つ素材で、頂点属性 `matw` に、
+ * 4〜6 はクラフトした建材で、頂点属性 `matw2` に重みが入る。
+ */
 export const MAT_GRASS = 0
 export const MAT_DIRT = 1
 export const MAT_ROCK = 2
 export const MAT_SAND = 3
+export const MAT_PLANK = 4
+export const MAT_BRICK = 5
+export const MAT_GLASS = 6
 export const MAT_NONE = 255
 
-export const MATERIAL_COUNT = 4
+/** 自然地形が持つ素材の数（密度場のサンプラが返す重みの数）。 */
+export const NATURAL_MATERIAL_COUNT = 4
+
+export const MATERIAL_COUNT = 7
 
 /**
  * 素材の一覧。`repose` は安息角（度）で、0 でない素材は
@@ -50,6 +59,9 @@ export const MATERIAL_INFO = [
   { id: MAT_DIRT, name: '土', color: '#7d5a3c', repose: 38 },
   { id: MAT_ROCK, name: '岩', color: '#8a8f96', repose: 0 },
   { id: MAT_SAND, name: '砂', color: '#d8c48a', repose: 32 },
+  { id: MAT_PLANK, name: '板', color: '#b8874a', repose: 0 },
+  { id: MAT_BRICK, name: 'レンガ', color: '#a8503c', repose: 0 },
+  { id: MAT_GLASS, name: 'ガラス', color: '#9fd6e8', repose: 0 },
 ] as const
 
 /**

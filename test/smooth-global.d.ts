@@ -25,6 +25,9 @@ export interface SmoothDebug {
   tool: string
   timeOfDay: number
   timeFrozen: boolean
+  health: number
+  mobs: number
+  torches: number
   inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
@@ -32,6 +35,19 @@ export interface SmoothDebug {
   gotoVillage(): boolean
   nearestTree(): { x: number; y: number; z: number } | null
   giveMaterial(index: number, amount: number): void
+  give(id: string, amount: number): void
+  itemCount(id: string): number
+  equip(id: string): void
+  craft(out: string): boolean
+  craftable(): string[]
+  setPanel(open: boolean): void
+  setTrade(open: boolean): void
+  spawnMob(kind: 'wraith' | 'deer' | 'villager', dx?: number, dz?: number): boolean
+  mobCount(kind?: 'wraith' | 'deer' | 'villager'): number
+  hitNearestMob(): boolean
+  hurt(amount: number): void
+  torchCount(): number
+  craftedVertices(): number
   setTool(name: string): void
   setTime(hours: number | null): void
   setBrushRadius(r: number): void

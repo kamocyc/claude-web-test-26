@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import { Renderer } from './engine/Renderer'
 import { SkyDayNight } from './engine/SkyDayNight'
 import { Water } from './engine/Water'
-import { createTerrainMaterial } from './render/TerrainMaterial'
+import { createGlassMaterial, createTerrainMaterial } from './render/TerrainMaterial'
 import { createNoiseTexture } from './render/proceduralTextures'
 import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
 import { VillageManager } from './world/VillageManager'
@@ -13,6 +13,8 @@ import { WorldStore } from './world/storage'
 import {
   CHUNK_SIZE,
   MATERIAL_INFO,
+  MAT_ROCK,
+  NATURAL_MATERIAL_COUNT,
   SAMPLE_SEED,
   SEA_LEVEL,
   VILLAGE_CELL,
@@ -21,6 +23,10 @@ import { Player, PLAYER_EYE } from './player/Player'
 import { Controls } from './player/Controls'
 import { createRayHit, raycastTerrain } from './player/terrainRaycast'
 import { Hud } from './ui/hud'
+import { Inventory } from './items/Inventory'
+import { ITEM_BY_MATERIAL, RECIPES, TRADES, item } from './items/items'
+import { MobManager } from './mobs/MobManager'
+import { TorchManager } from './world/TorchManager'
 
 const VIEW_DISTANCE = 7
 const REACH = 9
@@ -28,6 +34,11 @@ const MIN_BRUSH = 1
 const MAX_BRUSH = 6
 const EDIT_INTERVAL = 0.09
 const CHOP_INTERVAL = 0.25
+const ATTACK_INTERVAL = 0.42
+const MAX_HEALTH = 20
+/** ダメージを受けてから回復が始まるまでの秒数。 */
+const REGEN_DELAY = 7
+const REGEN_RATE = 1.1
 
 /** B キーで切り替わるブラシ。 */
 const TOOLS = [
@@ -120,7 +131,7 @@ async function boot(): Promise<void> {
   const camera = engine.camera
 
   const world = new World({ seed, viewDistance: VIEW_DISTANCE, store })
-  world.setMaterial(createTerrainMaterial(createNoiseTexture()))
+  world.setMaterial(createTerrainMaterial(createNoiseTexture()), createGlassMaterial())
   world.setTreeAssets(createTreePrototypes(), treeMaterial)
   scene.add(world.group)
 
@@ -130,12 +141,19 @@ async function boot(): Promise<void> {
   if (hasDb) world.setEdits(await store.loadAllEdits())
   if (meta?.chopped) world.setChopped(meta.chopped)
 
-  // 素材の手持ち量。掘ると増え、盛ると減る。
-  const inventory = new Float32Array(MATERIAL_INFO.length)
-  if (meta?.inventory) {
-    for (let i = 0; i < inventory.length; i++) inventory[i] = meta.inventory[i] ?? 0
-  }
-  hud.setInventory(inventory)
+  // 持ち物。地形の素材は体積、資源・道具は個数で数える。
+  const inventory = new Inventory()
+  if (meta?.inventory) inventory.load(meta.inventory)
+  hud.bind(inventory)
+
+  const mobs = new MobManager()
+  scene.add(mobs.group)
+  const torches = new TorchManager(scene)
+  if (meta?.torches) torches.load(meta.torches)
+
+  let health = typeof meta?.health === 'number' ? meta.health : MAX_HEALTH
+  let sinceHurt = REGEN_DELAY
+  hud.setHealth(health, MAX_HEALTH)
 
   const sky = new SkyDayNight(scene, camera.far * 0.5)
   if (meta) sky.timeOfDay = meta.timeOfDay
@@ -193,28 +211,33 @@ async function boot(): Promise<void> {
   function brushLabel(note: string | null = null): string {
     if (note) return note
     const t = TOOLS[tool]
-    const m = MATERIAL_INFO[slot]
-    const grain = t.id !== 'smooth' && m.repose > 0 ? `　${m.name}は崩れて積もる` : ''
+    const held = inventory.held()
+    const grain =
+      t.id !== 'smooth' && held?.material !== undefined && MATERIAL_INFO[held.material].repose > 0
+        ? `　${held.name}は崩れて積もる`
+        : ''
+    const hand = held ? `　［${held.name}］` : '　［素手］'
     if (t.id === 'box') {
       const n = boxEdge(brushRadius)
-      return `${t.name} ${n}×${n}×${n} m${grain}`
+      return `${t.name} ${n}×${n}×${n} m${hand}${grain}`
     }
-    return `${t.name} 半径 ${brushRadius.toFixed(1)} m${grain}`
+    return `${t.name} 半径 ${brushRadius.toFixed(1)} m${hand}${grain}`
   }
 
   let brushRadius = 2.5
   let tool = 0
-  let slot = 0
   let statsVisible = true
   let started = false
   let editCooldown = 0
   hud.setBrush(brushLabel())
 
   controls.onSlot = (i) => {
-    if (i >= MATERIAL_INFO.length) return
-    slot = i
-    hud.setSlot(i)
+    if (i >= inventory.hotbar.length) return
+    inventory.selected = i
+    hud.refresh()
+    hud.setBrush(brushLabel())
   }
+  hud.onSelectSlot = (i) => controls.onSlot?.(i)
   controls.onToggleFly = () => player.toggleFly()
   let timePreset = 0
   function applyTimePreset(): void {
@@ -241,7 +264,7 @@ async function boot(): Promise<void> {
     hud.setStatsVisible(statsVisible)
   }
   controls.onLockChange = (locked) => {
-    if (!locked && started) hud.setOverlay(true)
+    if (!locked && started && !hud.panelOpen && !hud.tradeOpen) hud.setOverlay(true)
   }
 
   hud.onPlay = () => {
@@ -255,8 +278,11 @@ async function boot(): Promise<void> {
     await store.clear()
     world.setEdits(new Map())
     world.setChopped([])
-    inventory.fill(0)
-    hud.setInventory(inventory)
+    inventory.clear()
+    torches.clear()
+    mobs.clear()
+    health = MAX_HEALTH
+    hud.setHealth(health, MAX_HEALTH)
     player.spawnAt(world, 0.5, 0.5)
     hud.setLoading('')
     hud.setPlayEnabled(true)
@@ -290,7 +316,9 @@ async function boot(): Promise<void> {
       pitch: controls.pitch,
       timeOfDay: sky.timeOfDay,
       flying: player.flying,
-      inventory: [...inventory],
+      inventory: inventory.toJSON(),
+      torches: [...torches.torches],
+      health,
       chopped: world.choppedList,
     }
   }
@@ -315,6 +343,12 @@ async function boot(): Promise<void> {
     timeOfDay: 0,
     /** 時刻を固定しているか。 */
     timeFrozen: false,
+    /** 体力。 */
+    health: MAX_HEALTH,
+    /** いま存在する MOB の数。 */
+    mobs: 0,
+    /** 置いた松明の数。 */
+    torches: 0,
     /** 素材の手持ち量（grass, dirt, rock, sand）。 */
     inventory: [0, 0, 0, 0] as number[],
     /** 視線角を直接設定する。 */
@@ -390,11 +424,79 @@ async function boot(): Promise<void> {
     density(x: number, y: number, z: number): number {
       return world.densityAt(x, y, z)
     },
-    /** 手持ち量を直接与える（テスト用）。 */
+    /** 素材の手持ち量を直接与える（テスト用、0=草 1=土 2=岩 3=砂）。 */
     giveMaterial(index: number, amount: number) {
-      if (index < 0 || index >= inventory.length) return
-      inventory[index] = amount
-      hud.setInventory(inventory)
+      const def = ITEM_BY_MATERIAL.get(index)
+      if (def) inventory.add(def.id, amount)
+    },
+    /** 任意のアイテムを与える（テスト用）。 */
+    give(id: string, amount: number) {
+      inventory.add(id, amount)
+    },
+    /** 持ち物の個数。 */
+    itemCount(id: string): number {
+      return inventory.whole(id)
+    },
+    /** ホットバーの枠にアイテムを入れて選ぶ（テスト用）。 */
+    equip(id: string) {
+      inventory.assign(inventory.selected, id)
+      hud.refresh()
+    },
+    /** レシピ ID を指定して作る。作れなければ false。 */
+    craft(out: string): boolean {
+      const r = RECIPES.find((x) => x.out === out)
+      if (!r) return false
+      const ok = inventory.craft(r)
+      if (ok) markMetaDirty()
+      return ok
+    },
+    /** 作れるレシピの一覧。 */
+    craftable(): string[] {
+      return RECIPES.filter((r) => inventory.canCraft(r)).map((r) => r.out)
+    },
+    /** 持ち物とクラフトの画面を開閉する。 */
+    setPanel(open: boolean) {
+      setPanel(open)
+    },
+    /** 交換画面を開閉する。 */
+    setTrade(open: boolean) {
+      setTradePanel(open)
+    },
+    /** MOB を目の前に湧かせる（テスト用）。 */
+    spawnMob(kind: 'wraith' | 'deer' | 'villager', dx = 3, dz = 0) {
+      const x = player.position.x + dx
+      const z = player.position.z + dz
+      return mobs.spawn(kind, x, world.field.height(x, z) + 0.5, z) !== null
+    },
+    /** MOB の数。 */
+    mobCount(kind?: 'wraith' | 'deer' | 'villager'): number {
+      return kind ? mobs.count(kind) : mobs.total
+    },
+    /** いちばん近い MOB を殴る（テスト用）。倒したら true。 */
+    hitNearestMob(): boolean {
+      let best = null as null | (typeof mobs.mobs)[number]
+      let bd = 6
+      for (const m of mobs.mobs) {
+        const d = Math.hypot(m.pos.x - player.position.x, m.pos.z - player.position.z)
+        if (d < bd) {
+          bd = d
+          best = m
+        }
+      }
+      if (!best) return false
+      return mobs.hurt(best, inventory.attack(), player.position.x, player.position.z)
+    },
+    /** ダメージを受ける（テスト用）。 */
+    hurt(amount: number) {
+      hurtPlayer(amount)
+    },
+    /** 松明の数。 */
+    torchCount(): number {
+      return torches.count
+    },
+    /** クラフトした建材が乗っている頂点の数（ワーカーまで届いているかの確認）。 */
+    craftedVertices(): number {
+      return world.countCraftedVertices()
     },
     /** 最寄りの村の広場へ移動する。見つからなければ false。 */
     gotoVillage(): boolean {
@@ -444,20 +546,118 @@ async function boot(): Promise<void> {
 
   const surfaceFogDensity = engine.fog.density
 
+  /** ダメージを受ける。防具のぶんだけ軽くなる。 */
+  function hurtPlayer(damage: number): void {
+    if (!started || health <= 0) return
+    const taken = Math.max(0.5, damage * (1 - inventory.armor()))
+    health -= taken
+    sinceHurt = 0
+    hud.flashHurt()
+    hud.setHealth(health, MAX_HEALTH)
+    markMetaDirty()
+    if (health <= 0) respawn()
+  }
+
+  /** やられたら最寄りの村へ、無ければ最初の地点へ戻す。持ち物はそのまま。 */
+  function respawn(): void {
+    health = MAX_HEALTH
+    sinceHurt = REGEN_DELAY
+    const v = world.field.villageNear(player.position.x, player.position.z)
+    const x = v ? v.cx : 0.5
+    const z = v ? v.cz : 0.5
+    player.spawnAt(world, x, z)
+    mobs.clear()
+    hud.setHealth(health, MAX_HEALTH)
+    hud.showToast(v ? 'やられた… 最寄りの村で目を覚ました' : 'やられた… 最初の地点に戻った', 2600)
+    markMetaDirty()
+  }
+
+  mobs.onAttack = (damage) => hurtPlayer(damage)
+  mobs.onDrop = (id, count) => {
+    inventory.add(id, count)
+    hud.showToast(`${item(id).name} ×${count} を手に入れた`)
+    markMetaDirty()
+  }
+
+  hud.onCraft = (r) => {
+    if (!inventory.craft(r)) return
+    hud.showToast(`${item(r.out).name} を作った`)
+    markMetaDirty()
+  }
+  hud.onTrade = (i) => {
+    const t = TRADES[i]
+    if (!t || !inventory.trade(t.give, t.get)) return
+    hud.showToast(`${item(t.get[0]).name} ×${t.get[1]} と交換した`)
+    markMetaDirty()
+  }
+  hud.onPanelClose = () => setPanel(false)
+  hud.onTradeClose = () => setTradePanel(false)
+
+  function setPanel(open: boolean): void {
+    hud.setPanel(open)
+    if (open) {
+      hud.setTrade(false)
+      document.exitPointerLock()
+    } else if (started) {
+      controls.requestLock()
+    }
+  }
+
+  function setTradePanel(open: boolean): void {
+    hud.setTrade(open)
+    if (open) {
+      hud.setPanel(false)
+      document.exitPointerLock()
+    } else if (started) {
+      controls.requestLock()
+    }
+  }
+
+  controls.onTogglePanel = () => setPanel(!hud.panelOpen)
+  controls.onInteract = () => {
+    if (hud.tradeOpen) {
+      setTradePanel(false)
+      return
+    }
+    const v = mobs.nearestVillager(player.position.x, player.position.z, 4.5)
+    if (!v) {
+      hud.showToast('近くに村人がいません')
+      return
+    }
+    setTradePanel(true)
+  }
+
   /**
-   * 掘った体積を素材ごとの手持ちに足す。
+   * 掘った体積を素材ごとの持ち物に足す。
    * プレイヤーが設置した素材があればそれを、無ければ地形本来の素材の比率で分ける。
+   * 岩を掘るとまれに石炭も出る（松明とガラスの材料）。
    */
   function creditDig(x: number, y: number, z: number, ny: number, amount: number): void {
     if (amount <= 0) return
     const placed = world.cornerMaterial(Math.round(x), Math.round(y), Math.round(z))
-    if (placed < inventory.length) {
-      inventory[placed] += amount
+    const placedItem = ITEM_BY_MATERIAL.get(placed)
+    if (placedItem) {
+      inventory.add(placedItem.id, amount)
       return
     }
     world.field.surfaceSample(x, y, z, ny, matScratch, 0)
-    for (let i = 0; i < inventory.length; i++) inventory[i] += amount * matScratch[i]
+    let rock = 0
+    for (let i = 0; i < NATURAL_MATERIAL_COUNT; i++) {
+      const def = ITEM_BY_MATERIAL.get(i)
+      if (!def || matScratch[i] <= 0) continue
+      inventory.add(def.id, amount * matScratch[i])
+      if (i === MAT_ROCK) rock = matScratch[i]
+    }
+    coalProgress += amount * rock * 0.02
+    if (coalProgress >= 1) {
+      const n = Math.floor(coalProgress)
+      coalProgress -= n
+      inventory.add('coal', n)
+    }
   }
+
+  /** 石炭は端数を持ち越して、掘り続けるとたまに 1 個出るようにする。 */
+  let coalProgress = 0
 
   function tick(): void {
     requestAnimationFrame(tick)
@@ -486,7 +686,20 @@ async function boot(): Promise<void> {
     engine.fog.density = underwater ? 0.055 : surfaceFogDensity
     if (underwater) engine.fog.color.setHex(0x1c4f6b)
 
-    // --- ブラシ ---
+    // --- MOB と松明 ---
+    const daylight = sky.daylight
+    if (started) {
+      mobs.update(dt, world, player.position.x, player.position.y, player.position.z, daylight)
+      torches.update(dt, camera.position.x, camera.position.y, camera.position.z)
+      // 少し経つと体力が戻る
+      sinceHurt += dt
+      if (health > 0 && health < MAX_HEALTH && sinceHurt > REGEN_DELAY) {
+        health = Math.min(MAX_HEALTH, health + REGEN_RATE * dt)
+        hud.setHealth(health, MAX_HEALTH)
+      }
+    }
+
+    // --- ブラシと戦闘 ---
     if (started && controls.locked) {
       if (controls.wheel !== 0) {
         brushRadius = clamp(brushRadius - Math.sign(controls.wheel) * 0.5, MIN_BRUSH, MAX_BRUSH)
@@ -505,22 +718,37 @@ async function boot(): Promise<void> {
         REACH,
         treeHit,
       )
-      // 木のほうが手前なら、左クリックは伐採になる
-      const onTree = tree !== null && tree.distance < (target ? target.distance : Infinity)
+      const mobHit = mobs.raycast(eye.x, eye.y, eye.z, lookDir.x, lookDir.y, lookDir.z, REACH)
 
+      // 手前にあるものが左クリックの対象になる（MOB > 木 > 地形）
+      const terrainDist = target ? target.distance : Infinity
+      const treeDist = tree ? tree.distance : Infinity
+      const onMob = mobHit !== null && mobHit.distance < Math.min(terrainDist, treeDist)
+      const onTree = !onMob && tree !== null && treeDist < terrainDist
+
+      const held = inventory.held()
       const kind = TOOLS[tool].id
       const smoothing = kind === 'smooth'
       // ならしは体積の帰属が曖昧なので手持ちを増減させない。左右どちらのボタンでもならす。
       const dig = smoothing || controls.digging
       const acting = controls.digging || controls.placing
 
+      // 道具の効果
+      const digMul = held?.dig ?? 1
+      const chopMul = held?.chop ?? 1
+      const digRadius = clamp(brushRadius + (held?.radius ?? 0), MIN_BRUSH, MAX_BRUSH + 2)
+
+      // 手に持っているものが置けるかどうか
+      const placeMat = held?.material
+      const placingTorch = held?.kind === 'light'
+      const stock = held ? inventory.count(held.id) : 0
+
       // 手持ちが足りないぶんブラシを小さくする（盛れる量 = 掘った量）
-      const stock = inventory[slot]
-      const repose = MATERIAL_INFO[slot].repose
+      const repose = placeMat !== undefined ? MATERIAL_INFO[placeMat].repose : 0
       const cap = repose > 0 ? Math.min(brushRadius, MAX_PILE_RADIUS) : brushRadius
       const edge = Math.min(boxEdge(brushRadius), Math.floor(cap * 2))
-      const half = dig ? boxEdge(brushRadius) / 2 : Math.min(edge, Math.floor(Math.cbrt(stock))) / 2
-      const radius = dig ? brushRadius : Math.min(cap, Math.cbrt((stock * 3) / (4 * Math.PI)))
+      const half = dig ? boxEdge(digRadius) / 2 : Math.min(edge, Math.floor(Math.cbrt(stock))) / 2
+      const radius = dig ? digRadius : Math.min(cap, Math.cbrt((stock * 3) / (4 * Math.PI)))
 
       // 掘るときは表面のわずかに内側、置くときはわずかに外側を中心にする
       const off = dig ? -0.25 : 0.35
@@ -549,8 +777,9 @@ async function boot(): Promise<void> {
         kind === 'box'
           ? toGhost < half + 0.3
           : Math.hypot(eye.x - cx, eye.y - cy, eye.z - cz) < radius + 0.3
-      const showBox = kind === 'box' && target !== null && !onTree && half > 0 && !inside
-      const showSphere = kind !== 'box' && target !== null && !onTree && !inside
+      const busy = onTree || onMob || placingTorch
+      const showBox = kind === 'box' && target !== null && !busy && half > 0 && !inside
+      const showSphere = kind !== 'box' && target !== null && !busy && !inside
       boxGhost.visible = showBox
       ghost.visible = showSphere
       if (showBox) {
@@ -561,36 +790,72 @@ async function boot(): Promise<void> {
         ghost.position.set(cx, cy, cz)
         ghost.scale.setScalar(Math.max(radius, 0.15))
       }
-      hud.setBrush(brushLabel(onTree ? '木（左クリックで伐採）' : null))
+      const note = onMob && mobHit
+        ? `${mobHit.mob.def.name}（左クリックで攻撃）`
+        : onTree
+          ? '木（左クリックで伐採）'
+          : null
+      hud.setBrush(brushLabel(note))
 
       editCooldown -= dt
-      if (editCooldown <= 0 && controls.digging && onTree && tree) {
+      if (editCooldown <= 0 && controls.digging && onMob && mobHit) {
+        const dead = mobs.hurt(
+          mobHit.mob,
+          inventory.attack(),
+          player.position.x,
+          player.position.z,
+        )
+        if (dead) hud.showToast(`${mobHit.mob.def.name} を倒した`)
+        editCooldown = ATTACK_INTERVAL
+      } else if (editCooldown <= 0 && controls.digging && onTree && tree) {
         if (world.chopTree(tree)) {
-          hud.showToast('木を切り倒した')
+          inventory.add('wood', 3)
+          hud.showToast('木を伐った（木材 ×3）')
           markMetaDirty()
-          editCooldown = CHOP_INTERVAL
+          editCooldown = CHOP_INTERVAL * chopMul
+        }
+      } else if (editCooldown <= 0 && controls.placing && placingTorch && held) {
+        if (target && stock >= 1) {
+          torches.add(
+            target.point.x + target.normal.x * 0.06,
+            target.point.y + target.normal.y * 0.06,
+            target.point.z + target.normal.z * 0.06,
+            controls.yaw,
+          )
+          inventory.take(held.id, 1)
+          markMetaDirty()
+          editCooldown = 0.28
+        } else if (target) {
+          hud.showToast('松明が足りません')
+          editCooldown = 0.5
         }
       } else if (target && editCooldown <= 0 && acting) {
-        if (!dig && stock < 1) {
-          hud.showToast(`${MATERIAL_INFO[slot].name}が足りません（掘って集める）`)
+        if (!dig && placeMat === undefined) {
+          hud.showToast('持っているものは置けません（E で持ち物）')
+          editCooldown = 0.5
+        } else if (!dig && stock < 1) {
+          hud.showToast(`${held?.name ?? '素材'}が足りません（掘って集める）`)
           editCooldown = 0.5
         } else {
+          const material = dig ? MATERIAL_INFO[0].id : (placeMat as number)
           const shape = kind === 'box' ? boxBrush(half, half, half) : sphereBrush(radius)
           // 粒状かどうかは素材 ID から決まるので、盛る側の呼び分けは要らない
           const bounds = smoothing
             ? world.applySmooth(cx, cy, cz, brushRadius, 1)
-            : world.applyBrush(cx, cy, cz, shape, dig ? 'dig' : 'place', MATERIAL_INFO[slot].id)
+            : world.applyBrush(cx, cy, cz, shape, dig ? 'dig' : 'place', material)
           if (bounds) {
             if (smoothing) {
               // 収支なし
             } else if (dig) {
               creditDig(cx, cy, cz, target.normal.y, bounds.cleared)
-            } else {
-              inventory[slot] = Math.max(0, inventory[slot] - bounds.solidified)
+              // 掘ったところにあった松明は回収する
+              const t = torches.removeNear(cx, cy, cz, radius + 0.6)
+              if (t) inventory.add('torch', 1)
+            } else if (held) {
+              inventory.take(held.id, bounds.solidified)
             }
-            hud.setInventory(inventory)
             markMetaDirty()
-            editCooldown = EDIT_INTERVAL
+            editCooldown = EDIT_INTERVAL * (dig && !smoothing ? digMul : 1)
           }
         }
       }
@@ -631,6 +896,7 @@ async function boot(): Promise<void> {
           `Mode  ${player.flying ? '飛行' : player.inWater ? '水中' : player.onGround ? '接地' : '空中'}`,
           `Env   ${biomeName(world, player.position.x, player.position.z)}  村 ${villages.activeCount}`,
           `Tree  ${world.treeCount}  伐採 ${world.choppedCount}`,
+          `HP    ${Math.ceil(health)}/${MAX_HEALTH}  MOB ${mobs.total}  松明 ${torches.count}`,
           `Time  ${String(h % 24).padStart(2, '0')}:00${sky.paused ? '  固定' : ''}`,
           `Seed  ${seed}`,
         ].join('\n'),
@@ -657,7 +923,13 @@ async function boot(): Promise<void> {
     stats.villages = villages.activeCount
     stats.villageBoxes = villages.colliderCount
     stats.chopped = world.choppedCount
-    for (let i = 0; i < inventory.length; i++) stats.inventory[i] = inventory[i]
+    for (let i = 0; i < NATURAL_MATERIAL_COUNT; i++) {
+      const def = ITEM_BY_MATERIAL.get(i)
+      stats.inventory[i] = def ? inventory.whole(def.id) : 0
+    }
+    stats.health = health
+    stats.mobs = mobs.total
+    stats.torches = torches.count
     stats.trees = world.treeCount
     stats.tool = TOOLS[tool].id
     stats.timeOfDay = sky.timeOfDay

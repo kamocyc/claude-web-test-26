@@ -1,13 +1,20 @@
-import { CELLS, CELL_BASE, GRID, PAD, VOXEL_SIZE } from './constants'
+import { CELLS, CELL_BASE, GRID, MATERIAL_COUNT, MAT_GLASS, NATURAL_MATERIAL_COUNT, PAD, VOXEL_SIZE } from './constants'
 
 export interface MeshData {
   positions: Float32Array
   normals: Float32Array
-  /** 頂点ごとの素材の重み (grass, dirt, rock, sand)。合計 1。 */
+  /** 頂点ごとの素材の重み (grass, dirt, rock, sand)。 */
   mats: Float32Array
+  /** クラフトした建材の重み (板, レンガ, ガラス, 予備)。mats と合わせて合計 1。 */
+  mats2: Float32Array
   /** 頂点ごとのバイオーム (temp, humid)。シェーダの色付けに使う。 */
   biome: Float32Array
   indices: Uint32Array
+  /**
+   * `indices` のうち、ここから先はガラスの三角形。
+   * 透過マテリアルを別グループとして張るために分けてある。
+   */
+  glassStart: number
 }
 
 /**
@@ -54,8 +61,11 @@ export function surfaceNets(
   const positions: number[] = []
   const normals: number[] = []
   const mats: number[] = []
+  const mats2: number[] = []
+  const glassW: number[] = []
   const biome: number[] = []
   const indices: number[] = []
+  const glassIndices: number[] = []
 
   const d = new Float32Array(8)
   const cornerIdx = new Int32Array(8)
@@ -63,7 +73,7 @@ export function surfaceNets(
   const gy = new Float32Array(8)
   const gz = new Float32Array(8)
   const w = new Float32Array(6)
-  const acc = new Float32Array(4)
+  const acc = new Float32Array(MATERIAL_COUNT)
 
   const strideY = GRID
   const strideZ = GRID * GRID
@@ -140,10 +150,7 @@ export function surfaceNets(
         normals.push(nx, ny, nz)
 
         // 素材：プレイヤー設置分を優先しつつ自然素材と混ぜる
-        acc[0] = 0
-        acc[1] = 0
-        acc[2] = 0
-        acc[3] = 0
+        acc.fill(0)
         let solid = 0
         let overridden = 0
         for (let b = 0; b < 8; b++) {
@@ -151,7 +158,7 @@ export function surfaceNets(
           solid++
           if (matOverride) {
             const m = matOverride[cornerIdx[b]]
-            if (m < 4) {
+            if (m < MATERIAL_COUNT) {
               acc[m] += 1
               overridden++
             }
@@ -172,13 +179,14 @@ export function surfaceNets(
 
         const natural = solid - overridden
         if (natural > 0) {
-          acc[0] += w[0] * natural
-          acc[1] += w[1] * natural
-          acc[2] += w[2] * natural
-          acc[3] += w[3] * natural
+          for (let m = 0; m < NATURAL_MATERIAL_COUNT; m++) acc[m] += w[m] * natural
         }
-        const total = acc[0] + acc[1] + acc[2] + acc[3] || 1
+        let total = 0
+        for (let m = 0; m < MATERIAL_COUNT; m++) total += acc[m]
+        if (total <= 0) total = 1
         mats.push(acc[0] / total, acc[1] / total, acc[2] / total, acc[3] / total)
+        mats2.push(acc[4] / total, acc[5] / total, acc[6] / total, 0)
+        glassW.push(acc[MAT_GLASS] / total)
 
         cellVert[ci + CELLS * (cj + CELLS * ck)] = vi
       }
@@ -240,12 +248,28 @@ export function surfaceNets(
 
   if (indices.length === 0) return null
 
+  // ガラスの三角形を後ろへ集める。透過は別マテリアルで描くのでグループを分ける。
+  const opaque: number[] = []
+  for (let t = 0; t < indices.length; t += 3) {
+    const a = indices[t]
+    const b = indices[t + 1]
+    const c = indices[t + 2]
+    const g = (glassW[a] + glassW[b] + glassW[c]) / 3
+    const out = g > 0.5 ? glassIndices : opaque
+    out.push(a, b, c)
+  }
+  const all = new Uint32Array(opaque.length + glassIndices.length)
+  all.set(opaque, 0)
+  all.set(glassIndices, opaque.length)
+
   return {
     positions: new Float32Array(positions),
     normals: new Float32Array(normals),
     mats: new Float32Array(mats),
+    mats2: new Float32Array(mats2),
     biome: new Float32Array(biome),
-    indices: new Uint32Array(indices),
+    indices: all,
+    glassStart: opaque.length,
   }
 }
 
