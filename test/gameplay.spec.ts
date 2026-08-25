@@ -40,6 +40,33 @@ async function click(page: Page, button: 0 | 2, ms: number): Promise<void> {
   )
 }
 
+/**
+ * ボタンを押したまま、ゲーム側の条件が満たされるまで待って離す。
+ *
+ * ヘッドレスは SwiftShader なので数 fps しか出ず、固定時間の押しっぱなしでは
+ * 1 フレームも回らないことがある。押している間の待ちを条件で切るとぶれない。
+ */
+async function holdUntil(
+  page: Page,
+  button: 0 | 2,
+  predicate: string,
+  timeout = 20_000,
+): Promise<void> {
+  await page.evaluate(
+    (b) => document.dispatchEvent(new MouseEvent('mousedown', { button: b })),
+    button,
+  )
+  try {
+    await page.waitForFunction(`(${predicate})()`, null, { timeout })
+  } finally {
+    await page.evaluate(
+      (b) => document.dispatchEvent(new MouseEvent('mouseup', { button: b })),
+      button,
+    )
+    await page.waitForTimeout(500)
+  }
+}
+
 async function lookDown(page: Page): Promise<void> {
   await page.evaluate(() =>
     document.dispatchEvent(new MouseEvent('mousemove', { movementX: 0, movementY: 620 })),
@@ -90,8 +117,11 @@ test.describe('持ち物とクラフト', () => {
     })
     await lookDown(page)
     const before = await itemCount(page, 'brick')
-    await click(page, 2, 900)
-    await page.waitForTimeout(1500)
+    await holdUntil(page, 2, `() => window.__smooth.itemCount('brick') < ${before}`)
+    // メッシュの作り直しは Worker 越しなので、頂点に出るまで待つ
+    await page.waitForFunction(() => window.__smooth!.craftedVertices() > 20, null, {
+      timeout: 20_000,
+    })
 
     expect(await itemCount(page, 'brick'), 'レンガが減っていない').toBeLessThan(before)
     expect(await craftedVertices(page), 'メッシュにレンガが出ていない').toBeGreaterThan(20)
@@ -118,14 +148,12 @@ test.describe('持ち物とクラフト', () => {
       s.equip('torch')
     })
     await lookDown(page)
-    await click(page, 2, 400)
-    await page.waitForTimeout(600)
+    await holdUntil(page, 2, '() => window.__smooth.torchCount() > 0')
     expect(await torchCount(page), '松明が置けていない').toBe(1)
     expect(await itemCount(page, 'torch')).toBe(3)
 
     await page.evaluate(() => window.__smooth!.equip('dirt'))
-    await click(page, 0, 700)
-    await page.waitForTimeout(600)
+    await holdUntil(page, 0, '() => window.__smooth.torchCount() === 0')
     expect(await torchCount(page), '掘っても松明が残っている').toBe(0)
     expect(await itemCount(page, 'torch'), '松明が戻ってこない').toBe(4)
   })
@@ -175,10 +203,15 @@ test.describe('MOB と戦闘', () => {
       s.give('bone_sword', 1)
       s.equip('bone_sword')
     })
-    await page.waitForFunction(() => window.__smooth!.hitNearestMob() === true, null, {
+    // 倒せるまで殴り、ドロップが持ち物に入るまで待つ（数 fps なので時間では待たない）
+    await page.waitForFunction(
+      () => window.__smooth!.hitNearestMob() === true || window.__smooth!.itemCount('hide') > 0,
+      null,
+      { timeout: 15_000 },
+    )
+    await page.waitForFunction(() => window.__smooth!.itemCount('hide') > 0, null, {
       timeout: 10_000,
     })
-    await page.waitForTimeout(800)
     expect(await itemCount(page, 'hide'), '皮が手に入らない').toBeGreaterThan(0)
   })
 

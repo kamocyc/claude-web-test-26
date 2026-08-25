@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
+import { boxGeometry, quad, tri } from './geoUtil'
 import { buildingBoxes } from '../world/village'
 import type { Box, Building, Village } from '../world/village'
 
@@ -172,9 +173,7 @@ function pillar(
 }
 
 function boxGeo(b: Box, color: number): THREE.BufferGeometry {
-  const geo = new THREE.BoxGeometry(b.maxX - b.minX, b.maxY - b.minY, b.maxZ - b.minZ)
-  geo.translate((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, (b.minZ + b.maxZ) / 2)
-  return finish(geo, color)
+  return finish(boxGeometry(b), color)
 }
 
 /**
@@ -216,28 +215,6 @@ function roofGeo(
   geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(v), 3))
   geo.computeVertexNormals()
   return finish(geo, color)
-}
-
-// A→B→C→D は屋根を内側から見て反時計回りに並ぶので、
-// 外向きの面になるよう巻き順を反転して出力する。
-function quad(
-  out: number[],
-  ax: number, ay: number, az: number,
-  bx: number, by: number, bz: number,
-  cx: number, cy: number, cz: number,
-  dx: number, dy: number, dz: number,
-): void {
-  out.push(ax, ay, az, cx, cy, cz, bx, by, bz)
-  out.push(ax, ay, az, dx, dy, dz, cx, cy, cz)
-}
-
-function tri(
-  out: number[],
-  ax: number, ay: number, az: number,
-  bx: number, by: number, bz: number,
-  cx: number, cy: number, cz: number,
-): void {
-  out.push(ax, ay, az, cx, cy, cz, bx, by, bz)
 }
 
 function finish(geo: THREE.BufferGeometry, color: number): THREE.BufferGeometry {

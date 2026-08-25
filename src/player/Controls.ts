@@ -21,6 +21,10 @@ export class Controls {
   onToggleFly: (() => void) | null = null
   /** B キー: ブラシの切り替え */
   onCycleTool: (() => void) | null = null
+  /** R キー: 建築パーツの切り替え（壁 → 窓 → 戸口 → 床 → 階段 → 屋根 → ブロック） */
+  onCyclePiece: (() => void) | null = null
+  /** 中クリック: 建築の回転を既定へ戻す */
+  onResetRotation: (() => void) | null = null
   /** T キー: 時刻の切り替え（デバッグ） */
   onCycleTime: (() => void) | null = null
   /** E キー: 持ち物とクラフトの画面 */
@@ -73,6 +77,7 @@ export class Controls {
   private handleMouseDown = (e: MouseEvent): void => {
     if (!this.locked) return
     if (e.button === 0) this.digging = true
+    if (e.button === 1) this.onResetRotation?.()
     if (e.button === 2) this.placing = true
   }
 
@@ -119,6 +124,11 @@ export class Controls {
 
     if (e.code === 'KeyB') {
       this.onCycleTool?.()
+      return
+    }
+
+    if (e.code === 'KeyR') {
+      this.onCyclePiece?.()
       return
     }
 

@@ -206,7 +206,7 @@ describe('MOB の障害物回避', () => {
     const trunks = new Float32Array([0, 0, 0, 0.4, 4])
     m.obstacles = {
       trunksNear: () => trunks,
-      boxesNear: (_x, _z, _r, out) => {
+      boxesNear: (_x, _y, _z, _r, out) => {
         out.length = 0
         return out
       },
@@ -228,7 +228,7 @@ describe('MOB の障害物回避', () => {
     const box = { minX: -1, maxX: 1, minZ: -6, maxZ: 6, minY: 0, maxY: 3 }
     m.obstacles = {
       trunksNear: () => new Float32Array(0),
-      boxesNear: (_x, _z, _r, out) => {
+      boxesNear: (_x, _y, _z, _r, out) => {
         out.length = 0
         out.push(box)
         return out
