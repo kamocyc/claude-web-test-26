@@ -1,7 +1,8 @@
 import * as THREE from 'three'
 import { SEA_LEVEL, WALKABLE_NY } from '../world/constants'
 import type { FieldSample, World } from '../world/World'
-import type { Box } from '../world/village'
+import { deltaToWorld, worldToLocal } from '../world/collision'
+import type { Collider } from '../world/collision'
 import type { ItemId } from '../items/items'
 import { MOB_DEFS, type MobDef, type MobKind, type MobModel, buildMobModel } from './mobs'
 
@@ -29,11 +30,11 @@ export interface Obstacles {
   /** 縦円柱（x, y, z, 半径, 高さ）を 5 要素ずつ並べた配列。 */
   trunksNear(x: number, y: number, z: number, r: number): Float32Array
   /** 軸平行ボックスの当たり判定。y は「どの高さの帯を見ればよいか」の目安に使う。 */
-  boxesNear(x: number, y: number, z: number, r: number, out: Box[]): Box[]
+  boxesNear(x: number, y: number, z: number, r: number, out: Collider[]): Collider[]
 }
 
 const NO_TRUNKS = new Float32Array(0)
-const NO_BOXES: Box[] = []
+const NO_BOXES: Collider[] = []
 
 export interface Mob {
   readonly def: MobDef
@@ -89,7 +90,7 @@ export class MobManager {
   obstacles: Obstacles | null = null
 
   private readonly sample: FieldSample = { d: 0, gx: 0, gy: 0, gz: 0 }
-  private readonly boxScratch: Box[] = []
+  private readonly boxScratch: Collider[] = []
   private spawnTimer = 0
 
   constructor() {
@@ -308,7 +309,7 @@ export class MobManager {
     dt: number,
     world: World,
     trunks: Float32Array,
-    boxes: readonly Box[],
+    boxes: readonly Collider[],
     wishX: number,
     wishZ: number,
   ): number {
@@ -333,7 +334,7 @@ export class MobManager {
     m: Mob,
     world: World,
     trunks: Float32Array,
-    boxes: readonly Box[],
+    boxes: readonly Collider[],
     dx: number,
     dz: number,
   ): boolean {
@@ -365,7 +366,11 @@ export class MobManager {
     }
     for (const b of boxes) {
       if (head <= b.minY || feet >= b.maxY) continue
-      if (ax > b.minX - r && ax < b.maxX + r && az > b.minZ - r && az < b.maxZ + r) return false
+      // 回転した箱は行き先をローカル座標へ移してから判定する
+      worldToLocal(b, ax, az, GO)
+      if (GO[0] > b.minX - r && GO[0] < b.maxX + r && GO[1] > b.minZ - r && GO[1] < b.maxZ + r) {
+        return false
+      }
     }
     return true
   }
@@ -395,33 +400,43 @@ export class MobManager {
     }
   }
 
-  /** 建物の壁から最小移動量で押し出す。屋根には乗らない。 */
-  private resolveBoxes(m: Mob, boxes: readonly Box[]): void {
+  /** 建物の壁や建てたパーツから最小移動量で押し出す。屋根には乗らない。 */
+  private resolveBoxes(m: Mob, boxes: readonly Collider[]): void {
     const r = m.def.radius
     for (const b of boxes) {
+      // 回転した箱は MOB をローカル座標へ移してから同じ式にかける
+      worldToLocal(b, m.pos.x, m.pos.z, PUSH)
+      const px = PUSH[0]
+      const pz = PUSH[1]
       const minX = b.minX - r
       const maxX = b.maxX + r
       const minZ = b.minZ - r
       const maxZ = b.maxZ + r
-      if (m.pos.x <= minX || m.pos.x >= maxX || m.pos.z <= minZ || m.pos.z >= maxZ) continue
+      if (px <= minX || px >= maxX || pz <= minZ || pz >= maxZ) continue
       if (m.pos.y + m.def.height <= b.minY || m.pos.y >= b.maxY) continue
-      const ox1 = m.pos.x - minX
-      const ox2 = maxX - m.pos.x
-      const oz1 = m.pos.z - minZ
-      const oz2 = maxZ - m.pos.z
+      const ox1 = px - minX
+      const ox2 = maxX - px
+      const oz1 = pz - minZ
+      const oz2 = maxZ - pz
       const best = Math.min(ox1, ox2, oz1, oz2)
-      if (best === ox1) {
-        m.pos.x = minX
-        if (m.vel.x > 0) m.vel.x = 0
-      } else if (best === ox2) {
-        m.pos.x = maxX
-        if (m.vel.x < 0) m.vel.x = 0
-      } else if (best === oz1) {
-        m.pos.z = minZ
-        if (m.vel.z > 0) m.vel.z = 0
-      } else {
-        m.pos.z = maxZ
-        if (m.vel.z < 0) m.vel.z = 0
+      let dx = 0
+      let dz = 0
+      if (best === ox1) dx = -ox1
+      else if (best === ox2) dx = ox2
+      else if (best === oz1) dz = -oz1
+      else dz = oz2
+      deltaToWorld(b, dx, dz, PUSH)
+      m.pos.x += PUSH[0]
+      m.pos.z += PUSH[1]
+
+      const len = Math.hypot(PUSH[0], PUSH[1])
+      if (len < 1e-9) continue
+      const nx = PUSH[0] / len
+      const nz = PUSH[1] / len
+      const vn = m.vel.x * nx + m.vel.z * nz
+      if (vn < 0) {
+        m.vel.x -= nx * vn
+        m.vel.z -= nz * vn
       }
     }
   }
@@ -584,3 +599,7 @@ export class MobManager {
     return best
   }
 }
+
+// ローカル座標へ移すときの作業用
+const GO = [0, 0]
+const PUSH = [0, 0]

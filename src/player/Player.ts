@@ -2,7 +2,8 @@ import * as THREE from 'three'
 import type { World, FieldSample } from '../world/World'
 import { SEA_LEVEL, WALKABLE_NY, WORLD_MIN_Y } from '../world/constants'
 import type { Controls } from './Controls'
-import type { Box } from '../world/village'
+import { deltaToWorld, worldToLocal } from '../world/collision'
+import type { Collider } from '../world/collision'
 
 const RADIUS = 0.38
 const HEIGHT = 1.78
@@ -65,8 +66,8 @@ export class Player {
 
   /** 木の幹（x, y, z, 半径, 高さ の 5 要素ずつ）。毎フレーム World から受け取る。 */
   trunks: Float32Array | null = null
-  /** 建物の壁など、軸平行ボックスの衝突体。 */
-  boxes: Box[] = []
+  /** 建物の壁や建てたパーツの衝突体（回転を持てる）。 */
+  boxes: Collider[] = []
 
   private accumulator = 0
   /** 滑っている向き（斜面を下る水平方向）。 */
@@ -239,8 +240,10 @@ export class Player {
     const feet = this.position.y
     for (const b of this.boxes) {
       if (feet < b.maxY - 0.06 || feet > b.maxY + GROUND_PROBE) continue
-      if (this.position.x <= b.minX - RADIUS || this.position.x >= b.maxX + RADIUS) continue
-      if (this.position.z <= b.minZ - RADIUS || this.position.z >= b.maxZ + RADIUS) continue
+      // 回転した箱でも同じ式で扱えるよう、足元をその箱のローカル座標へ移す
+      worldToLocal(b, this.position.x, this.position.z, PROBE)
+      if (PROBE[0] <= b.minX - RADIUS || PROBE[0] >= b.maxX + RADIUS) continue
+      if (PROBE[1] <= b.minZ - RADIUS || PROBE[1] >= b.maxZ + RADIUS) continue
       if (b.maxY > this.boxGroundY) this.boxGroundY = b.maxY
     }
     if (this.boxGroundY === -Infinity) return false
@@ -399,9 +402,11 @@ export class Player {
     if (this.boxes.length === 0) return
     for (const b of this.boxes) {
       // カプセルを AABB に、ボックスを半径分だけ膨らませて判定する。
-      // 押し出すたびに位置が動くので、箱ごとに読み直す
-      const px = this.position.x
-      const pz = this.position.z
+      // 回転した箱はプレイヤーをローカル座標へ移してから同じ式にかける
+      // （回転を持たない箱では変換が恒等になるので、村の壁の挙動は変わらない）。
+      worldToLocal(b, this.position.x, this.position.z, LOCAL)
+      const px = LOCAL[0]
+      const pz = LOCAL[1]
       const minX = b.minX - RADIUS
       const maxX = b.maxX + RADIUS
       const minZ = b.minZ - RADIUS
@@ -413,7 +418,7 @@ export class Player {
 
       // 段差に乗る（屋根や台の上、階段の 1 段）
       const oy = b.maxY - feet
-      if (oy > 0 && oy <= BOX_STEP && this.velocity.y <= 0 && this.boxFreeAbove(px, b.maxY, pz)) {
+      if (oy > 0 && oy <= BOX_STEP && this.velocity.y <= 0 && this.boxFreeAbove(b.maxY)) {
         this.position.y = b.maxY
         if (this.velocity.y < 0) this.velocity.y = 0
         this.onGround = true
@@ -421,33 +426,41 @@ export class Player {
         continue
       }
 
+      // 最小移動量の向きをローカルで決め、その移動量だけワールドへ回して押し出す
       const ox1 = px - minX
       const ox2 = maxX - px
       const oz1 = pz - minZ
       const oz2 = maxZ - pz
       const best = Math.min(ox1, ox2, oz1, oz2)
-      if (best === ox1) {
-        this.position.x = minX
-        if (this.velocity.x > 0) this.velocity.x = 0
-      } else if (best === ox2) {
-        this.position.x = maxX
-        if (this.velocity.x < 0) this.velocity.x = 0
-      } else if (best === oz1) {
-        this.position.z = minZ
-        if (this.velocity.z > 0) this.velocity.z = 0
-      } else {
-        this.position.z = maxZ
-        if (this.velocity.z < 0) this.velocity.z = 0
+      let dx = 0
+      let dz = 0
+      if (best === ox1) dx = -ox1
+      else if (best === ox2) dx = ox2
+      else if (best === oz1) dz = -oz1
+      else dz = oz2
+      deltaToWorld(b, dx, dz, LOCAL)
+      this.position.x += LOCAL[0]
+      this.position.z += LOCAL[1]
+
+      const len = Math.hypot(LOCAL[0], LOCAL[1])
+      if (len < 1e-9) continue
+      const nx = LOCAL[0] / len
+      const nz = LOCAL[1] / len
+      const vn = this.velocity.x * nx + this.velocity.z * nz
+      if (vn < 0) {
+        this.velocity.x -= nx * vn
+        this.velocity.z -= nz * vn
       }
     }
   }
 
   /** 足元 `feet` に立ったとき、他の箱に頭や体がぶつからないか。 */
-  private boxFreeAbove(x: number, feet: number, z: number): boolean {
+  private boxFreeAbove(feet: number): boolean {
     for (const b of this.boxes) {
       if (b.maxY <= feet + 1e-3) continue
-      if (x <= b.minX - RADIUS || x >= b.maxX + RADIUS) continue
-      if (z <= b.minZ - RADIUS || z >= b.maxZ + RADIUS) continue
+      worldToLocal(b, this.position.x, this.position.z, FREE)
+      if (FREE[0] <= b.minX - RADIUS || FREE[0] >= b.maxX + RADIUS) continue
+      if (FREE[1] <= b.minZ - RADIUS || FREE[1] >= b.maxZ + RADIUS) continue
       if (feet + HEIGHT > b.minY && feet < b.maxY) return false
     }
     return true
@@ -477,6 +490,11 @@ export class Player {
 }
 
 export const PLAYER_EYE = EYE
+
+// ローカル座標へ移すときの作業用（呼び出しの入れ子ごとに別のものを使う）
+const LOCAL = [0, 0]
+const PROBE = [0, 0]
+const FREE = [0, 0]
 
 /** 上から降りてきて最初に固体になる高さ。見つからなければ null。 */
 function surfaceY(world: World, x: number, z: number): number | null {

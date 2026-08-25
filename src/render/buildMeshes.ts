@@ -62,6 +62,16 @@ export function ghostMaterial(ok: boolean): THREE.Material {
   return ok ? GHOST_OK : GHOST_NG
 }
 
+/** 吸着した接続点の印。 */
+export const snapMarkerMaterial = new THREE.MeshBasicMaterial({
+  color: 0xffd479,
+  transparent: true,
+  opacity: 0.85,
+  depthWrite: false,
+  depthTest: false,
+  fog: false,
+})
+
 const GHOST_OK = new THREE.MeshBasicMaterial({
   color: 0x7fe08a,
   transparent: true,

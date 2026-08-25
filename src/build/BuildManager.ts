@@ -1,10 +1,10 @@
 import * as THREE from 'three'
-import { BuildGrid, createPieceHit, snapPiece } from './BuildGrid'
-import type { PieceHit, PlaceCheck, SolidFn } from './BuildGrid'
-import { PIECE_COST, pieceAnchor, pieceBoxes, pieceYaw } from './pieces'
+import { BuildGrid, createPieceHit } from './BuildGrid'
+import type { PieceHit, PlaceCheck, SnapResult, SolidFn } from './BuildGrid'
+import { PIECE_COST, pieceColliders, yawRad } from './pieces'
 import type { Piece, PieceKind } from './pieces'
-import { ghostMaterial, pieceGeometry, pieceMaterials } from '../render/buildMeshes'
-import type { Box } from '../world/village'
+import { ghostMaterial, pieceGeometry, pieceMaterials, snapMarkerMaterial } from '../render/buildMeshes'
+import type { Collider } from '../world/collision'
 
 interface InstanceGroup {
   kind: PieceKind
@@ -27,9 +27,11 @@ export class BuildManager {
 
   private readonly groups = new Map<string, InstanceGroup>()
   private readonly ghost: THREE.Mesh
+  /** どの接続点に噛んだかを見せる印。これが無いと吸着先が読めない。 */
+  private readonly marker: THREE.Mesh
   private readonly dummy = new THREE.Object3D()
   private readonly hit = createPieceHit()
-  private readonly boxScratch: Box[] = []
+  private readonly boxScratch: Collider[] = []
   private colliders = 0
 
   constructor(scene: THREE.Scene) {
@@ -39,6 +41,9 @@ export class BuildManager {
     this.ghost.visible = false
     this.ghost.matrixAutoUpdate = true
     scene.add(this.ghost)
+    this.marker = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), snapMarkerMaterial)
+    this.marker.visible = false
+    scene.add(this.marker)
   }
 
   get count(): number {
@@ -61,7 +66,7 @@ export class BuildManager {
 
   place(p: Piece): boolean {
     if (!this.grid.place(p)) return false
-    this.colliders += pieceBoxes(p, this.boxScratch).length
+    this.colliders += pieceColliders(p, this.boxScratch).length
     const g = this.groupOf(p.kind, p.mat)
     g.pieces.push(p)
     g.dirty = true
@@ -71,7 +76,7 @@ export class BuildManager {
   remove(p: Piece): Piece | null {
     const gone = this.grid.remove(p)
     if (!gone) return null
-    this.colliders -= pieceBoxes(gone, this.boxScratch).length
+    this.colliders -= pieceColliders(gone, this.boxScratch).length
     const g = this.groupOf(gone.kind, gone.mat)
     const i = g.pieces.indexOf(gone)
     if (i >= 0) g.pieces.splice(i, 1)
@@ -91,8 +96,28 @@ export class BuildManager {
 
   // ------------------------------------------------------------------ 参照
 
-  collectColliders(x: number, z: number, r: number, out: Box[], y0?: number, y1?: number): Box[] {
+  collectColliders(
+    x: number,
+    z: number,
+    r: number,
+    out: Collider[],
+    y0?: number,
+    y1?: number,
+  ): Collider[] {
     return this.grid.collectColliders(x, z, r, out, y0, y1)
+  }
+
+  /** 照準の点から置くパーツの姿勢を決める。 */
+  snap(
+    kind: PieceKind,
+    mat: number,
+    yawOffset: number,
+    px: number,
+    py: number,
+    pz: number,
+    camYaw: number,
+  ): SnapResult {
+    return this.grid.snap(kind, mat, yawOffset, px, py, pz, camYaw)
   }
 
   raycast(
@@ -156,18 +181,20 @@ export class BuildManager {
     }
   }
 
-  /** 設置予定の半透明表示。`p` が null なら隠す。 */
-  setGhost(p: Piece | null, ok: boolean): void {
+  /** 設置予定の半透明表示と、吸着した接続点の印。`p` が null なら隠す。 */
+  setGhost(p: Piece | null, ok: boolean, snapPoint: readonly number[] | null = null): void {
     if (!p) {
       this.ghost.visible = false
+      this.marker.visible = false
       return
     }
     this.ghost.visible = true
     this.ghost.geometry = pieceGeometry(p.kind)
     this.ghost.material = ghostMaterial(ok)
-    const a = pieceAnchor(p)
-    this.ghost.position.set(a[0], a[1], a[2])
-    this.ghost.rotation.set(0, pieceYaw(p), 0)
+    this.ghost.position.set(p.x, p.y, p.z)
+    this.ghost.rotation.set(0, yawRad(p.yaw), 0)
+    this.marker.visible = snapPoint !== null
+    if (snapPoint) this.marker.position.set(snapPoint[0], snapPoint[1], snapPoint[2])
   }
 
   // -------------------------------------------------------------------- 保存
@@ -176,16 +203,25 @@ export class BuildManager {
     return this.grid.serialize()
   }
 
+  /** 旧形式（格子）の保存データを読む。 */
+  loadLegacy(data: unknown, cell: number): void {
+    this.rebuildFrom(() => this.grid.loadLegacy(data, cell))
+  }
+
   load(data: unknown): void {
+    this.rebuildFrom(() => this.grid.load(data))
+  }
+
+  private rebuildFrom(fill: () => void): void {
     this.grid.clear()
     for (const g of this.groups.values()) {
       g.pieces.length = 0
       g.dirty = true
     }
-    this.grid.load(data)
+    fill()
     this.colliders = 0
     for (const p of this.grid.pieces()) {
-      this.colliders += pieceBoxes(p, this.boxScratch).length
+      this.colliders += pieceColliders(p, this.boxScratch).length
       const g = this.groupOf(p.kind, p.mat)
       g.pieces.push(p)
       g.dirty = true
@@ -194,9 +230,8 @@ export class BuildManager {
   }
 
   private applyTransform(p: Piece): void {
-    const a = pieceAnchor(p)
-    this.dummy.position.set(a[0], a[1], a[2])
-    this.dummy.rotation.set(0, pieceYaw(p), 0)
+    this.dummy.position.set(p.x, p.y, p.z)
+    this.dummy.rotation.set(0, yawRad(p.yaw), 0)
     this.dummy.scale.setScalar(1)
     this.dummy.updateMatrix()
   }
@@ -212,5 +247,4 @@ export class BuildManager {
   }
 }
 
-export { snapPiece }
-export type { Piece, PieceKind, PieceHit, PlaceCheck, SolidFn }
+export type { Piece, PieceKind, PieceHit, PlaceCheck, SnapResult, SolidFn }

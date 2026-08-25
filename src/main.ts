@@ -29,9 +29,16 @@ import { ITEM_BY_MATERIAL, RECIPES, TRADES, item, tryItem } from './items/items'
 import { MobManager } from './mobs/MobManager'
 import { TorchManager } from './world/TorchManager'
 import { BuildManager } from './build/BuildManager'
-import { snapPiece } from './build/BuildGrid'
-import type { PlaceCheck } from './build/BuildGrid'
-import { PIECE_COST, PIECE_KINDS, PIECE_NAME, slotKey } from './build/pieces'
+import type { PlaceCheck, SnapResult } from './build/BuildGrid'
+import {
+  BUILD_CELL,
+  PIECE_COST,
+  PIECE_KINDS,
+  PIECE_NAME,
+  YAW_STEP,
+  normalizeYaw,
+  yawDeg,
+} from './build/pieces'
 import type { PieceKind } from './build/pieces'
 
 const VIEW_DISTANCE = 7
@@ -166,7 +173,9 @@ async function boot(): Promise<void> {
 
   // 建てた壁や床。地形の密度場とは別レイヤに持ち、当たり判定だけ村の建物と同じ土俵に合流する
   const build = new BuildManager(scene)
-  if (meta?.pieces) build.load(meta.pieces)
+  // pieces2 が新形式。格子だった頃の pieces しか無いワールドは移して読む
+  if (meta?.pieces2) build.load(meta.pieces2)
+  else if (meta?.pieces) build.loadLegacy(meta.pieces, BUILD_CELL)
 
   let health = typeof meta?.health === 'number' ? meta.health : MAX_HEALTH
   let sinceHurt = REGEN_DELAY
@@ -236,7 +245,8 @@ async function boot(): Promise<void> {
     const hand = held ? `　［${held.name}］` : '　［素手］'
     if (t.id === 'build') {
       const k = PIECE_KINDS[pieceIndex]
-      return `${t.name} ${PIECE_NAME[k]}（${PIECE_COST[k]}）${hand}　R:種類　ホイール:向き`
+      const turn = buildYawOffset === 0 ? '' : ` ${yawDeg(buildYawOffset)}°`
+      return `${t.name} ${PIECE_NAME[k]}（${PIECE_COST[k]}）${hand}${turn}　R:種類　ホイール:5°`
     }
     if (t.id === 'box') {
       const n = boxEdge(brushRadius)
@@ -247,9 +257,9 @@ async function boot(): Promise<void> {
 
   let brushRadius = 2.5
   let tool = 0
-  /** 建築モードで選んでいるパーツと向き。 */
+  /** 建築モードで選んでいるパーツと、向きのオフセット（5° 刻みの 0..71）。 */
   let pieceIndex = 0
-  let buildRot = 0
+  let buildYawOffset = 0
   let statsVisible = true
   let started = false
   let editCooldown = 0
@@ -280,6 +290,13 @@ async function boot(): Promise<void> {
     tool = (tool + 1) % TOOLS.length
     hud.showToast(`ブラシ: ${TOOLS[tool].name}`)
     hud.setBrush(brushLabel())
+  }
+  controls.onResetRotation = () => {
+    if (TOOLS[tool].id !== 'build' || buildYawOffset === 0) return
+    buildYawOffset = 0
+    invalidateBuild()
+    hud.setBrush(brushLabel())
+    hud.showToast('向きを既定に戻しました')
   }
   controls.onCyclePiece = () => {
     if (TOOLS[tool].id !== 'build') {
@@ -353,7 +370,7 @@ async function boot(): Promise<void> {
       flying: player.flying,
       inventory: inventory.toJSON(),
       torches: [...torches.torches],
-      pieces: build.serialize(),
+      pieces2: build.serialize(),
       health,
       chopped: world.choppedList,
     }
@@ -555,31 +572,65 @@ async function boot(): Promise<void> {
       hud.setBrush(brushLabel())
       return true
     },
-    /** 建築パーツの向き 0..3（テスト用）。 */
-    setBuildRot(r: number) {
-      buildRot = ((Math.round(r) % 4) + 4) % 4
-      invalidateBuildCheck()
+    /** 建築の向きのオフセットを度で与える（テスト用。5° に丸められる）。 */
+    setBuildYaw(deg: number) {
+      buildYawOffset = normalizeYaw(deg / 5)
+      invalidateBuild()
+      hud.setBrush(brushLabel())
     },
     /**
-     * 指定座標のスロットへ直接建てる（照準を通さないテスト用）。
-     * 材料も支持も本番と同じ規則で見るので、返り値がそのまま理由になる。
+     * 基準点と向きを直接指定して建てる（照準も吸着も通さないテスト用）。
+     * 材料も支持も重なりも本番と同じ規則で見るので、返り値がそのまま理由になる。
+     * `deg` は Y 軸まわりの角度（5° に丸められる）。
      */
-    buildAt(name: string, x: number, y: number, z: number, itemId = 'plank', rot = 0): string {
-      const i = PIECE_KINDS.indexOf(name as PieceKind)
-      if (i < 0) return 'unknown'
-      const kind = PIECE_KINDS[i]
+    buildAt(name: string, x: number, y: number, z: number, itemId = 'plank', deg = 0): string {
+      const kind = pieceKind(name)
+      if (!kind) return 'unknown'
       const def = tryItem(itemId)
       if (!def?.build || def.material === undefined) return 'material'
       const cost = PIECE_COST[kind]
       if (inventory.count(def.id) < cost) return 'short'
-      const p = snapPiece(kind, x, y, z, 0, 0, 0, rot, def.material)
+      const p = { kind, x, y, z, yaw: normalizeYaw(deg / 5), mat: def.material }
       const check = build.canPlace(p, isSolidAt)
       if (check !== 'ok') return check
       build.place(p)
       inventory.take(def.id, cost)
-      invalidateBuildCheck()
+      invalidateBuild()
       markMetaDirty()
       return 'ok'
+    },
+    /**
+     * 照準の当たった点を渡して、**本番とまったく同じ吸着経路で**建てる（テスト用）。
+     * 既存パーツの接続点に噛めばその向きを継承する。
+     */
+    buildAim(
+      name: string,
+      x: number,
+      y: number,
+      z: number,
+      itemId = 'plank',
+      offsetDeg = 0,
+    ): string {
+      const kind = pieceKind(name)
+      if (!kind) return 'unknown'
+      const def = tryItem(itemId)
+      if (!def?.build || def.material === undefined) return 'material'
+      const cost = PIECE_COST[kind]
+      if (inventory.count(def.id) < cost) return 'short'
+      const snap = build.snap(kind, def.material, normalizeYaw(offsetDeg / 5), x, y, z, controls.yaw)
+      const check = build.canPlace(snap.piece, isSolidAt)
+      if (check !== 'ok') return check
+      build.place(snap.piece)
+      inventory.take(def.id, cost)
+      invalidateBuild()
+      markMetaDirty()
+      return 'ok'
+    },
+    /** 指定座標にいちばん近いパーツの中身（テスト用）。 */
+    pieceInfoAt(x: number, y: number, z: number, range = 4) {
+      const p = build.nearest(x, y, z, range)
+      if (!p) return null
+      return { kind: p.kind as string, x: p.x, y: p.y, z: p.z, deg: yawDeg(p.yaw), mat: p.mat }
     },
     /** 指定座標にいちばん近いパーツを壊す（テスト用）。材料は戻る。 */
     removePieceAt(x: number, y: number, z: number, range = 3): boolean {
@@ -588,7 +639,7 @@ async function boot(): Promise<void> {
       if (!gone) return false
       const def = ITEM_BY_MATERIAL.get(gone.mat)
       if (def) inventory.add(def.id, PIECE_COST[gone.kind])
-      invalidateBuildCheck()
+      invalidateBuild()
       markMetaDirty()
       return true
     },
@@ -773,32 +824,40 @@ async function boot(): Promise<void> {
 
   const isSolidAt = (x: number, y: number, z: number): boolean => world.isSolid(x, y, z)
 
+  function pieceKind(name: string): PieceKind | null {
+    const i = PIECE_KINDS.indexOf(name as PieceKind)
+    return i < 0 ? null : PIECE_KINDS[i]
+  }
+
   /**
-   * 置ける／置けないの判定は地形のサンプルが要るので、
-   * 照準のスロットが変わったときだけ調べ直す（ゴーストは毎フレーム出る）。
+   * 吸着の計算（近傍の接続点集めと重なり判定）は毎フレーム回すには重いので、
+   * **照準点が 5 cm 以上動くか、種類・向き・素材が変わったときだけ**やり直す。
    */
-  let buildCheckKey = ''
+  let buildKey = ''
+  let buildSnap: SnapResult | null = null
   let buildCheck: PlaceCheck = 'ok'
 
-  function invalidateBuildCheck(): void {
-    buildCheckKey = ''
+  function invalidateBuild(): void {
+    buildKey = ''
   }
 
   /**
    * 建築モードの 1 フレーム。
    *
-   * 照準の当たった点をグリッドのスロットへ吸着させてゴーストを出し、
+   * 照準の当たった点を既存パーツの接続点へ吸着させてゴーストを出し、
    * 右クリックで置き、左クリックで壊す（建築モード中は地形を掘らない）。
    */
   function updateBuildMode(): void {
     const kind = PIECE_KINDS[pieceIndex]
     const held = inventory.held()
 
-    // 建築モードではホイールは大きさではなく向きを変える
+    // 建築モードではホイールは大きさではなく向き。Shift で 45° ずつ回る
     if (controls.wheel !== 0) {
-      buildRot = (buildRot + (controls.wheel > 0 ? 1 : 3)) & 3
+      const fast = controls.keys.has('ShiftLeft') || controls.keys.has('ShiftRight')
+      const step = fast ? 9 : 1
+      buildYawOffset = normalizeYaw(buildYawOffset + (controls.wheel > 0 ? step : -step))
       controls.wheel = 0
-      invalidateBuildCheck()
+      invalidateBuild()
     }
 
     // 照準は「建てたパーツ」と「地形」の手前の方
@@ -810,45 +869,42 @@ async function boot(): Promise<void> {
     let px: number
     let py: number
     let pz: number
-    let nx: number
-    let ny: number
-    let nz: number
     if (onPiece && pieceHit) {
       px = eye.x + lookDir.x * pieceHit.distance
       py = eye.y + lookDir.y * pieceHit.distance
       pz = eye.z + lookDir.z * pieceHit.distance
-      nx = pieceHit.nx
-      ny = pieceHit.ny
-      nz = pieceHit.nz
     } else if (terrain) {
       px = terrain.point.x
       py = terrain.point.y
       pz = terrain.point.z
-      nx = terrain.normal.x
-      ny = terrain.normal.y
-      nz = terrain.normal.z
     } else {
       // 何にも当たらなければ目の前。支えが無いので普通はそのままでは置けない
       px = eye.x + lookDir.x * 4
       py = eye.y + lookDir.y * 4
       pz = eye.z + lookDir.z * 4
-      nx = -lookDir.x
-      ny = -lookDir.y
-      nz = -lookDir.z
     }
 
     const buildable = held?.build === true && held.material !== undefined
     const mat = buildable ? (held.material as number) : MAT_PLANK
-    const candidate = snapPiece(kind, px, py, pz, nx, ny, nz, buildRot, mat)
     const cost = PIECE_COST[kind]
     const enough = buildable && held !== null && inventory.count(held.id) >= cost
 
-    const key = `${kind}|${buildRot}|${slotKey(candidate)}`
-    if (key !== buildCheckKey) {
-      buildCheckKey = key
-      buildCheck = build.canPlace(candidate, isSolidAt)
+    const key = [
+      kind,
+      buildYawOffset,
+      mat,
+      Math.round(px * 20),
+      Math.round(py * 20),
+      Math.round(pz * 20),
+      Math.round(controls.yaw / YAW_STEP),
+    ].join('|')
+    if (key !== buildKey || !buildSnap) {
+      buildKey = key
+      buildSnap = build.snap(kind, mat, buildYawOffset, px, py, pz, controls.yaw)
+      buildCheck = build.canPlace(buildSnap.piece, isSolidAt)
     }
-    build.setGhost(candidate, buildCheck === 'ok' && enough)
+    const candidate = buildSnap.piece
+    build.setGhost(candidate, buildCheck === 'ok' && enough, buildSnap.point)
     hud.setBrush(brushLabel())
 
     if (editCooldown > 0) return
@@ -860,7 +916,7 @@ async function boot(): Promise<void> {
         const def = ITEM_BY_MATERIAL.get(gone.mat)
         if (def) inventory.add(def.id, PIECE_COST[gone.kind])
         hud.showToast(`${PIECE_NAME[gone.kind]}を回収した`)
-        invalidateBuildCheck()
+        invalidateBuild()
         markMetaDirty()
       } else {
         hud.showToast('壊すパーツに照準を合わせてください')
@@ -881,8 +937,8 @@ async function boot(): Promise<void> {
       editCooldown = 0.5
       return
     }
-    if (buildCheck === 'occupied') {
-      hud.showToast('そこにはもう置かれています')
+    if (buildCheck === 'overlap') {
+      hud.showToast('そこには他のパーツと重なってしまいます')
       editCooldown = DEMOLISH_INTERVAL
       return
     }
@@ -893,7 +949,7 @@ async function boot(): Promise<void> {
     }
     if (build.place(candidate)) {
       inventory.take(held.id, cost)
-      invalidateBuildCheck()
+      invalidateBuild()
       markMetaDirty()
     }
     editCooldown = BUILD_INTERVAL

@@ -52,15 +52,32 @@ export interface SmoothDebug {
   hurt(amount: number): void
   torchCount(): number
   setPiece(name: string): boolean
-  setBuildRot(rot: number): void
+  /** 建築の向きのオフセット（度、5° に丸められる）。 */
+  setBuildYaw(deg: number): void
+  /** 基準点と向きを直接指定して建てる。 */
   buildAt(
     kind: string,
     x: number,
     y: number,
     z: number,
     itemId?: string,
-    rot?: number,
+    deg?: number,
   ): string
+  /** 照準の点を渡して、本番と同じ吸着経路で建てる。 */
+  buildAim(
+    kind: string,
+    x: number,
+    y: number,
+    z: number,
+    itemId?: string,
+    offsetDeg?: number,
+  ): string
+  pieceInfoAt(
+    x: number,
+    y: number,
+    z: number,
+    range?: number,
+  ): { kind: string; x: number; y: number; z: number; deg: number; mat: number } | null
   removePieceAt(x: number, y: number, z: number, range?: number): boolean
   pieceCount(): number
   buildColliders(): number

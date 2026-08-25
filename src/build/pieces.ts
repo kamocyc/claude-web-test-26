@@ -1,9 +1,11 @@
 import type { Box } from '../world/village'
+import { colliderBounds, localToWorld } from '../world/collision'
+import type { Collider } from '../world/collision'
 
 /**
- * 建築グリッドの 1 マス（m）。
- * 壁 1 枚の幅・床から天井までの階高がこれになる。`VOXEL_SIZE = 1` の整数倍なので、
- * 地形を直方体ブラシで削った面とも桁が合う。
+ * 建築パーツの基準寸法（m）。
+ * 壁 1 枚の幅・床から天井までの階高がこれになる。
+ * 格子ではなく**パーツの大きさ**として使う（位置は連続値）。
  */
 export const BUILD_CELL = 3
 
@@ -25,6 +27,12 @@ export const DOOR_H = 2.2
 
 /** 窓のガラス面の半サイズ（m）。 */
 export const WINDOW_HALF = 0.8
+
+/** ヨーの刻み数。360° / 72 = 5°。 */
+export const YAW_STEPS = 72
+
+/** ヨー 1 刻みのラジアン。 */
+export const YAW_STEP = (Math.PI * 2) / YAW_STEPS
 
 export const PIECE_KINDS = ['wall', 'window', 'door', 'floor', 'stair', 'roof', 'block'] as const
 
@@ -57,107 +65,47 @@ export const PIECE_COST: Record<PieceKind, number> = {
 /**
  * 置いた建築パーツ 1 枚。
  *
- * セル座標は整数で、セル (cx, cy, cz) はワールドの
- * `[cx*CELL, cx*CELL+CELL] × …` を占める。
- * `rot` は Y 軸まわりの 90 度刻み。壁族は面の軸（0 = セルの -x 面 / 1 = -z 面）にだけ使い、
- * 床とブロックは無視、階段と屋根は昇る向きに使う。
+ * 格子には乗らず、**基準点は連続座標**で持つ。基準点はパーツの局所座標の原点で、
+ * 描画のジオメトリのアンカーと当たり判定の原点を兼ねる（壁は面の中心、
+ * 床・階段・屋根・ブロックは底面の中心）。
+ *
+ * `yaw` は Y 軸まわりの回転を **5° 刻みの整数 0..71** で持つ。度やラジアンではなく
+ * 整数にしてあるので、保存が正確で、「同じ向きか」を誤差なしで比べられる。
+ * これが接続点スナップで隣り合うパーツがぴたりと噛み合うことの根拠になる。
  */
 export interface Piece {
   kind: PieceKind
-  cx: number
-  cy: number
-  cz: number
-  rot: number
+  x: number
+  y: number
+  z: number
+  yaw: number
   /** 素材 ID（`MAT_PLANK` など）。地形の素材 ID をそのまま使う。 */
   mat: number
 }
 
-/** 壁・窓・戸口はセルの面に立つ「板」で、同じスロットを取り合う。 */
+/** 壁・窓・戸口は面に立つ「板」。 */
 export function isPanel(kind: PieceKind): boolean {
   return kind === 'wall' || kind === 'window' || kind === 'door'
 }
 
-/** 階段・屋根・ブロックはセルの体積を取り合う。 */
-export function isVolume(kind: PieceKind): boolean {
-  return kind === 'stair' || kind === 'roof' || kind === 'block'
+/** 0..71 に丸める。 */
+export function normalizeYaw(yaw: number): number {
+  return ((Math.round(yaw) % YAW_STEPS) + YAW_STEPS) % YAW_STEPS
 }
 
-/**
- * 占有スロットのキー。
- *
- * 壁は「セルの -x 面 / -z 面」に正規化してあるので、
- * 隣のセルから見た同じ面が別スロットになることはなく、二重置きが起きない。
- */
-export function slotKey(p: Piece): string {
-  const slot = isPanel(p.kind) ? (p.rot & 1 ? 'wz' : 'wx') : p.kind === 'floor' ? 'f' : 'v'
-  return `${slot}|${p.cx},${p.cy},${p.cz}`
+/** ヨー（0..71）→ ラジアン。 */
+export function yawRad(yaw: number): number {
+  return yaw * YAW_STEP
 }
 
-/** 有効な `rot`（壁族は軸の 2 通り、床とブロックは 0 固定、階段と屋根は 4 通り）。 */
-export function normalizeRot(kind: PieceKind, rot: number): number {
-  const r = ((rot % 4) + 4) % 4
-  if (isPanel(kind)) return r & 1
-  if (kind === 'floor' || kind === 'block') return 0
-  return r
+/** ラジアン → 最寄りのヨー（0..71）。 */
+export function yawFromRad(rad: number): number {
+  return normalizeYaw(rad / YAW_STEP)
 }
 
-/**
- * パーツの基準点（ワールド座標）。ここを原点として局所座標が定義され、
- * 描画のインスタンス行列も当たり判定もこの点と {@link pieceYaw} から作る。
- */
-export function pieceAnchor(p: Piece, out: number[] = []): number[] {
-  const C = BUILD_CELL
-  if (isPanel(p.kind)) {
-    // 板は面の中心に立つ。rot=0 は -x 面、rot=1 は -z 面
-    if ((p.rot & 1) === 0) {
-      out[0] = p.cx * C
-      out[1] = p.cy * C + C / 2
-      out[2] = p.cz * C + C / 2
-    } else {
-      out[0] = p.cx * C + C / 2
-      out[1] = p.cy * C + C / 2
-      out[2] = p.cz * C
-    }
-    return out
-  }
-  // 床・階段・屋根・ブロックはセル底面の中心
-  out[0] = p.cx * C + C / 2
-  out[1] = p.cy * C
-  out[2] = p.cz * C + C / 2
-  return out
-}
-
-/** 基準点まわりの Y 回転（ラジアン）。 */
-export function pieceYaw(p: Piece): number {
-  if (isPanel(p.kind)) return (p.rot & 1) * (Math.PI / 2)
-  if (p.kind === 'stair' || p.kind === 'roof') return normalizeRot(p.kind, p.rot) * (Math.PI / 2)
-  return 0
-}
-
-/**
- * ヨー θ = rot × 90°の回転。three の Y 回転に合わせて
- * `x' = x cosθ + z sinθ`, `z' = -x sinθ + z cosθ`。
- * 90 度刻みなので軸平行のまま、当たり判定の AABB が丸まらない。
- */
-export function rotXZ(x: number, z: number, rot: number, out: number[] = []): number[] {
-  switch (((rot % 4) + 4) % 4) {
-    case 1:
-      out[0] = z
-      out[1] = -x
-      break
-    case 2:
-      out[0] = -x
-      out[1] = -z
-      break
-    case 3:
-      out[0] = -z
-      out[1] = x
-      break
-    default:
-      out[0] = x
-      out[1] = z
-  }
-  return out
+/** 表示用の度数（0..355）。 */
+export function yawDeg(yaw: number): number {
+  return normalizeYaw(yaw) * 5
 }
 
 /**
@@ -229,31 +177,9 @@ export function localBoxes(kind: PieceKind): Box[] {
   }
 }
 
-/** ワールド座標での当たり判定。`out` に詰めて返す。 */
-export function pieceBoxes(p: Piece, out: Box[] = []): Box[] {
-  out.length = 0
-  const anchor = pieceAnchor(p)
-  const yaw = isPanel(p.kind) ? 0 : normalizeRot(p.kind, p.rot)
-  const a = [0, 0]
-  const b = [0, 0]
-  for (const box of localBoxes(p.kind)) {
-    rotXZ(box.minX, box.minZ, yaw, a)
-    rotXZ(box.maxX, box.maxZ, yaw, b)
-    out.push({
-      minX: anchor[0] + Math.min(a[0], b[0]),
-      minY: anchor[1] + box.minY,
-      minZ: anchor[2] + Math.min(a[1], b[1]),
-      maxX: anchor[0] + Math.max(a[0], b[0]),
-      maxY: anchor[1] + box.maxY,
-      maxZ: anchor[2] + Math.max(a[1], b[1]),
-    })
-  }
-  return out
-}
-
-/** パーツ全体を包む AABB。 */
-export function pieceBounds(p: Piece): Box {
-  const boxes = pieceBoxes(p)
+/** 局所座標での外接箱。 */
+export function localBounds(kind: PieceKind): Box {
+  const boxes = localBoxes(kind)
   const out = { ...boxes[0] }
   for (const b of boxes) {
     if (b.minX < out.minX) out.minX = b.minX
@@ -266,7 +192,121 @@ export function pieceBounds(p: Piece): Box {
   return out
 }
 
-/** ワールド座標 → セル座標。 */
-export function cellOf(v: number): number {
-  return Math.floor(v / BUILD_CELL)
+/**
+ * ワールドでの当たり判定。x/z はローカルのまま、回転の中心と cos/sin を添えて返す
+ * （{@link Collider} を参照）。`out` に詰めて返す。
+ */
+export function pieceColliders(p: Piece, out: Collider[] = []): Collider[] {
+  out.length = 0
+  const rad = yawRad(p.yaw)
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  for (const b of localBoxes(p.kind)) {
+    out.push({
+      minX: b.minX,
+      minY: p.y + b.minY,
+      minZ: b.minZ,
+      maxX: b.maxX,
+      maxY: p.y + b.maxY,
+      maxZ: b.maxZ,
+      ox: p.x,
+      oz: p.z,
+      cos,
+      sin,
+    })
+  }
+  return out
 }
+
+/** 回転を含めたワールドの外接箱。空間索引と粗い足切りに使う。 */
+export function pieceBounds(p: Piece, out: Box = EMPTY_BOX()): Box {
+  const local = localBounds(p.kind)
+  const rad = yawRad(p.yaw)
+  return colliderBounds(
+    {
+      minX: local.minX,
+      minY: p.y + local.minY,
+      minZ: local.minZ,
+      maxX: local.maxX,
+      maxY: p.y + local.maxY,
+      maxZ: local.maxZ,
+      ox: p.x,
+      oz: p.z,
+      cos: Math.cos(rad),
+      sin: Math.sin(rad),
+    },
+    out,
+  )
+}
+
+/** パーツの中心（ワールド）。スナップ候補の採点に使う。 */
+export function pieceCenter(p: Piece, out: number[] = []): number[] {
+  const local = localBounds(p.kind)
+  const rad = yawRad(p.yaw)
+  localToWorld(
+    { ...local, ox: p.x, oz: p.z, cos: Math.cos(rad), sin: Math.sin(rad) },
+    (local.minX + local.maxX) / 2,
+    (local.minZ + local.maxZ) / 2,
+    PAIR,
+  )
+  out[0] = PAIR[0]
+  out[1] = p.y + (local.minY + local.maxY) / 2
+  out[2] = PAIR[1]
+  return out
+}
+
+/**
+ * 接続点（局所座標、`[x, y, z, …]` の平坦配列）。
+ *
+ * 置くときは「既存パーツの接続点」と「これから置くパーツの接続点」を一致させるので、
+ * **隣り合うパーツは必ず隙間なく噛み合う**。辺の中点があることで
+ * 「床のこの辺に壁を立てる」が一発で決まる。
+ */
+export function snapPoints(kind: PieceKind): number[] {
+  const C = BUILD_CELL
+  const h = C / 2
+  const T = PANEL_T
+
+  if (isPanel(kind)) {
+    // 面（x = 0）の 4 隅と 4 辺の中点
+    return [
+      0, -h, -h, 0, -h, h, 0, h, -h, 0, h, h,
+      0, -h, 0, 0, h, 0, 0, 0, -h, 0, 0, h,
+    ]
+  }
+
+  switch (kind) {
+    case 'floor':
+      // 上面と下面の 4 隅・4 辺中点。上面の辺中点が「その辺に壁を立てる」に効く
+      return [
+        -h, 0, -h, -h, 0, h, h, 0, -h, h, 0, h,
+        0, 0, -h, 0, 0, h, -h, 0, 0, h, 0, 0,
+        -h, T, -h, -h, T, h, h, T, -h, h, T, h,
+        0, T, -h, 0, T, h, -h, T, 0, h, T, 0,
+      ]
+
+    case 'block':
+      // 8 隅と 6 面の中心
+      return [
+        -h, 0, -h, -h, 0, h, h, 0, -h, h, 0, h,
+        -h, C, -h, -h, C, h, h, C, -h, h, C, h,
+        0, 0, 0, 0, C, 0,
+        -h, h, 0, h, h, 0, 0, h, -h, 0, h, h,
+      ]
+
+    case 'stair':
+      // 昇り口（-x 側）の辺と、昇りきった先（+x 側の上端）の辺
+      return [-h, 0, -h, -h, 0, h, -h, 0, 0, h, 0, -h, h, 0, h, h, C, -h, h, C, h, h, C, 0]
+
+    case 'roof':
+      // 軒（-x 側）と棟（+x 側）
+      return [-h, 0, -h, -h, 0, h, -h, 0, 0, h, C, -h, h, C, h, h, C, 0]
+  }
+  return []
+}
+
+function EMPTY_BOX(): Box {
+  return { minX: 0, minY: 0, minZ: 0, maxX: 0, maxY: 0, maxZ: 0 }
+}
+
+const PAIR = [0, 0]
