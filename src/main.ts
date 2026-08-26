@@ -52,6 +52,9 @@ import {
   segmentEnd,
 } from './track/track'
 import type { Segment, TrackKind } from './track/track'
+import { TrainManager } from './train/TrainManager'
+import { CAR_LEN, STATION_COST, TRAIN_COST } from './train/trains'
+import type { Train } from './train/trains'
 
 const VIEW_DISTANCE = 7
 const REACH = 9
@@ -72,6 +75,7 @@ const TOOLS = [
   { id: 'smooth', name: 'ならし' },
   { id: 'build', name: '建築' },
   { id: 'track', name: '軌道' },
+  { id: 'station', name: '駅・列車' },
 ] as const
 
 /** 建築モードの操作間隔（秒）。 */
@@ -88,6 +92,14 @@ const TRACK_REASON: Record<string, string> = {
   toohigh: '高すぎて橋脚が立てられません',
   kink: '繋ぐ相手との向きが違いすぎます（回り込んでください）',
 }
+
+/** 駅・列車モードで、狙点の近くの駅／列車を拾う距離（m）。 */
+const STATION_PICK = 6
+const TRAIN_PICK = 5
+
+/** 列車に乗り込める距離（m）と、降りたときに脇へよける距離（m）。 */
+const RIDE_RANGE = 4.5
+const RIDE_OFF = 2.6
 
 /** 狙点の近くでレールヘッドを拾う距離（m）。 */
 const RAILHEAD_RANGE = 4
@@ -210,6 +222,11 @@ async function boot(): Promise<void> {
   const tracks = new TrackManager(scene)
   if (meta?.tracks) tracks.load(meta.tracks)
 
+  // 駅と列車。線路の網（経路探索）はここが持ち、線路が変わるたびに組み直す
+  const trains = new TrainManager(scene)
+  trains.rebuildNetwork(tracks.graph.segments())
+  if (meta?.stations || meta?.trainRoutes) trains.load(meta.stations, meta.trainRoutes)
+
   let health = typeof meta?.health === 'number' ? meta.health : MAX_HEALTH
   let sinceHurt = REGEN_DELAY
   hud.setHealth(health, MAX_HEALTH)
@@ -287,6 +304,15 @@ async function boot(): Promise<void> {
       const head = trackPlan?.from ? '' : '　新しい線'
       return `${t.name} ${info.name}${cost}${hand}${head}　R:線路/道路　ホイール:長さ ${segLen} m`
     }
+    if (t.id === 'station') {
+      const picked =
+        routeSel.length === 0
+          ? '　駅に照準を合わせて右クリックで路線に追加'
+          : `　路線: ${routeSel.map((i) => `駅${i + 1}`).join(' → ')}${
+              routeSel.length >= 2 ? `　R:発車（${TRAIN_COST}）` : ''
+            }`
+      return `${t.name}（駅 ${STATION_COST}）${hand}${picked}`
+    }
     if (t.id === 'box') {
       const n = boxEdge(brushRadius)
       return `${t.name} ${n}×${n}×${n} m${hand}${grain}`
@@ -311,6 +337,10 @@ async function boot(): Promise<void> {
    */
   let trackKey = ''
   let trackPlan: TrackPlan | null = null
+  /** 路線を組み立てている最中に選んだ駅（選んだ順）。 */
+  let routeSel: number[] = []
+  /** いま乗っている列車。 */
+  let riding: Train | null = null
 
   function invalidateTrack(): void {
     trackKey = ''
@@ -347,6 +377,13 @@ async function boot(): Promise<void> {
     hud.setBrush(brushLabel())
   }
   controls.onResetRotation = () => {
+    if (TOOLS[tool].id === 'station') {
+      if (routeSel.length === 0) return
+      clearRouteSelection()
+      hud.setBrush(brushLabel())
+      hud.showToast('選んだ路線を取り消しました')
+      return
+    }
     if (TOOLS[tool].id === 'track') {
       if (!railhead) return
       railhead = null
@@ -361,6 +398,11 @@ async function boot(): Promise<void> {
     hud.showToast('向きを既定に戻しました')
   }
   controls.onCyclePiece = () => {
+    if (TOOLS[tool].id === 'station') {
+      departRoute()
+      hud.setBrush(brushLabel())
+      return
+    }
     if (TOOLS[tool].id === 'track') {
       trackIndex = (trackIndex + 1) % TRACK_KINDS.length
       // 種類が変わると繋げる相手も変わるので、握っていた端点は手放す
@@ -371,7 +413,7 @@ async function boot(): Promise<void> {
       return
     }
     if (TOOLS[tool].id !== 'build') {
-      hud.showToast('建築モードか軌道モードで使えます（B で切替）')
+      hud.showToast('建築・軌道・駅のモードで使えます（B で切替）')
       return
     }
     pieceIndex = (pieceIndex + 1) % PIECE_KINDS.length
@@ -404,7 +446,10 @@ async function boot(): Promise<void> {
     torches.clear()
     build.clear()
     tracks.clear()
+    trains.clear()
     railhead = null
+    riding = null
+    routeSel = []
     mobs.clear()
     health = MAX_HEALTH
     hud.setHealth(health, MAX_HEALTH)
@@ -445,6 +490,8 @@ async function boot(): Promise<void> {
       torches: [...torches.torches],
       pieces2: build.serialize(),
       tracks: tracks.serialize(),
+      stations: trains.serialize().stations,
+      trainRoutes: trains.serialize().trains,
       health,
       chopped: world.choppedList,
     }
@@ -480,6 +527,11 @@ async function boot(): Promise<void> {
     pieces: 0,
     /** 敷いた軌道の区間数。 */
     tracks: 0,
+    /** 建てた駅の数と、走っている列車の数。 */
+    stations: 0,
+    trains: 0,
+    /** 列車に乗っているか。 */
+    riding: false,
     /** 素材の手持ち量（grass, dirt, rock, sand）。 */
     inventory: [0, 0, 0, 0] as number[],
     /** 視線角を直接設定する。 */
@@ -775,6 +827,7 @@ async function boot(): Promise<void> {
       if (plan.check !== 'ok') return plan.check
       if (!tracks.placePlan(plan)) return 'overlap'
       inventory.take(def.id, cost)
+      refreshNetwork()
       railhead = plan.joinTo ? null : endOf(plan.seg)
       invalidateTrack()
       markMetaDirty()
@@ -838,6 +891,7 @@ async function boot(): Promise<void> {
       const def = ITEM_BY_MATERIAL.get(gone.mat)
       if (def) inventory.add(def.id, segmentCost(gone))
       if (railhead && railhead.seg === gone) railhead = null
+      refreshNetwork()
       invalidateTrack()
       markMetaDirty()
       return true
@@ -850,6 +904,122 @@ async function boot(): Promise<void> {
     clearRailhead() {
       railhead = null
       invalidateTrack()
+    },
+    /** 建てた駅の数。 */
+    stationCount(): number {
+      return trains.stations.length
+    },
+    /** 駅の一覧（建てた順）。 */
+    stationList() {
+      return trains.stations.map((s) => ({ x: s.x, y: s.y, z: s.z, mat: s.mat }))
+    },
+    /** 線路の上に駅を建てる（テスト用。本番と同じ規則で見る）。 */
+    placeStation(x: number, y: number, z: number, itemId = 'rock'): string {
+      const def = tryItem(itemId)
+      if (!def?.build || def.material === undefined) return 'material'
+      if (inventory.count(def.id) < STATION_COST) return 'short'
+      const check = trains.canPlaceStation(x, y, z)
+      if (check !== 'ok') return check
+      if (!trains.addStation(x, y, z, def.material)) return 'notrack'
+      inventory.take(def.id, STATION_COST)
+      markMetaDirty()
+      return 'ok'
+    },
+    /** 指定座標にいちばん近い駅の番号（無ければ -1）。 */
+    stationAt(x: number, y: number, z: number, range = 6): number {
+      return trains.stationAt(x, y, z, range)
+    },
+    /** 駅を撤去する（材料は戻る）。 */
+    removeStationAt(x: number, y: number, z: number, range = 6): boolean {
+      const i = trains.stationAt(x, y, z, range)
+      const gone = i >= 0 ? trains.removeStation(i) : null
+      if (!gone) return false
+      const def = ITEM_BY_MATERIAL.get(gone.mat)
+      if (def) inventory.add(def.id, STATION_COST)
+      routeSel = routeSel.filter((k) => k !== i).map((k) => (k > i ? k - 1 : k))
+      trains.setSelection(routeSel)
+      markMetaDirty()
+      return true
+    },
+    /** 駅を路線に加える（照準で選ぶのと同じ）。 */
+    selectStation(index: number): boolean {
+      if (!trains.stations[index]) return false
+      if (routeSel[routeSel.length - 1] === index) return false
+      routeSel = [...routeSel, index]
+      trains.setSelection(routeSel)
+      hud.setBrush(brushLabel())
+      return true
+    },
+    /** いま選んでいる路線。 */
+    routeSelection(): number[] {
+      return [...routeSel]
+    },
+    clearRoute() {
+      clearRouteSelection()
+      hud.setBrush(brushLabel())
+    },
+    /** 選んだ路線で列車を発車させる（テスト用。R キーと同じ規則）。 */
+    depart(itemId = 'rock'): string {
+      const def = tryItem(itemId)
+      if (!def?.build || def.material === undefined) return 'material'
+      if (routeSel.length < 2) return 'short-route'
+      if (inventory.count(def.id) < TRAIN_COST) return 'short'
+      if (!trains.addTrain(routeSel, def.material)) return 'badroute'
+      inventory.take(def.id, TRAIN_COST)
+      clearRouteSelection()
+      hud.setBrush(brushLabel())
+      markMetaDirty()
+      return 'ok'
+    },
+    /** 走っている列車の数。 */
+    trainCount(): number {
+      return trains.trains.length
+    },
+    /** 列車の状態。 */
+    trainInfo(index = 0) {
+      const t = trains.trains[index]
+      if (!t) return null
+      return {
+        x: t.pos[0],
+        y: t.pos[1],
+        z: t.pos[2],
+        yaw: t.pos[3],
+        speed: t.speed,
+        running: t.running,
+        stuck: t.stuck,
+        hop: t.hop,
+        dir: t.dir,
+        dwell: t.dwell,
+        total: t.total,
+        traveled: t.traveled,
+        route: [...t.route],
+      }
+    },
+    /** 列車を引き上げる（材料は戻る）。 */
+    removeTrainAt(x: number, y: number, z: number, range = 6): boolean {
+      const t = trains.nearestTrain(x, y, z, range)
+      if (!t) return false
+      const def = ITEM_BY_MATERIAL.get(t.mat)
+      if (def) inventory.add(def.id, TRAIN_COST)
+      if (riding === t) riding = null
+      trains.removeTrain(t)
+      markMetaDirty()
+      return true
+    },
+    /** いちばん近い列車に乗る（F キーと同じ）。 */
+    rideTrain(): boolean {
+      return mount()
+    },
+    /** 列車から降りる。 */
+    leaveTrain() {
+      dismount()
+    },
+    /**
+     * いま乗っているか。`riding` は毎フレーム書き出す表示用なので、
+     * 乗り降りした直後に読むならこちらを使う。
+     */
+    isRiding(): boolean {
+      return riding !== null
     },
     /** 最寄りの村の広場へ移動する。見つからなければ false。 */
     gotoVillage(): boolean {
@@ -983,6 +1153,12 @@ async function boot(): Promise<void> {
       setTradePanel(false)
       return
     }
+    // 列車が近ければ乗り降りが優先
+    if (riding) {
+      dismount()
+      return
+    }
+    if (mount()) return
     const v = mobs.nearestVillager(player.position.x, player.position.z, 4.5)
     if (!v) {
       hud.showToast('近くに村人がいません')
@@ -1274,6 +1450,7 @@ async function boot(): Promise<void> {
         const def = ITEM_BY_MATERIAL.get(gone.mat)
         if (def) inventory.add(def.id, segmentCost(gone))
         if (railhead && railhead.seg === gone) railhead = null
+        refreshNetwork()
         hud.showToast(`${TRACK_INFO[gone.kind].name}を撤去した`)
         invalidateTrack()
         markMetaDirty()
@@ -1303,12 +1480,196 @@ async function boot(): Promise<void> {
     }
     if (tracks.placePlan(plan)) {
       inventory.take(held.id, cost)
+      refreshNetwork()
       // 繋ぎ切ったら線は閉じ、そうでなければ終点が次のレールヘッドになる
       railhead = plan.joinTo ? null : endOf(plan.seg)
       invalidateTrack()
       markMetaDirty()
     }
     editCooldown = TRACK_INTERVAL
+  }
+
+  /** 線路が変わったら、経路探索の網を組み直す（駅が線路から外れたら捨てられる）。 */
+  function refreshNetwork(): void {
+    trains.rebuildNetwork(tracks.graph.segments())
+    // 消えた駅を指していた選択は落とす
+    routeSel = routeSel.filter((i) => trains.stations[i])
+    trains.setSelection(routeSel)
+  }
+
+  /** 選んだ路線を捨てる。 */
+  function clearRouteSelection(): void {
+    if (routeSel.length === 0) return
+    routeSel = []
+    trains.setSelection(routeSel)
+  }
+
+  /** 選んだ駅を順に結んで 1 編成走らせる。 */
+  function departRoute(): void {
+    const held = inventory.held()
+    if (routeSel.length < 2) {
+      hud.showToast('駅を 2 つ以上、走らせたい順に選んでください')
+      return
+    }
+    if (!held?.build || held.material === undefined) {
+      hud.showToast('この素材では列車を作れません（岩・板・レンガ・ガラス）')
+      return
+    }
+    if (inventory.count(held.id) < TRAIN_COST) {
+      hud.showToast(`${held.name}が足りません（列車に ${TRAIN_COST} 必要）`)
+      return
+    }
+    const train = trains.addTrain(routeSel, held.material)
+    if (!train) {
+      hud.showToast('その路線では走らせられません')
+      return
+    }
+    inventory.take(held.id, TRAIN_COST)
+    hud.showToast(`列車が発車しました（${routeSel.length} 駅）`)
+    clearRouteSelection()
+    markMetaDirty()
+  }
+
+  /**
+   * 駅・列車モードの 1 フレーム。
+   *
+   * 右クリックで線路の上に駅を置き、**置いた駅に照準を合わせて右クリックすると
+   * 路線に順番に加わる**。2 駅以上選んで `R` を押すと列車が発車する。
+   * 左クリックは駅か列車の撤去、中クリックは選んだ路線の取り消し。
+   */
+  function updateStationMode(): void {
+    const held = inventory.held()
+    const trackHit = tracks.raycast(eye.x, eye.y, eye.z, lookDir.x, lookDir.y, lookDir.z, REACH)
+    const terrain = raycastTerrain(world, eye, lookDir, REACH, hit)
+    const onTrack = trackHit !== null && trackHit.distance < (terrain ? terrain.distance : Infinity)
+    const dist = onTrack && trackHit ? trackHit.distance : terrain ? terrain.distance : REACH
+    const px = eye.x + lookDir.x * dist
+    const py = eye.y + lookDir.y * dist
+    const pz = eye.z + lookDir.z * dist
+
+    const station = trains.stationAt(px, py, pz, STATION_PICK)
+    const train = trains.nearestTrain(px, py, pz, TRAIN_PICK)
+    hud.setBrush(brushLabel())
+
+    if (editCooldown > 0) return
+
+    // 左クリック = 撤去。材料は全額戻る
+    if (controls.digging) {
+      if (station >= 0) {
+        const gone = trains.removeStation(station)
+        if (gone) {
+          const def = ITEM_BY_MATERIAL.get(gone.mat)
+          if (def) inventory.add(def.id, STATION_COST)
+          routeSel = routeSel.filter((i) => i !== station).map((i) => (i > station ? i - 1 : i))
+          trains.setSelection(routeSel)
+          hud.showToast('駅を撤去した')
+          markMetaDirty()
+        }
+      } else if (train) {
+        const def = ITEM_BY_MATERIAL.get(train.mat)
+        if (def) inventory.add(def.id, TRAIN_COST)
+        if (riding === train) dismount()
+        trains.removeTrain(train)
+        hud.showToast('列車を引き上げた')
+        markMetaDirty()
+      } else {
+        hud.showToast('撤去する駅か列車に照準を合わせてください')
+      }
+      editCooldown = DEMOLISH_INTERVAL
+      return
+    }
+
+    if (!controls.placing) return
+
+    // 既にある駅を狙っていれば、路線に加える
+    if (station >= 0) {
+      if (routeSel[routeSel.length - 1] === station) {
+        hud.showToast('同じ駅は続けて選べません')
+      } else {
+        routeSel = [...routeSel, station]
+        trains.setSelection(routeSel)
+        hud.showToast(`駅${station + 1} を路線に追加（${routeSel.length} 駅目）`)
+      }
+      editCooldown = BUILD_INTERVAL
+      return
+    }
+
+    // 何も無ければ線路の上に駅を建てる
+    if (!held?.build || held.material === undefined) {
+      hud.showToast('この素材では駅を建てられません（岩・板・レンガ・ガラス）')
+      editCooldown = 0.5
+      return
+    }
+    if (inventory.count(held.id) < STATION_COST) {
+      hud.showToast(`${held.name}が足りません（駅に ${STATION_COST} 必要）`)
+      editCooldown = 0.5
+      return
+    }
+    const check = trains.canPlaceStation(px, py, pz)
+    if (check === 'notrack') {
+      hud.showToast('駅は線路の上にしか建てられません')
+      editCooldown = DEMOLISH_INTERVAL
+      return
+    }
+    if (check === 'tooclose') {
+      hud.showToast('近くに駅がありすぎます')
+      editCooldown = DEMOLISH_INTERVAL
+      return
+    }
+    if (trains.addStation(px, py, pz, held.material)) {
+      inventory.take(held.id, STATION_COST)
+      hud.showToast(`駅${trains.stations.length} を建てた`)
+      markMetaDirty()
+    }
+    editCooldown = TRACK_INTERVAL
+  }
+
+  /** 近くの列車に乗り込む。乗れたら true。 */
+  function mount(): boolean {
+    const t = trains.nearestTrain(
+      player.position.x,
+      player.position.y,
+      player.position.z,
+      RIDE_RANGE,
+    )
+    if (!t) return false
+    riding = t
+    player.velocity.set(0, 0, 0)
+    hud.showToast('列車に乗った（F で降りる）')
+    return true
+  }
+
+  /** 列車から降りて、線路の脇に立つ。 */
+  function dismount(): void {
+    const t = riding
+    riding = null
+    if (!t) return
+    // ヨー θ の右は (cosθ, -sinθ)
+    player.position.set(
+      t.pos[0] + Math.cos(t.pos[3]) * RIDE_OFF,
+      t.pos[1] + 0.6,
+      t.pos[2] - Math.sin(t.pos[3]) * RIDE_OFF,
+    )
+    player.velocity.set(0, 0, 0)
+    hud.showToast('列車から降りた')
+  }
+
+  /** 乗っているあいだは、列車の運転台にプレイヤーを載せて運ぶ。 */
+  function carryRider(): void {
+    const t = riding
+    if (!t) return
+    if (!trains.trains.includes(t)) {
+      riding = null
+      return
+    }
+    // 運転台は車体の後ろ寄り。前方は (-sinθ, -cosθ)
+    const back = -CAR_LEN * 0.28
+    player.position.set(
+      t.pos[0] - Math.sin(t.pos[3]) * back,
+      t.pos[1] + 0.6,
+      t.pos[2] - Math.cos(t.pos[3]) * back,
+    )
+    player.velocity.set(0, 0, 0)
   }
 
   /** 区間の終点を、次に伸ばせる端点として取り出す。 */
@@ -1322,7 +1683,10 @@ async function boot(): Promise<void> {
     const dt = Math.min(clock.getDelta(), 0.1)
     frames++
 
-    if (started && controls.locked) {
+    if (started && riding) {
+      // 乗車中は自分では歩かない。視線だけ自由に回せる
+      carryRider()
+    } else if (started && controls.locked) {
       player.update(dt, world, controls)
     }
 
@@ -1365,6 +1729,7 @@ async function boot(): Promise<void> {
     // --- MOB と松明 ---
     const daylight = sky.daylight
     if (started) {
+      trains.update(dt)
       mobs.update(dt, world, player.position.x, player.position.y, player.position.z, daylight)
       torches.update(dt, camera.position.x, camera.position.y, camera.position.z)
       // 少し経つと体力が戻る
@@ -1380,6 +1745,14 @@ async function boot(): Promise<void> {
       camera.getWorldDirection(lookDir)
       editCooldown -= dt
       updateBuildMode()
+      tracks.setGhost(null, false, groundY)
+      ghost.visible = false
+      boxGhost.visible = false
+    } else if (started && controls.locked && TOOLS[tool].id === 'station') {
+      camera.getWorldDirection(lookDir)
+      editCooldown -= dt
+      updateStationMode()
+      build.setGhost(null, false)
       tracks.setGhost(null, false, groundY)
       ghost.visible = false
       boxGhost.visible = false
@@ -1592,6 +1965,7 @@ async function boot(): Promise<void> {
           `Tree  ${world.treeCount}  伐採 ${world.choppedCount}`,
           `HP    ${Math.ceil(health)}/${MAX_HEALTH}  MOB ${mobs.total}  松明 ${torches.count}`,
           `Build ${build.count} パーツ  軌道 ${tracks.count} 区間`,
+          `Rail  駅 ${trains.stations.length}  列車 ${trains.trains.length}${riding ? '（乗車中）' : ''}`,
           `Hit   ${villages.colliderCount + build.colliderCount + tracks.colliderCount}`,
           `Time  ${String(h % 24).padStart(2, '0')}:00${sky.paused ? '  固定' : ''}`,
           `Seed  ${seed}`,
@@ -1628,6 +2002,9 @@ async function boot(): Promise<void> {
     stats.torches = torches.count
     stats.pieces = build.count
     stats.tracks = tracks.count
+    stats.stations = trains.stations.length
+    stats.trains = trains.trains.length
+    stats.riding = riding !== null
     stats.trees = world.treeCount
     stats.tool = TOOLS[tool].id
     stats.timeOfDay = sky.timeOfDay

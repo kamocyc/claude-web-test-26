@@ -63,7 +63,7 @@ export function buildTrackGeometry(
   if (seg.kind === 'rail') {
     // 枕木は路盤の天面にわずかに顔を出す程度（歩く面は路盤の天面のまま）
     forEachStation(seg, TIE_SPACING, (x, y, z, yaw) => {
-      boxAt(body, x, y, z, yaw, half * 0.85, 0.13, -0.16, 0.03)
+      orientedBox(body, x, y, z, yaw, half * 0.85, 0.13, -0.16, 0.03)
     })
     ribbon(accent, pts, RAIL_HALF, RAIL_HALF, RAIL_TOP, RAIL_BOTTOM, -GAUGE / 2)
     ribbon(accent, pts, RAIL_HALF, RAIL_HALF, RAIL_TOP, RAIL_BOTTOM, GAUGE / 2)
@@ -72,7 +72,7 @@ export function buildTrackGeometry(
     ribbon(body, pts, 0.2, 0.2, 0.12, -0.02, -(half - 0.2))
     ribbon(body, pts, 0.2, 0.2, 0.12, -0.02, half - 0.2)
     forEachStation(seg, 4, (x, y, z, yaw) => {
-      boxAt(accent, x, y, z, yaw, 0.14, 0.9, 0.0, 0.03)
+      orientedBox(accent, x, y, z, yaw, 0.14, 0.9, 0.0, 0.03)
     })
   }
 
@@ -86,10 +86,10 @@ export function buildTrackGeometry(
     for (const side of [-1, 1]) {
       const px = x + Math.cos(yaw) * side * half * 0.6
       const pz = z - Math.sin(yaw) * side * half * 0.6
-      boxAt(body, px, 0, pz, yaw, PILLAR_HALF, PILLAR_HALF, foot, top)
+      orientedBox(body, px, 0, pz, yaw, PILLAR_HALF, PILLAR_HALF, foot, top)
     }
     // 柱の頭をつなぐ横木
-    boxAt(body, x, 0, z, yaw, half * 0.8, PILLAR_HALF * 0.8, top - 0.3, top)
+    orientedBox(body, x, 0, z, yaw, half * 0.8, PILLAR_HALF * 0.8, top - 0.3, top)
   })
 
   return { body: geometryFrom(body), accent: accent.length > 0 ? geometryFrom(accent) : null }
@@ -166,8 +166,11 @@ function ribbon(
   face(out, fn, at(n - 1, 0), at(n - 1, 1), at(n - 1, 2), at(n - 1, 3))
 }
 
-/** ヨーに沿って向いた箱（枕木・橋脚・中央線）。y は中心線からの相対。 */
-function boxAt(
+/**
+ * ヨーに沿って向いた箱（枕木・橋脚・中央線・駅や車体にも使う）。
+ * `y0`/`y1` は `y` からの相対なので、`y` に 0 を渡せばワールド座標そのままで書ける。
+ */
+export function orientedBox(
   out: number[],
   x: number,
   y: number,
@@ -218,9 +221,9 @@ function forEachStation(
   }
 }
 
-type Pt = [number, number, number]
+export type Pt = [number, number, number]
 
-function face(out: number[], hint: Pt, a: Pt, b: Pt, c: Pt, d: Pt): void {
+export function face(out: number[], hint: Pt, a: Pt, b: Pt, c: Pt, d: Pt): void {
   quadFacing(
     out,
     hint[0], hint[1], hint[2],
@@ -231,7 +234,7 @@ function face(out: number[], hint: Pt, a: Pt, b: Pt, c: Pt, d: Pt): void {
   )
 }
 
-function geometryFrom(v: number[]): THREE.BufferGeometry {
+export function geometryFrom(v: number[]): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry()
   geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(v), 3))
   geo.computeVertexNormals()

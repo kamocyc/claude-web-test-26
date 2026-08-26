@@ -32,6 +32,11 @@ export interface SmoothDebug {
   pieces: number
   /** 敷いた軌道の区間数。 */
   tracks: number
+  /** 建てた駅の数と、走っている列車の数。 */
+  stations: number
+  trains: number
+  /** 列車に乗っているか。 */
+  riding: boolean
   inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
@@ -124,6 +129,39 @@ export interface SmoothDebug {
     curve: number
   }[]
   removeTrackAt(x: number, y: number, z: number, range?: number): boolean
+  stationCount(): number
+  stationList(): { x: number; y: number; z: number; mat: number }[]
+  /** 線路の上に駅を建てる。'ok' | 'notrack' | 'tooclose' | 'short' | 'material' */
+  placeStation(x: number, y: number, z: number, itemId?: string): string
+  stationAt(x: number, y: number, z: number, range?: number): number
+  removeStationAt(x: number, y: number, z: number, range?: number): boolean
+  /** 駅を路線に加える。 */
+  selectStation(index: number): boolean
+  routeSelection(): number[]
+  clearRoute(): void
+  /** 選んだ路線で列車を発車させる。'ok' | 'short-route' | 'short' | 'badroute' | 'material' */
+  depart(itemId?: string): string
+  trainCount(): number
+  trainInfo(index?: number): {
+    x: number
+    y: number
+    z: number
+    yaw: number
+    speed: number
+    running: boolean
+    stuck: boolean
+    hop: number
+    dir: number
+    dwell: number
+    total: number
+    traveled: number
+    route: number[]
+  } | null
+  removeTrainAt(x: number, y: number, z: number, range?: number): boolean
+  rideTrain(): boolean
+  leaveTrain(): void
+  /** いま乗っているか（乗り降りした直後でも正しい）。 */
+  isRiding(): boolean
   /** いま伸ばそうとしている端点。 */
   railhead(): { x: number; y: number; z: number; yaw: number } | null
   clearRailhead(): void
