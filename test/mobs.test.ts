@@ -147,6 +147,29 @@ describe('MOB', () => {
     expect(m.total, '昼になっても残っている').toBe(0)
   })
 
+  it('向きを指定して吹き飛ばせる（列車にはねられたとき）', () => {
+    const m = new MobManager()
+    const mob = m.spawn('deer', 0, 1, 0)
+    // 真横（+X）へ、強めに
+    const dead = m.knock(mob, 3, 1, 0, 12, 6)
+    expect(dead).toBe(false)
+    expect(mob.vel.x).toBeCloseTo(12, 6)
+    expect(mob.vel.z).toBeCloseTo(0, 6)
+    expect(mob.vel.y).toBeCloseTo(6, 6)
+    expect(mob.hp).toBe(MOB_DEFS.deer.hp - 3)
+    // 体力を削り切れば倒れ、ドロップの対象になる
+    expect(m.knock(mob, 999, 1, 0, 12, 6)).toBe(true)
+    expect(mob.killed).toBe(true)
+  })
+
+  it('殴られると殴った位置から遠ざかる向きへ弾かれる', () => {
+    const m = new MobManager()
+    const mob = m.spawn('deer', 3, 1, 0)
+    m.hurt(mob, 1, 0, 0)
+    expect(mob.vel.x).toBeGreaterThan(0)
+    expect(mob.vel.y).toBeGreaterThan(0)
+  })
+
   it('近くの村人を探せる', () => {
     const m = new MobManager()
     m.spawn('deer', 1, 0, 0)

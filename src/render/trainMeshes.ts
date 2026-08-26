@@ -2,7 +2,19 @@ import * as THREE from 'three'
 import { geometryFrom, orientedBox } from './trackMeshes'
 import { buildMaterial } from './buildMeshes'
 import { TRACK_INFO } from '../track/track'
-import { CAR_H, CAR_LEN, CAR_W, PLATFORM_H, PLATFORM_LEN, PLATFORM_W } from '../train/trains'
+import {
+  CAB_BACK,
+  CAB_HALF_LEN,
+  CAB_HALF_W,
+  CAR_H,
+  CAR_LEN,
+  CAR_W,
+  HOOD_TOP,
+  PLATFORM_H,
+  PLATFORM_LEN,
+  PLATFORM_W,
+  ROOF_TOP,
+} from '../train/trains'
 
 /** 屋根・車輪・煙突。車体は軌道と同じく素材の色で描く。 */
 export const trainTrimMaterial = new THREE.MeshStandardMaterial({
@@ -99,14 +111,14 @@ export function buildTrainMesh(mat: number): THREE.Group {
   const w = CAR_W / 2
   const l = CAR_LEN / 2
 
-  // 台枠とボイラー
+  // 台枠とボイラー。天面 HOOD_TOP が当たり判定の「前半」の高さ
   orientedBox(body, 0, 0, 0, 0, w, l, 0.35, 0.6)
-  orientedBox(body, 0, 0, 0, 0, w * 0.8, l * 0.62, 0.6, CAR_H * 0.72)
+  orientedBox(body, 0, 0, 0, 0, w * 0.8, CAB_BACK, 0.6, HOOD_TOP)
   // 運転台（後ろ寄り）
-  orientedBox(body, 0, 0, l * 0.62, 0, w * 0.9, l * 0.36, 0.6, CAR_H)
-  // 屋根と煙突
-  orientedBox(trim, 0, 0, l * 0.62, 0, w * 0.98, l * 0.4, CAR_H, CAR_H + 0.14)
-  orientedBox(trim, 0, 0, -l * 0.72, 0, 0.22, 0.22, CAR_H * 0.72, CAR_H * 0.72 + 0.5)
+  orientedBox(body, 0, 0, CAB_BACK, 0, CAB_HALF_W, CAB_HALF_LEN, 0.6, CAR_H)
+  // 屋根と煙突。屋根の天面 ROOF_TOP が当たり判定の「運転台」の高さ
+  orientedBox(trim, 0, 0, CAB_BACK, 0, CAB_HALF_W * 1.09, CAB_HALF_LEN * 1.11, CAR_H, ROOF_TOP)
+  orientedBox(trim, 0, 0, -l * 0.72, 0, 0.22, 0.22, HOOD_TOP, HOOD_TOP + 0.5)
   // 車輪（左右 3 対）。ヨー 0 のとき右は +x、前方は -z
   for (const side of [-1, 1]) {
     for (const at of [-0.62, 0, 0.62]) {

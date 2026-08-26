@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import { TrackNetwork, pathLength, pathPoint } from '../src/train/network'
-import { DWELL, MAX_SPEED, STATION_MIN_GAP, Train } from '../src/train/trains'
+import {
+  CAB_BACK,
+  CAR_H,
+  CAR_LEN,
+  CAR_W,
+  DWELL,
+  HOOD_TOP,
+  MAX_SPEED,
+  ROOF_TOP,
+  STATION_MIN_GAP,
+  Train,
+} from '../src/train/trains'
 import type { Station } from '../src/train/trains'
+import { HIT_DAMAGE_MAX, HIT_DAMAGE_MIN, HIT_SPEED, carColliders, trainImpact } from '../src/train/impact'
+import { buildTrainMesh } from '../src/render/trainMeshes'
 import { normalizeAngle, segmentEnd } from '../src/track/track'
 import type { Segment, TrackKind } from '../src/track/track'
 import { MAT_ROCK } from '../src/world/constants'
@@ -184,5 +197,130 @@ describe('列車', () => {
 
   it('駅どうしの最小間隔は車体より長い', () => {
     expect(STATION_MIN_GAP).toBeGreaterThan(7)
+  })
+})
+
+describe('列車の当たり判定', () => {
+  /** ヨー θ、レール天面 y = 10 に置いた車体。 */
+  function car(yaw = 0, x = 0, z = 0): number[] {
+    return [x, 10, z, yaw]
+  }
+
+  it('車体は前半と運転台の 2 つの箱で、運転台だけ屋根まで高い', () => {
+    const [hood, cab] = carColliders(car())
+    expect(hood.minY).toBe(10)
+    expect(hood.maxY).toBeCloseTo(10 + HOOD_TOP, 9)
+    expect(hood.minZ).toBeCloseTo(-CAR_LEN / 2, 9)
+    expect(hood.maxZ).toBeCloseTo(CAR_LEN / 2, 9)
+    expect(hood.maxX - hood.minX).toBeCloseTo(CAR_W, 9)
+    // 運転台は後ろ寄りにあり、屋根のぶんだけ高い
+    expect(cab.maxY).toBeCloseTo(10 + ROOF_TOP, 9)
+    expect(cab.maxY).toBeGreaterThan(hood.maxY)
+    expect((cab.minZ + cab.maxZ) / 2).toBeGreaterThan(0)
+  })
+
+  it('当たり判定は見た目の車体をちょうど包む', () => {
+    // 車体（children[0]）と、屋根・煙突・車輪（children[1]）
+    const mesh = buildTrainMesh(MAT_ROCK)
+    const extent = (child: unknown) => {
+      const pos = (child as { geometry: { attributes: { position: { array: ArrayLike<number> } } } })
+        .geometry.attributes.position.array
+      const e = { minY: Infinity, maxY: -Infinity, maxX: 0, maxZ: 0 }
+      for (let i = 0; i < pos.length; i += 3) {
+        e.maxX = Math.max(e.maxX, Math.abs(pos[i]))
+        e.minY = Math.min(e.minY, pos[i + 1])
+        e.maxY = Math.max(e.maxY, pos[i + 1])
+        e.maxZ = Math.max(e.maxZ, Math.abs(pos[i + 2]))
+      }
+      return e
+    }
+    const body = extent(mesh.children[0])
+    const trim = extent(mesh.children[1])
+    // 車体は当たり判定の中に収まる
+    expect(body.minY).toBeCloseTo(0.35, 6)
+    expect(body.maxY).toBeCloseTo(CAR_H, 6)
+    expect(body.maxX).toBeLessThanOrEqual(CAR_W / 2 + 1e-6)
+    expect(body.maxZ).toBeLessThanOrEqual(CAR_LEN / 2 + 1e-6)
+    // 立てる面は屋根のてっぺん（車輪だけは飾りなので少しはみ出る）
+    expect(Math.max(body.maxY, trim.maxY)).toBeCloseTo(ROOF_TOP, 6)
+    expect(trim.minY).toBeCloseTo(0, 6)
+  })
+
+  it('走っている列車は線路の上のものをはねる', () => {
+    const hit = trainImpact(car(), MAX_SPEED, 0, 10, -3, 0.38, 1.78)
+    expect(hit).not.toBeNull()
+    expect(hit!.damage).toBeCloseTo(HIT_DAMAGE_MAX, 6)
+    // 先頭に当たったので、おおむね進行方向（ヨー 0 なら -Z）へ飛ぶ
+    expect(hit!.nz).toBeLessThan(-0.7)
+    // ただし線路の上に落ちて轢かれ直さないよう、少しは横へ逸れる
+    expect(Math.abs(hit!.nx)).toBeGreaterThan(0.1)
+    expect(Math.hypot(hit!.nx, hit!.nz)).toBeCloseTo(1, 9)
+    expect(hit!.push).toBeGreaterThan(0)
+    expect(hit!.lift).toBeGreaterThan(0)
+  })
+
+  it('止まっている（遅い）列車ははねない', () => {
+    expect(trainImpact(car(), 0, 0, 10, -3, 0.38, 1.78)).toBeNull()
+    expect(trainImpact(car(), HIT_SPEED - 0.01, 0, 10, -3, 0.38, 1.78)).toBeNull()
+    expect(trainImpact(car(), HIT_SPEED, 0, 10, -3, 0.38, 1.78)).not.toBeNull()
+  })
+
+  it('屋根の上に立っているとはねられない', () => {
+    // ボイラーの上
+    expect(trainImpact(car(), MAX_SPEED, 0, 10 + HOOD_TOP, -3, 0.38, 1.78)).toBeNull()
+    // 運転台の屋根の上
+    expect(trainImpact(car(), MAX_SPEED, 0, 10 + ROOF_TOP, CAB_BACK, 0.38, 1.78)).toBeNull()
+    // 同じ場所でも足が低ければはねられる
+    expect(trainImpact(car(), MAX_SPEED, 0, 10, CAB_BACK, 0.38, 1.78)).not.toBeNull()
+  })
+
+  it('車体の外や下にいるとはねられない', () => {
+    // 横にどく
+    expect(trainImpact(car(), MAX_SPEED, CAR_W, 10, 0, 0.38, 1.78)).toBeNull()
+    // 前後に離れる
+    expect(trainImpact(car(), MAX_SPEED, 0, 10, -CAR_LEN, 0.38, 1.78)).toBeNull()
+    // 橋の下をくぐる
+    expect(trainImpact(car(), MAX_SPEED, 0, 6, 0, 0.38, 1.78)).toBeNull()
+  })
+
+  it('横に当たると線路の外へ払われ、速いほど強く飛ぶ', () => {
+    const side = trainImpact(car(), MAX_SPEED, 1.4, 10, 0, 0.38, 1.78)
+    expect(side).not.toBeNull()
+    // ヨー 0 の右は +X。真横なので前後の成分は無い
+    expect(side!.nx).toBeCloseTo(1, 6)
+    expect(side!.nz).toBeCloseTo(0, 6)
+
+    const slow = trainImpact(car(), HIT_SPEED, 1.4, 10, 0, 0.38, 1.78)!
+    expect(slow.damage).toBeCloseTo(HIT_DAMAGE_MIN, 6)
+    expect(slow.damage).toBeLessThan(side!.damage)
+    expect(slow.push).toBeLessThan(side!.push)
+  })
+
+  it('車体が回っていても、飛ぶ向きは車体から見た向きどおり', () => {
+    const yaw = Math.PI / 2
+    // ヨー π/2 の前方は -X、右は -Z。前方 3 m・右 0.5 m に立つ
+    const hit = trainImpact(car(yaw), MAX_SPEED, -3, 10, -0.5, 0.38, 1.78)
+    expect(hit).not.toBeNull()
+    // 前方（-X）が主で、当たった側（-Z）へ逸れる
+    expect(hit!.nx).toBeLessThan(-0.7)
+    expect(hit!.nz).toBeLessThan(-0.1)
+  })
+
+  it('走ると 1 フレーム前の位置が残る（屋根の上を運ぶのに使う）', () => {
+    const line = straightLine(2, 20)
+    const net = new TrackNetwork()
+    net.build(line)
+    const stations = [station(line[0], 0), station(line[1], 18)]
+    const resolve = (a: Station, b: Station) => {
+      const p = net.locate(a.x, a.y, a.z, 2)
+      const q = net.locate(b.x, b.y, b.z, 2)
+      return p && q ? net.path(p, q) : null
+    }
+    const t = new Train([0, 1], MAT_ROCK)
+    for (let i = 0; i < 200; i++) t.update(1 / 60, stations, resolve)
+    expect(t.speed).toBeGreaterThan(1)
+    const moved = Math.hypot(t.pos[0] - t.prev[0], t.pos[2] - t.prev[2])
+    expect(moved).toBeGreaterThan(0)
+    expect(moved).toBeCloseTo(t.speed / 60, 2)
   })
 })

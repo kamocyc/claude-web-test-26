@@ -93,6 +93,21 @@ async function buildStations(page: Page): Promise<void> {
   expect(built).toEqual(['ok', 'ok'])
 }
 
+/** 線路・駅・列車を用意して、走り出すまで待つ。 */
+async function runTrain(page: Page): Promise<void> {
+  await layLine(page)
+  await buildStations(page)
+  await page.evaluate(() => {
+    const s = window.__smooth!
+    s.selectStation(0)
+    s.selectStation(1)
+    s.depart()
+  })
+  await page.waitForFunction(() => (window.__smooth!.trainInfo(0)?.speed ?? 0) > 4, null, {
+    timeout: 120_000,
+  })
+}
+
 test.describe('駅と列車', () => {
   test('駅は線路の上にしか建てられない', async ({ page }) => {
     await start(page)
@@ -274,5 +289,125 @@ test.describe('駅と列車', () => {
     })
     expect(r.before).toBe(2)
     expect(r.after).toBe(1)
+  })
+})
+
+
+test.describe('列車の当たり判定', () => {
+  test('屋根の上に立てて、走っている列車といっしょに運ばれる', async ({ page }) => {
+    await start(page)
+    await runTrain(page)
+
+    const on = await page.evaluate(async () => {
+      const s = window.__smooth!
+      const t = s.trainInfo(0)!
+      // 運転台の屋根の真ん中へ降りる（ヨー θ の後ろは (sinθ, cosθ)）
+      const cab = s.trainColliders()[1]
+      const back = (cab.minZ + cab.maxZ) / 2
+      s.placeAt(t.x + Math.sin(t.yaw) * back, cab.maxY + 0.05, t.z + Math.cos(t.yaw) * back)
+      await new Promise((r) => setTimeout(r, 1200))
+      return { roofY: cab.maxY, standing: s.standingOnTrain(), p: s.state() }
+    })
+    // 車体をすり抜けず、屋根の天面に立っている
+    expect(on.standing).not.toBeNull()
+    expect(on.standing!).toBeCloseTo(on.roofY, 1)
+    expect(on.p.onGround).toBe(true)
+
+    // 列車が進んだぶんだけ、屋根の上のプレイヤーも動く
+    const carried = await page.evaluate(async () => {
+      const s = window.__smooth!
+      const from = s.state()
+      const t0 = s.trainInfo(0)!
+      await new Promise((r) => setTimeout(r, 4000))
+      const p = s.state()
+      const t1 = s.trainInfo(0)!
+      return {
+        moved: Math.hypot(p.x - from.x, p.z - from.z),
+        trainMoved: Math.hypot(t1.x - t0.x, t1.z - t0.z),
+        standing: s.standingOnTrain(),
+        hits: s.trainHits,
+        health: s.health,
+      }
+    })
+    expect(carried.trainMoved, '列車が動いていない').toBeGreaterThan(1)
+    expect(carried.moved).toBeCloseTo(carried.trainMoved, 1)
+    expect(carried.standing).not.toBeNull()
+    // 屋根の上にいるあいだは轢かれない
+    expect(carried.hits).toBe(0)
+    expect(carried.health).toBe(20)
+  })
+
+  test('線路の上にいると、はねられてダメージを受け飛ばされる', async ({ page }) => {
+    await start(page)
+    await runTrain(page)
+
+    const before = await page.evaluate(() => {
+      const s = window.__smooth!
+      const t = s.trainInfo(0)!
+      // 進行方向 6 m 先の線路の上に立つ（ヨー θ の前方は (-sinθ, -cosθ)）
+      s.teleport(t.x - Math.sin(t.yaw) * 6, t.z - Math.cos(t.yaw) * 6)
+      return { health: s.health, hits: s.trainHits, p: s.state() }
+    })
+    expect(before.hits).toBe(0)
+    expect(before.health).toBe(20)
+
+    await page.waitForFunction(() => window.__smooth!.trainHits > 0, null, { timeout: 180_000 })
+    const hit = await page.evaluate(() => {
+      const s = window.__smooth!
+      return { health: s.health, hits: s.trainHits, p: s.state() }
+    })
+    expect(hit.hits).toBe(1)
+    expect(hit.health, 'ダメージを受けていない').toBeLessThan(before.health)
+    // 打ち上げられて足が地面から離れる
+    expect(hit.p.onGround).toBe(false)
+    expect(hit.p.y).toBeGreaterThan(before.p.y + 0.2)
+
+    // そのまま線路の外へ飛ばされる
+    await page.waitForTimeout(3000)
+    const flew = await page.evaluate(
+      (b) => {
+        const p = window.__smooth!.state()
+        return Math.hypot(p.x - b.x, p.z - b.z)
+      },
+      before.p,
+    )
+    expect(flew).toBeGreaterThan(0.8)
+  })
+
+  test('線路の上の MOB もはねられる', async ({ page }) => {
+    await start(page)
+    await runTrain(page)
+
+    const spawned = await page.evaluate(() => {
+      const s = window.__smooth!
+      const t = s.trainInfo(0)!
+      const fx = -Math.sin(t.yaw)
+      const fz = -Math.cos(t.yaw)
+      const rx = Math.cos(t.yaw)
+      const rz = -Math.sin(t.yaw)
+      // 車体のすぐ前（4 m 先）に横並びで置く。逃げる間もなく轢かれる
+      let n = 0
+      for (const side of [-0.6, 0, 0.6]) {
+        const x = t.x + fx * 4 + rx * side
+        const z = t.z + fz * 4 + rz * side
+        if (s.spawnMobAt('deer', x, t.y, z)) n++
+      }
+      // 近くにいると鹿が逃げてしまうので、プレイヤーは遠くへ避難する
+      s.placeAt(t.x - fx * 60, t.y + 1, t.z - fz * 60)
+      return { n, hide: s.itemCount('hide') }
+    })
+    expect(spawned.n).toBe(3)
+
+    // 轢かれた鹿は倒れて毛皮を落とす
+    await page.waitForFunction((h) => window.__smooth!.itemCount('hide') > h, spawned.hide, {
+      timeout: 180_000,
+    })
+    const after = await page.evaluate(() => {
+      const s = window.__smooth!
+      return { hide: s.itemCount('hide'), health: s.health }
+    })
+    expect(after.hide).toBeGreaterThan(spawned.hide)
+    // プレイヤーは離れているので無傷
+    expect(after.health).toBe(20)
   })
 })

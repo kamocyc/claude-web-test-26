@@ -20,6 +20,19 @@ export const CAR_LEN = 7
 export const CAR_W = 2.6
 export const CAR_H = 2.4
 
+/**
+ * 車体の細かい寸法。**見た目（`buildTrainMesh`）と当たり判定（`carColliders`）の両方**が
+ * ここを見るので、車体の形を変えても屋根の上に立てる高さがずれない。
+ * 向きは当たり判定のローカル座標と同じで、右が +x・後ろが +z。
+ */
+/** 運転台の中心（車体中心から後ろへ）と、その半分の長さ・幅。 */
+export const CAB_BACK = (CAR_LEN / 2) * 0.62
+export const CAB_HALF_LEN = (CAR_LEN / 2) * 0.36
+export const CAB_HALF_W = (CAR_W / 2) * 0.9
+/** ボイラーの上面と、運転台の屋根の高さ（レール天面から）。 */
+export const HOOD_TOP = CAR_H * 0.72
+export const ROOF_TOP = CAR_H + 0.14
+
 /** 最高速度（m/s）と、加速・減速（m/s²）。 */
 export const MAX_SPEED = 13
 export const ACCEL = 3.2
@@ -69,6 +82,11 @@ export class Train {
   stuck = false
   /** 位置と向き `[x, y, z, yaw]`。 */
   readonly pos = [0, 0, 0, 0]
+  /**
+   * 1 つ前の {@link pos}。差を取ると「このフレームで車体が動いた量」になるので、
+   * 屋根の上に立っている者を**動く床**として一緒に運べる。
+   */
+  readonly prev = [0, 0, 0, 0]
 
   private retry = 0
 
@@ -88,6 +106,9 @@ export class Train {
   }
 
   update(dt: number, stations: readonly Station[], resolve: Resolve): void {
+    // 途中で return する道が多いので、いちばん先に控えておく
+    for (let i = 0; i < 4; i++) this.prev[i] = this.pos[i]
+
     if (this.route.length < 2) {
       this.stuck = true
       return

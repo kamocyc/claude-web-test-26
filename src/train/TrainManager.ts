@@ -2,8 +2,10 @@ import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { TrackNetwork } from './network'
 import type { Leg, TrackPoint } from './network'
-import { STATION_MIN_GAP, Train } from './trains'
+import { CAR_LEN, STATION_MIN_GAP, Train } from './trains'
 import type { Resolve, Station } from './trains'
+import { carColliders } from './impact'
+import type { Collider } from '../world/collision'
 import { buildStationGeometry, buildTrainMesh, signMaterial } from '../render/trainMeshes'
 import { buildMaterial } from '../render/buildMeshes'
 import { pointAt } from '../track/track'
@@ -30,6 +32,7 @@ export class TrainManager {
   readonly trains: Train[] = []
 
   private readonly groups = new Map<number, StationGroup>()
+  private readonly carScratch: Collider[] = []
   private signMesh: THREE.Mesh | null = null
   private readonly trainMeshes = new Map<Train, THREE.Group>()
   private selection: readonly number[] = []
@@ -157,6 +160,29 @@ export class TrainManager {
       this.trainMeshes.delete(train)
     }
     return true
+  }
+
+  /**
+   * 付近の車体の当たり判定を `out` に**追記する**（`BuildGrid.collectColliders` と同じ約束）。
+   * これで列車は壁と同じように扱われ、屋根の上に立てるようになる。
+   */
+  collectColliders(
+    x: number,
+    z: number,
+    r: number,
+    out: Collider[],
+    y0 = -1e5,
+    y1 = 1e5,
+  ): Collider[] {
+    const reach = r + CAR_LEN
+    for (const t of this.trains) {
+      if (Math.abs(t.pos[0] - x) > reach || Math.abs(t.pos[2] - z) > reach) continue
+      for (const c of carColliders(t.pos, this.carScratch)) {
+        if (c.maxY <= y0 || c.minY >= y1) continue
+        out.push({ ...c })
+      }
+    }
+    return out
   }
 
   /** その位置にいちばん近い列車。 */

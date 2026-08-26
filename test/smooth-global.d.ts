@@ -37,12 +37,16 @@ export interface SmoothDebug {
   trains: number
   /** 列車に乗っているか。 */
   riding: boolean
+  /** 列車にはねられた回数。 */
+  trainHits: number
   /** デバッグ用の無制限モードが入っているか。 */
   unlimited: boolean
   inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
   teleport(x: number, z: number): void
+  /** 高さも指定して置く（足場の上へ直に降ろせる）。 */
+  placeAt(x: number, y: number, z: number): void
   gotoVillage(): boolean
   nearestTree(): { x: number; y: number; z: number; r: number; h: number } | null
   treeColliders(): number[]
@@ -193,6 +197,32 @@ export interface SmoothDebug {
   leaveTrain(): void
   /** いま乗っているか（乗り降りした直後でも正しい）。 */
   isRiding(): boolean
+  /** 車体の当たり判定（`[前半, 運転台]` の 2 つ）。 */
+  trainColliders(index?: number): {
+    ox: number
+    oz: number
+    minX: number
+    maxX: number
+    minZ: number
+    maxZ: number
+    minY: number
+    maxY: number
+  }[]
+  /** いま列車の上に立っているか。立っていればその天面の高さ。 */
+  standingOnTrain(): number | null
+  /** いま居る MOB の一覧。 */
+  mobList(): {
+    kind: string
+    x: number
+    y: number
+    z: number
+    vx: number
+    vy: number
+    vz: number
+    hp: number
+  }[]
+  /** 指定の場所に MOB を湧かせる。 */
+  spawnMobAt(kind: 'wraith' | 'deer' | 'villager', x: number, y: number, z: number): boolean
   /** いま伸ばそうとしている端点。 */
   railhead(): { x: number; y: number; z: number; yaw: number } | null
   clearRailhead(): void

@@ -7,6 +7,7 @@ import { createNoiseTexture } from './render/proceduralTextures'
 import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
 import { VillageManager } from './world/VillageManager'
 import type { Box } from './world/village'
+import { worldToLocal } from './world/collision'
 import type { Collider } from './world/collision'
 import { World, createTreeHit } from './world/World'
 import { boxBrush, orientedBoxBrush, snapBoxCenter, sphereBrush } from './world/edits'
@@ -60,6 +61,8 @@ import { MAX_PILLAR } from './track/TrackGraph'
 import { TrainManager } from './train/TrainManager'
 import { CAR_LEN, STATION_COST, TRAIN_COST } from './train/trains'
 import type { Train } from './train/trains'
+import { carColliders, trainImpact } from './train/impact'
+import type { Impact } from './train/impact'
 
 const VIEW_DISTANCE = 7
 const REACH = 9
@@ -116,6 +119,11 @@ const TRAIN_PICK = 5
 /** 列車に乗り込める距離（m）と、降りたときに脇へよける距離（m）。 */
 const RIDE_RANGE = 4.5
 const RIDE_OFF = 2.6
+
+/** 一度はねられてから、次にはねられるまでの間（秒）。轢かれ続けないための猶予。 */
+const TRAIN_HIT_COOLDOWN = 1.2
+/** はね飛ばされたときに地面から浮かせる高さ（m）。摩擦に食われないようにする。 */
+const TRAIN_HIT_LIFT_OFF = 0.15
 
 /** 狙点の近くでレールヘッドを拾う距離（m）。 */
 const RAILHEAD_RANGE = 4
@@ -377,6 +385,16 @@ async function boot(): Promise<void> {
   let routeSel: number[] = []
   /** いま乗っている列車。 */
   let riding: Train | null = null
+  /** 起動からの経過秒。はねられた間隔を測るのに使う。 */
+  let elapsed = 0
+  /** 次にはねられるまでの残り時間（プレイヤーぶん）。 */
+  let trainHitCd = 0
+  /** MOB がはねられた時刻。消えた MOB を掴んだままにしないよう WeakMap で持つ。 */
+  const mobHitAt = new WeakMap<object, number>()
+  /** 当たり判定と、はねられた結果の置き場（毎フレーム使い回す）。 */
+  const carScratch: Collider[] = []
+  const impactScratch: Impact = { nx: 0, nz: 0, push: 0, lift: 0, damage: 0 }
+  const roofScratch = [0, 0]
 
   function invalidateTrack(): void {
     trackKey = ''
@@ -505,6 +523,7 @@ async function boot(): Promise<void> {
     build.clear()
     tracks.clear()
     trains.clear()
+    stats.trainHits = 0
     railhead = null
     riding = null
     routeSel = []
@@ -590,6 +609,8 @@ async function boot(): Promise<void> {
     trains: 0,
     /** 列車に乗っているか。 */
     riding: false,
+    /** 列車にはねられた回数。 */
+    trainHits: 0,
     /** デバッグ用の無制限モードが入っているか。 */
     unlimited: false,
     /** 素材の手持ち量（grass, dirt, rock, sand）。 */
@@ -619,6 +640,15 @@ async function boot(): Promise<void> {
       // 落下待ちを挟まずすぐ接地するよう、地面のすぐ上に置く
       player.position.y -= 1.0
       world.update(x, player.position.y, z)
+    },
+    /**
+     * 高さも指定して置く（テスト用）。地表を探さないので、
+     * 列車の屋根の上のような**足場の上**へ直に降ろせる。
+     */
+    placeAt(x: number, y: number, z: number) {
+      player.position.set(x, y, z)
+      player.velocity.set(0, 0, 0)
+      world.update(x, y, z)
     },
     /** 一番近い木の根元の位置と幹の当たり判定（デバッグ／テスト用）。 */
     nearestTree(): { x: number; y: number; z: number; r: number; h: number } | null {
@@ -1148,6 +1178,53 @@ async function boot(): Promise<void> {
     isRiding(): boolean {
       return riding !== null
     },
+    /** 車体の当たり判定（走行中の位置で組み立てたもの）。 */
+    trainColliders(index = 0) {
+      const t = trains.trains[index]
+      if (!t) return []
+      return carColliders(t.pos, []).map((c) => ({
+        ox: c.ox ?? 0,
+        oz: c.oz ?? 0,
+        minX: c.minX,
+        maxX: c.maxX,
+        minZ: c.minZ,
+        maxZ: c.maxZ,
+        minY: c.minY,
+        maxY: c.maxY,
+      }))
+    },
+    /** いま列車の上に立っているか（立っているなら、その天面の高さ）。 */
+    standingOnTrain(): number | null {
+      let best: number | null = null
+      for (const t of trains.trains) {
+        for (const c of carColliders(t.pos, carScratch)) {
+          if (player.position.y < c.maxY - 0.1 || player.position.y > c.maxY + 0.35) continue
+          worldToLocal(c, player.position.x, player.position.z, roofScratch)
+          const r = player.radius
+          if (roofScratch[0] <= c.minX - r || roofScratch[0] >= c.maxX + r) continue
+          if (roofScratch[1] <= c.minZ - r || roofScratch[1] >= c.maxZ + r) continue
+          if (best === null || c.maxY > best) best = c.maxY
+        }
+      }
+      return best
+    },
+    /** いま居る MOB の一覧（はね飛ばされたかを見るのに使う）。 */
+    mobList() {
+      return mobs.mobs.map((m) => ({
+        kind: m.def.kind as string,
+        x: m.pos.x,
+        y: m.pos.y,
+        z: m.pos.z,
+        vx: m.vel.x,
+        vy: m.vel.y,
+        vz: m.vel.z,
+        hp: m.hp,
+      }))
+    },
+    /** 指定の場所に MOB を湧かせる（テスト用）。 */
+    spawnMobAt(kind: 'wraith' | 'deer' | 'villager', x: number, y: number, z: number) {
+      return mobs.spawn(kind, x, y, z) !== null
+    },
     /** 最寄りの村の広場へ移動する。見つからなければ false。 */
     gotoVillage(): boolean {
       const cx = Math.floor(player.position.x / VILLAGE_CELL)
@@ -1229,7 +1306,8 @@ async function boot(): Promise<void> {
       // 村の建物（out を空にして詰める）に、建てたパーツを足す
       villages.collidersNear(x, z, r, out)
       build.collectColliders(x, z, r, out, y - 2, y + 4)
-      return tracks.collectColliders(x, z, r, out, y - 2, y + 4)
+      tracks.collectColliders(x, z, r, out, y - 2, y + 4)
+      return trains.collectColliders(x, z, r, out, y - 2, y + 4)
     },
   }
 
@@ -1955,6 +2033,90 @@ async function boot(): Promise<void> {
     player.velocity.set(0, 0, 0)
   }
 
+  /**
+   * 屋根の上に立っているあいだは、列車が動いたぶんだけ一緒に運ぶ（動く床）。
+   *
+   * 押し出しと接地は既存の箱の仕組みに任せてあるので、ここでやるのは
+   * **足元の車体が動いた量を足す**ことだけ。判定は 1 フレーム前の車体（`prev`）で行う。
+   * プレイヤーが立っていたのはそちらだから。
+   */
+  function carryOnRoof(): void {
+    for (const t of trains.trains) {
+      const dx = t.pos[0] - t.prev[0]
+      const dy = t.pos[1] - t.prev[1]
+      const dz = t.pos[2] - t.prev[2]
+      if (dx === 0 && dy === 0 && dz === 0) continue
+      for (const c of carColliders(t.prev, carScratch)) {
+        const feet = player.position.y
+        if (feet < c.maxY - 0.06 || feet > c.maxY + 0.35) continue
+        worldToLocal(c, player.position.x, player.position.z, roofScratch)
+        const r = player.radius
+        if (roofScratch[0] <= c.minX - r || roofScratch[0] >= c.maxX + r) continue
+        if (roofScratch[1] <= c.minZ - r || roofScratch[1] >= c.maxZ + r) continue
+        player.position.x += dx
+        player.position.y += dy
+        player.position.z += dz
+        return
+      }
+    }
+  }
+
+  /**
+   * 走っている列車が、線路の上のプレイヤーや MOB をはねる。
+   *
+   * 押しのけ（{@link Player.resolveBoxes}）より**先に**見る。あとから見ると
+   * 車体の横へ押し出されたあとになってしまい、当たったことに気づけない。
+   */
+  function applyTrainImpacts(dt: number): void {
+    trainHitCd = Math.max(0, trainHitCd - dt)
+    for (const t of trains.trains) {
+      if (t === riding) continue
+
+      if (!riding && trainHitCd <= 0 && health > 0) {
+        const hit = trainImpact(
+          t.pos,
+          t.speed,
+          player.position.x,
+          player.position.y,
+          player.position.z,
+          player.radius,
+          player.height,
+          impactScratch,
+        )
+        if (hit) {
+          trainHitCd = TRAIN_HIT_COOLDOWN
+          stats.trainHits++
+          hurtPlayer(hit.damage)
+          // やられて復帰したときは、その場所へ飛ばさない
+          if (health > 0) {
+            player.position.y += TRAIN_HIT_LIFT_OFF
+            player.velocity.set(hit.nx * hit.push, hit.lift, hit.nz * hit.push)
+            player.onGround = false
+            hud.showToast('列車にはねられた！')
+          }
+        }
+      }
+
+      for (const m of mobs.mobs) {
+        if (elapsed - (mobHitAt.get(m) ?? -1e9) < TRAIN_HIT_COOLDOWN) continue
+        const hit = trainImpact(
+          t.pos,
+          t.speed,
+          m.pos.x,
+          m.pos.y,
+          m.pos.z,
+          m.def.radius,
+          m.def.height,
+          impactScratch,
+        )
+        if (!hit) continue
+        mobHitAt.set(m, elapsed)
+        m.pos.y += TRAIN_HIT_LIFT_OFF
+        mobs.knock(m, hit.damage, hit.nx, hit.nz, hit.push, hit.lift)
+      }
+    }
+  }
+
   /** 区間の終点を、次に伸ばせる端点として取り出す。 */
   function endOf(seg: Segment): TrackEnd {
     const e = segmentEnd(seg)
@@ -1965,11 +2127,20 @@ async function boot(): Promise<void> {
     requestAnimationFrame(tick)
     const dt = Math.min(clock.getDelta(), 0.1)
     frames++
+    elapsed += dt
+
+    // 列車はプレイヤーより先に動かす。当たり判定・乗り上げ・はねられを
+    // すべて「いまの車体」で決められる
+    if (started) {
+      trains.update(dt)
+      applyTrainImpacts(dt)
+    }
 
     if (started && riding) {
       // 乗車中は自分では歩かない。視線だけ自由に回せる
       carryRider()
     } else if (started && controls.locked) {
+      carryOnRoof()
       player.update(dt, world, controls)
     }
 
@@ -2001,6 +2172,14 @@ async function boot(): Promise<void> {
       player.position.y - 1.2,
       player.position.y + player.height + 0.5,
     )
+    trains.collectColliders(
+      player.position.x,
+      player.position.z,
+      1.2,
+      player.boxes,
+      player.position.y - 1.2,
+      player.position.y + player.height + 0.5,
+    )
     build.rebuild()
     tracks.rebuild(surfaceY)
 
@@ -2012,7 +2191,6 @@ async function boot(): Promise<void> {
     // --- MOB と松明 ---
     const daylight = sky.daylight
     if (started) {
-      trains.update(dt)
       mobs.update(dt, world, player.position.x, player.position.y, player.position.z, daylight)
       torches.update(dt, camera.position.x, camera.position.y, camera.position.z)
       // 少し経つと体力が戻る
