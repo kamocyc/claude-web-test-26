@@ -30,6 +30,8 @@ export interface SmoothDebug {
   torches: number
   /** 置いた建築パーツの数。 */
   pieces: number
+  /** 敷いた軌道の区間数。 */
+  tracks: number
   inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
@@ -81,6 +83,50 @@ export interface SmoothDebug {
   removePieceAt(x: number, y: number, z: number, range?: number): boolean
   pieceCount(): number
   buildColliders(): number
+  trackCount(): number
+  trackColliders(): number
+  /** 軌道の種類（rail / road）を選ぶ。 */
+  setTrackKind(name: string): boolean
+  /** 1 区間の長さ（m）。 */
+  setTrackLength(m: number): void
+  /** 照準の点を渡して、本番と同じ経路で敷く。 */
+  trackAim(x: number, y: number, z: number, itemId?: string): string
+  trackAt(
+    x: number,
+    y: number,
+    z: number,
+    range?: number,
+  ): {
+    kind: string
+    x: number
+    y: number
+    z: number
+    yaw: number
+    curve: number
+    length: number
+    rise: number
+    mat: number
+    endX: number
+    endY: number
+    endZ: number
+    endYaw: number
+  } | null
+  /** 敷いてある区間を敷いた順に並べたもの。 */
+  trackList(): {
+    kind: string
+    x: number
+    y: number
+    z: number
+    endX: number
+    endY: number
+    endZ: number
+    length: number
+    curve: number
+  }[]
+  removeTrackAt(x: number, y: number, z: number, range?: number): boolean
+  /** いま伸ばそうとしている端点。 */
+  railhead(): { x: number; y: number; z: number; yaw: number } | null
+  clearRailhead(): void
   craftedVertices(): number
   setTool(name: string): void
   setTime(hours: number | null): void

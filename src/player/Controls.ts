@@ -19,11 +19,14 @@ export class Controls {
 
   onSlot: ((index: number) => void) | null = null
   onToggleFly: (() => void) | null = null
-  /** B キー: ブラシの切り替え */
+  /** B キー: ブラシの切り替え（球 → 直方体 → ならし → 建築 → 軌道） */
   onCycleTool: (() => void) | null = null
-  /** R キー: 建築パーツの切り替え（壁 → 窓 → 戸口 → 床 → 階段 → 屋根 → ブロック） */
+  /**
+   * R キー: 建築パーツの切り替え（壁 → 窓 → 戸口 → 床 → 階段 → 屋根 → ブロック）。
+   * 軌道モードでは 線路 ⇄ 道路 の切り替えになる。
+   */
   onCyclePiece: (() => void) | null = null
-  /** 中クリック: 建築の回転を既定へ戻す */
+  /** 中クリック: 建築の回転を既定へ戻す。軌道モードでは接続を切って新しい線を始める */
   onResetRotation: (() => void) | null = null
   /** T キー: 時刻の切り替え（デバッグ） */
   onCycleTime: (() => void) | null = null

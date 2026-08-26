@@ -27,6 +27,8 @@ export interface SaveMeta {
    */
   pieces?: number[]
   pieces2?: number[]
+  /** 敷いた線路・道路（`TrackGraph.serialize()` の平坦配列）。 */
+  tracks?: number[]
   /** 伐採した木のセルキー。 */
   chopped: number[]
 }

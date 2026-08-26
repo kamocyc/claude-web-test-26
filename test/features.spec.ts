@@ -209,10 +209,10 @@ async function lookDown(page: Page): Promise<void> {
 }
 
 test.describe('ブラシの切り替え', () => {
-  test('B キーで 球 → 直方体 → ならし → 建築 と巡回する', async ({ page }) => {
+  test('B キーで 球 → 直方体 → ならし → 建築 → 軌道 と巡回する', async ({ page }) => {
     await start(page)
     expect((await api(page)).tool).toBe('sphere')
-    for (const expected of ['box', 'smooth', 'build', 'sphere']) {
+    for (const expected of ['box', 'smooth', 'build', 'track', 'sphere']) {
       await page.keyboard.press('KeyB')
       // 数 fps しか出ないので、次のフレームで stats が更新されるまで待つ
       await page.waitForFunction((t) => window.__smooth?.tool === t, expected, { timeout: 10_000 })
