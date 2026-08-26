@@ -3,6 +3,7 @@ import type { Collider } from '../world/collision'
 import { colliderBounds, obbOverlap, rayCollider } from '../world/collision'
 import {
   DECK_T,
+  GRADE_TOL,
   MAX_SEG_LEN,
   MIN_SEG_LEN,
   TRACK_INFO,
@@ -31,7 +32,7 @@ export type SolidFn = (x: number, y: number, z: number) => boolean
 /**
  * 敷設の可否を測るための地形。
  *
- * `ground` は橋脚の高さを見るための地表面（素の地形で十分）。
+ * `ground` は橋脚の高さと切り盛りの量を見るための地表面。
  * `solid` を渡すと「軌道の上に地面が被っているか」をそちらで見るので、
  * **プレイヤーが掘った切通しがそのまま反映される**。渡さなければ `ground` で代用する。
  */
@@ -52,8 +53,8 @@ export const JOIN_RANGE = 2.5
 /** 繋ぐときに許す向きの食い違い（ラジアン）。これを超えると折れ目扱い。 */
 export const JOIN_MAX_ANGLE = (20 * Math.PI) / 180
 
-/** 地面が軌道面よりこれ以上高いと「切土が必要」。 */
-export const BURY_TOL = 0.4
+/** 段差を直したとみなす余裕（m）。切土の限界ちょうどの地面を弾かないための遊び。 */
+const GRADE_SLACK = 0.05
 
 /** 橋脚の高さの上限（m）。 */
 export const MAX_PILLAR = 14
@@ -416,9 +417,11 @@ export class TrackGraph {
   }
 
   /**
-   * 敷けるかどうか。地形は書き換えないので、
-   * **軌道より上に出ている地面があれば置けない**（プレイヤーが自分で切土する）。
-   * 逆に地面が低いところは橋脚で支えるが、高すぎる橋脚は認めない。
+   * 敷けるかどうか。
+   *
+   * 路盤との差が {@link GRADE_TOL} までの地面は敷くときに切り盛りして合わせるので通す。
+   * それを超えて高い地面は切土が深すぎるので置けず（プレイヤーが自分で掘る）、
+   * 逆に低いところは橋脚で渡すが、高すぎる橋脚は認めない。
    */
   check(
     seg: Segment,
@@ -452,7 +455,9 @@ export class TrackGraph {
       const y = pts[i * 4 + 1]
       const z = pts[i * 4 + 2]
       const g = terrain.ground(x, z)
-      const buried = terrain.solid ? terrain.solid(x, y + BURY_TOL, z) : g > y + BURY_TOL
+      // 路盤の底面から GRADE_TOL までは敷くときに削るので、そこまでは埋まっていない扱い
+      const cutTop = y - DECK_T + GRADE_TOL + GRADE_SLACK
+      const buried = terrain.solid ? terrain.solid(x, cutTop, z) : g > cutTop
       const high = y - g > MAX_PILLAR
       if (!buried && !high) continue
       if (!trim) return buried ? 'buried' : 'toohigh'

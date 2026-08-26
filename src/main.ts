@@ -8,7 +8,7 @@ import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
 import { VillageManager } from './world/VillageManager'
 import type { Box } from './world/village'
 import { World, createTreeHit } from './world/World'
-import { boxBrush, snapBoxCenter, sphereBrush } from './world/edits'
+import { boxBrush, orientedBoxBrush, snapBoxCenter, sphereBrush } from './world/edits'
 import { WorldStore } from './world/storage'
 import {
   CHUNK_SIZE,
@@ -44,6 +44,7 @@ import { TrackManager } from './track/TrackManager'
 import type { TrackEnd, TrackPlan } from './track/TrackManager'
 import {
   DEFAULT_SEG_LEN,
+  GRADE_TOL,
   MAX_SEG_LEN,
   MIN_SEG_LEN,
   TRACK_INFO,
@@ -52,6 +53,8 @@ import {
   segmentEnd,
 } from './track/track'
 import type { Segment, TrackKind } from './track/track'
+import { gradeOps } from './track/grading'
+import { MAX_PILLAR } from './track/TrackGraph'
 import { TrainManager } from './train/TrainManager'
 import { CAR_LEN, STATION_COST, TRAIN_COST } from './train/trains'
 import type { Train } from './train/trains'
@@ -88,7 +91,7 @@ const TRACK_INTERVAL = 0.24
 /** 敷けない理由の説明。 */
 const TRACK_REASON: Record<string, string> = {
   overlap: 'そこには他の軌道と重なってしまいます',
-  buried: '地面に埋まってしまいます（先に掘って切通しを作ってください）',
+  buried: '切土が深すぎます（先に掘って切通しを作ってください）',
   toohigh: '高すぎて橋脚が立てられません',
   kink: '繋ぐ相手との向きが違いすぎます（回り込んでください）',
 }
@@ -584,6 +587,12 @@ async function boot(): Promise<void> {
     dig(x: number, y: number, z: number, r = 2.5) {
       world.applyBrush(x, y, z, sphereBrush(r), 'dig', MATERIAL_INFO[0].id)
     },
+    /** 指定座標へ球ブラシで盛る（テスト用。照準を通さず直接叩く）。 */
+    fill(x: number, y: number, z: number, r = 2.5, itemId = 'rock') {
+      const def = tryItem(itemId)
+      if (def?.material === undefined) return
+      world.applyBrush(x, y, z, sphereBrush(r), 'place', def.material)
+    },
     /** 近くの木の当たり判定（縦円柱。x, y, 半径, 高さ の順で 5 要素ずつ）。 */
     treeColliders(): number[] {
       return Array.from(
@@ -783,6 +792,10 @@ async function boot(): Promise<void> {
     trackCount(): number {
       return tracks.count
     },
+    /** 掘った跡・盛った跡まで含めた地表の高さ（テスト用）。 */
+    surfaceAt(x: number, z: number): number {
+      return surfaceY(x, z)
+    },
     /** 敷いた軌道が持つ当たり判定の箱の数。 */
     trackColliders(): number {
       return tracks.colliderCount
@@ -827,6 +840,7 @@ async function boot(): Promise<void> {
       if (plan.check !== 'ok') return plan.check
       if (!tracks.placePlan(plan)) return 'overlap'
       inventory.take(def.id, cost)
+      gradeTerrain(plan.seg)
       refreshNetwork()
       railhead = plan.joinTo ? null : endOf(plan.seg)
       invalidateTrack()
@@ -1201,14 +1215,72 @@ async function boot(): Promise<void> {
 
   const isSolidAt = (x: number, y: number, z: number): boolean => world.isSolid(x, y, z)
 
-  /** 橋脚の足元に使う地表の高さ。掘った跡は反映されないが、支柱の見た目には十分。 */
-  const groundY = (x: number, z: number): number => world.field.height(x, z)
+  /** 地表を探すときの刻みと、二分で詰める回数（4 cm まで詰まる）。 */
+  const SURFACE_STEP = 0.4
+  const SURFACE_REFINE = 3
 
   /**
-   * 軌道の敷設可否を測る地形。被りの判定だけは密度場を直接見るので、
+   * 地表の高さ。**掘った跡も盛った跡も反映される**ので、
+   * 切り盛りしたところに橋脚が立ったり、同じ場所を二度盛ったりしない。
+   *
+   * 素の地形の高さから上下に探して、固体と空の境目を二分で詰める。
+   * たいていは 1〜2 歩で見つかるので、素の高さを引くのとほとんど変わらない。
+   */
+  const surfaceY = (x: number, z: number): number => {
+    const h = world.field.height(x, z)
+    const hi = h + GRADE_TOL + 1
+    const lo = h - MAX_PILLAR - 1
+    let solid: number
+    let air: number
+    if (world.isSolid(x, h, z)) {
+      let y = h
+      while (y < hi && world.isSolid(x, y + SURFACE_STEP, z)) y += SURFACE_STEP
+      solid = y
+      air = y + SURFACE_STEP
+    } else {
+      let y = h
+      while (y > lo && !world.isSolid(x, y - SURFACE_STEP, z)) y -= SURFACE_STEP
+      // 下に何も無い（水の中や空洞）ときは素の地形に任せる
+      if (y <= lo) return h
+      solid = y - SURFACE_STEP
+      air = y
+    }
+    for (let i = 0; i < SURFACE_REFINE; i++) {
+      const mid = (solid + air) / 2
+      if (world.isSolid(x, mid, z)) solid = mid
+      else air = mid
+    }
+    return solid
+  }
+
+  /**
+   * 軌道の敷設可否を測る地形。被りの判定は密度場を直接見るので、
    * **自分で掘った切通しはそのまま「通れる」ようになる**。
    */
-  const trackTerrain = { ground: groundY, solid: isSolidAt }
+  const trackTerrain = { ground: surfaceY, solid: isSolidAt }
+
+  /**
+   * 敷いた区間に合わせて地形を切り盛りする。
+   *
+   * 差が {@link GRADE_TOL} 以下のところだけを直す。深い谷は橋脚に任せ、
+   * 高すぎる山はそもそも敷けない（{@link TrackGraph.check} が弾く）。
+   * ならしブラシと同じで、**手持ちの材料は増減させない**
+   * （削った土も盛った土も、路盤を整えるぶんとして帳消しにする）。
+   */
+  function gradeTerrain(seg: Segment): void {
+    const ops = gradeOps(seg, surfaceY)
+    if (ops.length === 0) return
+    world.applyBrushBatch(
+      ops.map((o) => ({
+        x: o.x,
+        y: o.y,
+        z: o.z,
+        shape: orientedBoxBrush(o.hx, o.hy, o.hz, o.yaw),
+        mode: o.mode,
+        material: o.mat,
+      })),
+    )
+  }
 
   function pieceKind(name: string): PieceKind | null {
     const i = PIECE_KINDS.indexOf(name as PieceKind)
@@ -1438,7 +1510,7 @@ async function boot(): Promise<void> {
     const plan = trackPlan
     const cost = segmentCost(plan.seg)
     const enough = buildable && held !== null && inventory.count(held.id) >= cost
-    tracks.setGhost(plan, plan.check === 'ok' && enough, groundY)
+    tracks.setGhost(plan, plan.check === 'ok' && enough, surfaceY)
     hud.setBrush(brushLabel())
 
     if (editCooldown > 0) return
@@ -1480,6 +1552,7 @@ async function boot(): Promise<void> {
     }
     if (tracks.placePlan(plan)) {
       inventory.take(held.id, cost)
+      gradeTerrain(plan.seg)
       refreshNetwork()
       // 繋ぎ切ったら線は閉じ、そうでなければ終点が次のレールヘッドになる
       railhead = plan.joinTo ? null : endOf(plan.seg)
@@ -1719,7 +1792,7 @@ async function boot(): Promise<void> {
       player.position.y + player.height + 0.5,
     )
     build.rebuild()
-    tracks.rebuild(groundY)
+    tracks.rebuild(surfaceY)
 
     // 水中は視界を濁らせる
     const underwater = camera.position.y < SEA_LEVEL
@@ -1745,7 +1818,7 @@ async function boot(): Promise<void> {
       camera.getWorldDirection(lookDir)
       editCooldown -= dt
       updateBuildMode()
-      tracks.setGhost(null, false, groundY)
+      tracks.setGhost(null, false, surfaceY)
       ghost.visible = false
       boxGhost.visible = false
     } else if (started && controls.locked && TOOLS[tool].id === 'station') {
@@ -1753,7 +1826,7 @@ async function boot(): Promise<void> {
       editCooldown -= dt
       updateStationMode()
       build.setGhost(null, false)
-      tracks.setGhost(null, false, groundY)
+      tracks.setGhost(null, false, surfaceY)
       ghost.visible = false
       boxGhost.visible = false
     } else if (started && controls.locked && TOOLS[tool].id === 'track') {
@@ -1765,7 +1838,7 @@ async function boot(): Promise<void> {
       boxGhost.visible = false
     } else if (started && controls.locked) {
       build.setGhost(null, false)
-      tracks.setGhost(null, false, groundY)
+      tracks.setGhost(null, false, surfaceY)
       if (controls.wheel !== 0) {
         brushRadius = clamp(brushRadius - Math.sign(controls.wheel) * 0.5, MIN_BRUSH, MAX_BRUSH)
         controls.wheel = 0
@@ -1928,7 +2001,7 @@ async function boot(): Promise<void> {
       ghost.visible = false
       boxGhost.visible = false
       build.setGhost(null, false)
-      tracks.setGhost(null, false, groundY)
+      tracks.setGhost(null, false, surfaceY)
       hud.setBrush(brushLabel())
     }
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Box3, BufferGeometry } from 'three'
 import { buildTrackGeometry } from '../src/render/trackMeshes'
-import { DECK_T } from '../src/track/track'
+import { DECK_T, GRADE_TOL } from '../src/track/track'
 import type { Segment } from '../src/track/track'
 import { MAT_ROCK } from '../src/world/constants'
 
@@ -24,6 +24,16 @@ describe('軌道のジオメトリ', () => {
     // 8 m 下に地面があれば、そこまで柱が下りる
     expect(bounds(raised.body).min.y).toBeLessThan(2)
     expect(bounds(raised.body).min.y).toBeGreaterThan(2 - 1.5)
+  })
+
+  it('切り盛りで埋まるくらいの差なら橋脚は立てない', () => {
+    const deck = 10 - DECK_T
+    // 敷くと盛られて埋まる差 → 橋脚なし（ゴーストと置いたあとの見た目が一致する）
+    const shallow = buildTrackGeometry(seg(), () => deck - GRADE_TOL + 0.3)
+    expect(bounds(shallow.body).min.y).toBeGreaterThan(deck - 0.1)
+    // 盛らずに渡す深さ → 橋脚あり
+    const deep = buildTrackGeometry(seg(), () => deck - GRADE_TOL - 0.3)
+    expect(bounds(deep.body).min.y).toBeLessThan(deck - GRADE_TOL)
   })
 
   it('見た目の天面が歩ける面（中心線の高さ）と一致する', () => {

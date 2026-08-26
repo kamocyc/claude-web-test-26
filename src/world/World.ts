@@ -16,8 +16,8 @@ import {
 import { DensityField } from './density'
 import { Chunk, TREE_FIELDS, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
 import type { EditMap } from './Chunk'
-import { applyBrush, applySmoothBrush, isLooseMaterial, settleLoose } from './edits'
-import type { BrushBounds, BrushMode, BrushShape } from './edits'
+import { applyBrush, applyBrushes, applySmoothBrush, isLooseMaterial, settleLoose } from './edits'
+import type { BrushBounds, BrushMode, BrushOp, BrushShape } from './edits'
 import { TREE_CELL, TREE_STRIDE, treeCellKey } from './vegetation'
 import { WorkerPool } from './WorkerPool'
 import type { TreePrototype } from '../render/treeMeshes'
@@ -380,6 +380,27 @@ export class World {
     bounds.maxX = Math.max(bounds.maxX, s.maxX)
     bounds.maxY = Math.max(bounds.maxY, s.maxY)
     bounds.maxZ = Math.max(bounds.maxZ, s.maxZ)
+  }
+
+  /**
+   * 複数のブラシをまとめて掛ける。何も変化しなければ null。
+   *
+   * 崩れ（{@link settleLoose}）は起こさない。軌道の切り盛りのように
+   * **形をそのまま残したい**編集のためのもので、掛けた箱の面がそのまま地面になる。
+   * メッシュの作り直しは最後に 1 回だけなので、細かい箱を何十本並べても
+   * 1 回の編集と同じ負荷で済む。
+   */
+  applyBrushBatch(ops: readonly BrushOp[]): BrushBounds | null {
+    if (ops.length === 0) return null
+    const bounds = applyBrushes(
+      ops,
+      this.readD,
+      this.readMat,
+      this.writeCorner,
+      WORLD_MIN_Y + 2,
+      WORLD_MAX_Y - 2,
+    )
+    return this.finishEdit(bounds)
   }
 
   /** 凸凹をならす。何も変化しなければ null。 */

@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   applyBrush,
+  applyBrushes,
   applySmoothBrush,
   boxBrush,
+  orientedBoxBrush,
   snapBoxCenter,
   sphereBrush,
 } from '../src/world/edits'
@@ -119,6 +121,106 @@ describe('直方体ブラシ', () => {
       if (e > worst) worst = e
     }
     expect(worst).toBeLessThan(0.12)
+  })
+})
+
+describe('回した直方体ブラシ', () => {
+  /** 局所 +x が右・+z が後ろ。回した箱の符号付き距離。 */
+  function turnedSdf(
+    px: number,
+    py: number,
+    pz: number,
+    cx: number,
+    cy: number,
+    cz: number,
+    hx: number,
+    hy: number,
+    hz: number,
+    yaw: number,
+  ): number {
+    const dx = px - cx
+    const dz = pz - cz
+    const cos = Math.cos(yaw)
+    const sin = Math.sin(yaw)
+    const lx = dx * cos - dz * sin
+    const lz = dx * sin + dz * cos
+    const qx = Math.abs(lx) - hx
+    const qy = Math.abs(py - cy) - hy
+    const qz = Math.abs(lz) - hz
+    return (
+      Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0)) +
+      Math.min(Math.max(qx, qy, qz), 0)
+    )
+  }
+
+  it('回転させないときは軸に沿った直方体ブラシと同じ', () => {
+    const a = makeGrid(() => 20)
+    const b = makeGrid(() => 20)
+    applyBrush(C, C, C, boxBrush(H, H, H), 'dig', 0, a.readD, a.readMat, a.write, -1000, 1000)
+    const rot = orientedBoxBrush(H, H, H, 0)
+    applyBrush(C, C, C, rot, 'dig', 0, b.readD, b.readMat, b.write, -1000, 1000)
+    for (let i = 0; i < a.d.length; i++) expect(b.d[i]).toBeCloseTo(a.d[i], 9)
+  })
+
+  it('斜めに掘ると、その向きの直方体の面が出る', () => {
+    const yaw = 0.6
+    const g = makeGrid(() => 20)
+    applyBrush(
+      C,
+      C,
+      C,
+      orientedBoxBrush(1.5, 2, 5, yaw),
+      'dig',
+      0,
+      g.readD,
+      g.readMat,
+      g.write,
+      -1000,
+      1000,
+    )
+    const m = surfaceNets(g.d, 0, 0, 0, null, null)
+    expect(m).not.toBeNull()
+    let worst = 0
+    let far = 0
+    for (let i = 0; i < m!.positions.length; i += 3) {
+      const e = Math.abs(
+        turnedSdf(
+          m!.positions[i],
+          m!.positions[i + 1],
+          m!.positions[i + 2],
+          C,
+          C,
+          C,
+          1.5,
+          2,
+          5,
+          yaw,
+        ),
+      )
+      if (e > worst) worst = e
+      const d = Math.hypot(m!.positions[i] - C, m!.positions[i + 2] - C)
+      if (d > far) far = d
+    }
+    // 面取りは最大でも 1 格子の半分
+    expect(worst).toBeLessThan(0.5)
+    // 長辺の向きに伸びている（回っていなければ 5 まで届かない）
+    expect(far).toBeGreaterThan(4.5)
+  })
+
+  it('まとめて掛けても 1 本ずつ掛けたのと同じ結果になる', () => {
+    const one = makeGrid((_x, y) => -y)
+    const many = makeGrid((_x, y) => -y)
+    const ops = [
+      { x: C - 2, y: C, z: C, shape: orientedBoxBrush(2, 1, 3, 0.4), mode: 'place' as const, material: 2 },
+      { x: C + 2, y: C + 1, z: C, shape: orientedBoxBrush(2, 1, 3, -0.7), mode: 'dig' as const, material: 0 },
+    ]
+    for (const o of ops) {
+      applyBrush(o.x, o.y, o.z, o.shape, o.mode, o.material, one.readD, one.readMat, one.write, -1000, 1000)
+    }
+    const bounds = applyBrushes(ops, many.readD, many.readMat, many.write, -1000, 1000)
+    for (let i = 0; i < one.d.length; i++) expect(many.d[i]).toBeCloseTo(one.d[i], 9)
+    expect(bounds.touched).toBeGreaterThan(0)
+    expect(bounds.solidified).toBeGreaterThan(0)
   })
 })
 

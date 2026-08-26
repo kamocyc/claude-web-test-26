@@ -97,17 +97,7 @@ export function boxBrush(hx: number, hy: number, hz: number): BrushShape {
     ex: ax,
     ey: ay,
     ez: az,
-    sdf: (dx, dy, dz) => {
-      const qx = Math.abs(dx) - ax
-      const qy = Math.abs(dy) - ay
-      const qz = Math.abs(dz) - az
-      const ox = qx > 0 ? qx : 0
-      const oy = qy > 0 ? qy : 0
-      const oz = qz > 0 ? qz : 0
-      const outside = Math.sqrt(ox * ox + oy * oy + oz * oz)
-      const inside = Math.min(Math.max(qx, qy, qz), 0)
-      return outside + inside
-    },
+    sdf: (dx, dy, dz) => boxSdf(dx, dy, dz, ax, ay, az),
     span: (dx, dz, out) => {
       const hit = Math.abs(dx) <= ax && Math.abs(dz) <= az
       out.lo = hit ? -ay : 1
@@ -115,6 +105,57 @@ export function boxBrush(hx: number, hy: number, hz: number): BrushShape {
       return out
     },
   }
+}
+
+/**
+ * Y 軸まわりに回した直方体ブラシ。半サイズは m、`yaw` はラジアン。
+ *
+ * 回転の規約は {@link Collider} と同じで、**局所 +x が右、局所 +z が後ろ**。
+ * だから `hx` が幅方向、`hz` が進行方向の半サイズになり、軌道の 1 コマを
+ * そのまま切り盛りできる。走査範囲は回した箱を包む大きさに広げる。
+ */
+export function orientedBoxBrush(hx: number, hy: number, hz: number, yaw: number): BrushShape {
+  const ax = hx / VOXEL_SIZE
+  const ay = hy / VOXEL_SIZE
+  const az = hz / VOXEL_SIZE
+  const cos = Math.cos(yaw)
+  const sin = Math.sin(yaw)
+  const ac = Math.abs(cos)
+  const as = Math.abs(sin)
+  return {
+    ex: ax * ac + az * as,
+    ey: ay,
+    ez: ax * as + az * ac,
+    sdf: (dx, dy, dz) => boxSdf(dx * cos - dz * sin, dy, dx * sin + dz * cos, ax, ay, az),
+    span: (dx, dz, out) => {
+      const lx = dx * cos - dz * sin
+      const lz = dx * sin + dz * cos
+      const hit = Math.abs(lx) <= ax && Math.abs(lz) <= az
+      out.lo = hit ? -ay : 1
+      out.hi = hit ? ay : -1
+      return out
+    },
+  }
+}
+
+/** 中心を原点とする軸平行の直方体の符号付き距離。 */
+function boxSdf(
+  dx: number,
+  dy: number,
+  dz: number,
+  ax: number,
+  ay: number,
+  az: number,
+): number {
+  const qx = Math.abs(dx) - ax
+  const qy = Math.abs(dy) - ay
+  const qz = Math.abs(dz) - az
+  const ox = qx > 0 ? qx : 0
+  const oy = qy > 0 ? qy : 0
+  const oz = qz > 0 ? qz : 0
+  const outside = Math.sqrt(ox * ox + oy * oy + oz * oz)
+  const inside = Math.min(Math.max(qx, qy, qz), 0)
+  return outside + inside
 }
 
 /**
@@ -363,6 +404,55 @@ export function applyBrush(
   // --- 3. 変化した格子点だけ書き戻す ---
   writeBack(reg, bounds, write)
   return bounds
+}
+
+/** まとめて掛けるブラシ 1 本ぶんの指定。 */
+export interface BrushOp {
+  x: number
+  y: number
+  z: number
+  shape: BrushShape
+  mode: BrushMode
+  /** 置くときの素材。掘るときは使われない。 */
+  material: number
+}
+
+/**
+ * 複数のブラシを順に掛け、影響範囲をひとまとめにして返す。
+ *
+ * 1 本ずつ掛けるのと結果は同じだが、**呼び出し側がメッシュの作り直しを 1 回で済ませられる**。
+ * 軌道の切り盛りのように、細かい箱を何十本も並べて掛ける用途向け。
+ */
+export function applyBrushes(
+  ops: readonly BrushOp[],
+  readD: CornerReader,
+  readMat: CornerMatReader,
+  write: CornerWriter,
+  clampMinY: number,
+  clampMaxY: number,
+): BrushBounds {
+  const total = emptyBounds()
+  for (const op of ops) {
+    const b = applyBrush(
+      op.x,
+      op.y,
+      op.z,
+      op.shape,
+      op.mode,
+      op.material,
+      readD,
+      readMat,
+      write,
+      clampMinY,
+      clampMaxY,
+    )
+    total.solidified += b.solidified
+    total.cleared += b.cleared
+    total.fragmentsRemoved += b.fragmentsRemoved
+    total.looseTouched += b.looseTouched
+    mergeBounds(total, b)
+  }
+  return total
 }
 
 /** 球ブラシ。既存の呼び出し向けの薄いラッパ。 */

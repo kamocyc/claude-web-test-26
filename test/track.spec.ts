@@ -36,7 +36,7 @@ async function goToFlatGround(page: Page): Promise<void> {
 /**
  * 平らで開けた向きを探して、そちらを向く。
  *
- * 村の広場でも一方向は丘に突き当たる。地形を書き換えない仕様なので、
+ * 村の広場でも一方向は丘に突き当たる。切り盛りで直せるのは小さな段差までなので、
  * 丘へ向けて敷けば途中で切り詰められて当然。ここで測りたいのはそこではないため、
  * **足元に地面があって頭上が塞がっていない**向きを選んでから敷く。
  */
@@ -236,5 +236,55 @@ test.describe('軌道モード', () => {
     expect(result.removed).toBe(true)
     expect(result.count).toBe(0)
     expect(result.after).toBe(result.before)
+  })
+  test('小さな段差は、敷くと地形のほうが路盤に合う（切り盛り）', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 10)
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      // 8 m 先から、見ている向きへ 10 m の線を敷く
+      const ax = p.x + dx * 8
+      const az = p.z + dz * 8
+      // 線の途中に 1.2 m のくぼみと 1.4 m の出っ張りを作る
+      const hollow = { x: ax + dx * 3, z: az + dz * 3 }
+      const mound = { x: ax + dx * 7, z: az + dz * 7 }
+      s.dig(hollow.x, s.surfaceAt(hollow.x, hollow.z) + 0.8, hollow.z, 2)
+      s.fill(mound.x, s.surfaceAt(mound.x, mound.z) + 0.2, mound.z, 1.2)
+      const before = {
+        hollow: s.surfaceAt(hollow.x, hollow.z),
+        mound: s.surfaceAt(mound.x, mound.z),
+      }
+
+      const placed = s.trackAim(ax, p.y, az)
+      const seg = s.trackList()[0]
+      const after = {
+        hollow: s.surfaceAt(hollow.x, hollow.z),
+        mound: s.surfaceAt(mound.x, mound.z),
+      }
+      return { placed, seg, before, after, hollow, mound }
+    }, dir)
+
+    expect(r.placed).toBe('ok')
+    // 掘ったところは下がり、盛ったところは上がっている（測る対象がちゃんとできている）
+    expect(r.before.hollow).toBeLessThan(r.before.mound - 1.5)
+
+    // 区間は直線なので、注目点の路盤の底面は始点と終点の線形補間で出せる
+    const seg = r.seg
+    const deckBottom = (x: number, z: number): number => {
+      const t = Math.hypot(x - seg.x, z - seg.z) / seg.length
+      return seg.y + (seg.endY - seg.y) * t - 0.35
+    }
+
+    // くぼみは築堤で埋まり、出っ張りは切土で削られて、どちらも路盤の底面に合う
+    expect(Math.abs(r.after.hollow - deckBottom(r.hollow.x, r.hollow.z))).toBeLessThan(0.3)
+    expect(Math.abs(r.after.mound - deckBottom(r.mound.x, r.mound.z))).toBeLessThan(0.3)
+    // 実際に地形が動いている
+    expect(r.after.hollow - r.before.hollow).toBeGreaterThan(0.6)
+    expect(r.before.mound - r.after.mound).toBeGreaterThan(0.6)
   })
 })

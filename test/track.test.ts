@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   DECK_T,
+  GRADE_TOL,
   MAX_SEG_LEN,
   MIN_SEG_LEN,
   TRACK_INFO,
@@ -319,6 +320,19 @@ describe('敷設', () => {
     const again = planFrom(g, null, [0, 0, 0])
     expect(again.check).toBe('overlap')
     expect(g.place(again.seg)).toBe(false)
+  })
+
+  it('少しの段差なら敷ける（敷くときに切り盛りして合わせる）', () => {
+    const g = graphWith()
+    // 路盤の底面は狙点と同じ高さなので、地面が GRADE_TOL まで高くても切土で通る
+    expect(planFrom(g, null, [0, 0, 0], level(GRADE_TOL - 0.5)).check).toBe('ok')
+    // 低いほうは橋脚で渡すので、もともと通る
+    expect(planFrom(new TrackGraph(), null, [0, 0, 0], level(-GRADE_TOL - 3)).check).toBe('ok')
+  })
+
+  it('切土が深すぎる区間は敷けない', () => {
+    const g = graphWith()
+    expect(planFrom(g, null, [0, 0, 0], level(GRADE_TOL + 1)).check).toBe('buried')
   })
 
   it('地面に埋まる区間は敷けない', () => {

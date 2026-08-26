@@ -45,6 +45,7 @@ export interface SmoothDebug {
   nearestTree(): { x: number; y: number; z: number; r: number; h: number } | null
   treeColliders(): number[]
   dig(x: number, y: number, z: number, r?: number): void
+  fill(x: number, y: number, z: number, r?: number, itemId?: string): void
   giveMaterial(index: number, amount: number): void
   give(id: string, amount: number): void
   itemCount(id: string): number
@@ -88,6 +89,7 @@ export interface SmoothDebug {
   removePieceAt(x: number, y: number, z: number, range?: number): boolean
   pieceCount(): number
   buildColliders(): number
+  surfaceAt(x: number, z: number): number
   trackCount(): number
   trackColliders(): number
   /** 軌道の種類（rail / road）を選ぶ。 */

@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { quadFacing } from './geoUtil'
-import { DECK_T, TRACK_INFO, pointAt, sampleSegment } from '../track/track'
+import { DECK_T, GRADE_TOL, TRACK_INFO, pointAt, sampleSegment } from '../track/track'
 import type { Segment } from '../track/track'
 
 /** 軌間（レール中心の間隔、m）。 */
@@ -15,8 +15,6 @@ const TIE_SPACING = 1.2
 /** 橋脚の間隔（m）と柱の半径（m）。 */
 const PILLAR_SPACING = 3
 const PILLAR_HALF = 0.22
-/** 橋脚を立て始める地面との差（m）。 */
-const PILLAR_MIN = 0.3
 
 /** レールの鋼色。素材が何であれレールはこの色で描く。 */
 export const railMaterial = new THREE.MeshStandardMaterial({
@@ -43,8 +41,9 @@ export interface TrackGeometry {
  * 区間 1 本のジオメトリ。
  *
  * 当たり判定（{@link segmentColliders}）と同じ刻みの点列から作るので、
- * **見えている面と歩ける面が必ず一致する**。地面が路盤より低いところには
- * 橋脚（トレッスル）を自動で立てて、宙に浮いて見えないようにする。
+ * **見えている面と歩ける面が必ず一致する**。地面が路盤よりずっと低いところには
+ * 橋脚（トレッスル）を自動で立てて、宙に浮いて見えないようにする
+ * （少しの差は敷くときに切り盛りで埋まるので、橋脚は立てない）。
  */
 export function buildTrackGeometry(
   seg: Segment,
@@ -80,7 +79,9 @@ export function buildTrackGeometry(
   forEachStation(seg, PILLAR_SPACING, (x, y, z, yaw) => {
     const deck = y - DECK_T
     const g = ground(x, z)
-    if (deck - g < PILLAR_MIN) return
+    // 差が GRADE_TOL までのところは敷くときに盛って埋まるので橋脚は要らない。
+    // ゴーストも同じ規則で描くので、**見えているものがそのまま置かれる**
+    if (deck - g <= GRADE_TOL) return
     const top = deck + 0.05
     const foot = g - 0.6
     for (const side of [-1, 1]) {
