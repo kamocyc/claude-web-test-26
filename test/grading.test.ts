@@ -5,6 +5,7 @@ import {
   GRADE_MARGIN,
   GRADE_STEP,
   gradeOps,
+  gradeVolume,
 } from '../src/track/grading'
 import type { GradeOp } from '../src/track/grading'
 import { DECK_T, GRADE_TOL, TRACK_INFO, pointAt } from '../src/track/track'
@@ -129,5 +130,37 @@ describe('切り盛り', () => {
 
   it('長さ 0 の区間では何もしない', () => {
     expect(gradeOps(seg({ length: 0 }), level(-1))).toHaveLength(0)
+  })
+
+  it('動かす土の量が、幅 × 長さ × 高さの差になる', () => {
+    const s = seg({ y: DECK_T, length: 12 })
+    const width = (TRACK_INFO.rail.width / 2 + GRADE_MARGIN) * 2
+
+    // 1 m 低い地面を 12 m ぶん埋める
+    const low = gradeVolume(s, level(-1))
+    expect(low.cut).toBe(0)
+    expect(low.fill).toBeCloseTo(width * s.length * 1, 6)
+
+    // 0.8 m 高い地面を 12 m ぶん削る
+    const high = gradeVolume(s, level(0.8))
+    expect(high.fill).toBe(0)
+    expect(high.cut).toBeCloseTo(width * s.length * 0.8, 6)
+
+    // そろっていれば土は動かない
+    expect(gradeVolume(s, level(0))).toEqual({ fill: 0, cut: 0 })
+  })
+
+  it('橋脚に任せる深さでは土を積まない（材料も要らない）', () => {
+    const s = seg({ y: DECK_T })
+    expect(gradeVolume(s, level(-GRADE_TOL - 0.5)).fill).toBe(0)
+  })
+
+  it('切土の量は路盤の上に出ているぶんだけ（空を削るぶんは数えない）', () => {
+    const s = seg({ y: DECK_T })
+    const width = (TRACK_INFO.rail.width / 2 + GRADE_MARGIN) * 2
+    // 掘る箱の高さは CUT_CLEAR（3 m）だが、地面は 1 m しか出ていない
+    const v = gradeVolume(s, level(1))
+    expect(v.cut).toBeCloseTo(width * s.length * 1, 6)
+    expect(v.cut).toBeLessThan(width * s.length * CUT_CLEAR)
   })
 })

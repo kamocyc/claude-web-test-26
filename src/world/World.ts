@@ -388,9 +388,9 @@ export class World {
    * 崩れ（{@link settleLoose}）は起こさない。軌道の切り盛りのように
    * **形をそのまま残したい**編集のためのもので、掛けた箱の面がそのまま地面になる。
    * メッシュの作り直しは最後に 1 回だけなので、細かい箱を何十本並べても
-   * 1 回の編集と同じ負荷で済む。
+   * 1 回の編集と同じ負荷で済む。`each` を渡すと 1 本ごとの結果も受け取れる。
    */
-  applyBrushBatch(ops: readonly BrushOp[]): BrushBounds | null {
+  applyBrushBatch(ops: readonly BrushOp[], each?: BrushBounds[]): BrushBounds | null {
     if (ops.length === 0) return null
     const bounds = applyBrushes(
       ops,
@@ -399,6 +399,7 @@ export class World {
       this.writeCorner,
       WORLD_MIN_Y + 2,
       WORLD_MAX_Y - 2,
+      each,
     )
     return this.finishEdit(bounds)
   }

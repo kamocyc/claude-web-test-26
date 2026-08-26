@@ -46,6 +46,16 @@ export interface GradeOp {
   hz: number
   /** 盛土に使う素材（切土では使わない）。 */
   mat: number
+  /**
+   * 実際に動く土の量の見積もり（m³）。幅 × 刻み × 地面と路盤の差。
+   *
+   * 箱そのものの体積ではない。盛土の箱は根入れのぶん地面へ食い込んでいるし、
+   * 切土の箱は列車が通る空間のぶん空を含んでいて、どちらもその部分は土が動かない。
+   * 継ぎ目の重なり（`hz` の 5 %）も、土が二重に動くわけではないので刻みのぶんで数える。
+   * 支払い前の見積もり（{@link gradeVolume}）に使う。実際の請求は
+   * ブラシが数えた格子点の数で行う。
+   */
+  volume: number
 }
 
 /**
@@ -85,7 +95,8 @@ export function gradeOps(seg: Segment, ground: GroundFn, out: GradeOp[] = []): G
     const gr = ground(x + rx, z + rz)
 
     // 切土: 肩まで含めていちばん高いところが路盤より上なら削る
-    if (Math.max(gc, gl, gr) > deck + GRADE_MIN) {
+    const highest = Math.max(gc, gl, gr)
+    if (highest > deck + GRADE_MIN) {
       out.push({
         mode: 'dig',
         x,
@@ -96,6 +107,8 @@ export function gradeOps(seg: Segment, ground: GroundFn, out: GradeOp[] = []): G
         hy: CUT_CLEAR / 2,
         hz,
         mat: seg.mat,
+        // 削るのは路盤より上に出ているぶんだけ（それより上はもともと空）
+        volume: 2 * half * ds * Math.min(highest - deck, CUT_CLEAR),
       })
     }
 
@@ -114,6 +127,8 @@ export function gradeOps(seg: Segment, ground: GroundFn, out: GradeOp[] = []): G
         hy: (deck - foot) / 2,
         hz,
         mat: seg.mat,
+        // 積むのは地面から路盤までのぶんだけ（根入れのぶんはもともと土）
+        volume: 2 * half * ds * fill,
       })
     }
   }
@@ -121,3 +136,22 @@ export function gradeOps(seg: Segment, ground: GroundFn, out: GradeOp[] = []): G
 }
 
 const PT = [0, 0, 0, 0]
+
+/**
+ * 切り盛りで動く土の量の見積もり（m³）。盛る量と削る量を別々に返す。
+ *
+ * 敷く前に「材料が足りるか」を測って HUD に出すためのもの。実際の請求と受け取りは
+ * ブラシが数えた格子点の数で行うので、ここはあくまで目安（格子は 1 m なので、
+ * 体積と格子点の数はだいたい同じ数字になる）。
+ */
+export function gradeVolume(seg: Segment, ground: GroundFn): { fill: number; cut: number } {
+  let fill = 0
+  let cut = 0
+  for (const o of gradeOps(seg, ground, VOLUME_SCRATCH)) {
+    if (o.mode === 'place') fill += o.volume
+    else cut += o.volume
+  }
+  return { fill, cut }
+}
+
+const VOLUME_SCRATCH: GradeOp[] = []

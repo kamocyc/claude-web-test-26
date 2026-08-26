@@ -422,6 +422,9 @@ export interface BrushOp {
  *
  * 1 本ずつ掛けるのと結果は同じだが、**呼び出し側がメッシュの作り直しを 1 回で済ませられる**。
  * 軌道の切り盛りのように、細かい箱を何十本も並べて掛ける用途向け。
+ *
+ * `each` を渡すと 1 本ごとの結果もそこへ順に積む。掘った土の素材は場所ごとに違うので、
+ * **どの箱がどれだけ掘ったか**を知りたい呼び出し側はこれを使う。
  */
 export function applyBrushes(
   ops: readonly BrushOp[],
@@ -430,6 +433,7 @@ export function applyBrushes(
   write: CornerWriter,
   clampMinY: number,
   clampMaxY: number,
+  each?: BrushBounds[],
 ): BrushBounds {
   const total = emptyBounds()
   for (const op of ops) {
@@ -451,6 +455,7 @@ export function applyBrushes(
     total.fragmentsRemoved += b.fragmentsRemoved
     total.looseTouched += b.looseTouched
     mergeBounds(total, b)
+    each?.push(b)
   }
   return total
 }

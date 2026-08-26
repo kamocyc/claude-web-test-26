@@ -37,6 +37,8 @@ export interface SmoothDebug {
   trains: number
   /** 列車に乗っているか。 */
   riding: boolean
+  /** デバッグ用の無制限モードが入っているか。 */
+  unlimited: boolean
   inventory: number[]
   look(yaw: number, pitch: number): void
   state(): SmoothState
@@ -49,6 +51,8 @@ export interface SmoothDebug {
   giveMaterial(index: number, amount: number): void
   give(id: string, amount: number): void
   itemCount(id: string): number
+  /** 無制限モードでも変わらない、実際に溜めてある量。 */
+  storedCount(id: string): number
   equip(id: string): void
   craft(out: string): boolean
   craftable(): string[]
@@ -90,6 +94,14 @@ export interface SmoothDebug {
   pieceCount(): number
   buildColliders(): number
   surfaceAt(x: number, z: number): number
+  /** デバッグ用の無制限モードを切り替える（F4 と同じ）。戻り値はいまの状態。 */
+  setUnlimited(on: boolean): boolean
+  /** 近くの区間を敷くのに要る材料（軌道のぶんと、切り盛りする土の量）。 */
+  trackCostAt(
+    x: number,
+    y: number,
+    z: number,
+  ): { rail: number; fill: number; cut: number } | null
   trackCount(): number
   trackColliders(): number
   /** 軌道の種類（rail / road）を選ぶ。 */

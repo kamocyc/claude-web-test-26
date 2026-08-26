@@ -146,4 +146,38 @@ describe('保存', () => {
     expect(inv.whole('nope')).toBe(0)
     expect(inv.whole('dirt')).toBe(0)
   })
+
+  it('無制限モードでは払えるが、溜めた量は減らない', () => {
+    const inv = new Inventory()
+    inv.add('rock', 10)
+    inv.unlimited = true
+
+    // 手持ちが無いものでも払える
+    expect(inv.count('plank')).toBeGreaterThan(1e6)
+    expect(inv.take('plank', 500)).toBe(true)
+    expect(inv.takeUpTo('plank', 500)).toBe(500)
+    // 溜めてある量には手をつけない
+    expect(inv.stored('plank')).toBe(0)
+    expect(inv.take('rock', 4)).toBe(true)
+    expect(inv.stored('rock')).toBe(10)
+
+    // 戻せば元の量から続けられる
+    inv.unlimited = false
+    expect(inv.count('rock')).toBe(10)
+    expect(inv.count('plank')).toBe(0)
+    expect(inv.take('plank', 1)).toBe(false)
+  })
+
+  it('無制限モードでは持ち物にすべて並び、レシピも作れる', () => {
+    const inv = new Inventory()
+    expect(inv.owned()).toHaveLength(0)
+    inv.unlimited = true
+    expect(inv.owned().length).toBeGreaterThan(10)
+    const plank = RECIPES.find((r) => r.out === 'plank')!
+    expect(inv.canCraft(plank)).toBe(true)
+    expect(inv.craft(plank)).toBe(true)
+    // 作ったものは実際に溜まる（戻したときに使える）
+    expect(inv.stored('plank')).toBe(plank.count)
+    expect(inv.stored('wood')).toBe(0)
+  })
 })

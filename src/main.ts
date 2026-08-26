@@ -9,6 +9,7 @@ import { VillageManager } from './world/VillageManager'
 import type { Box } from './world/village'
 import { World, createTreeHit } from './world/World'
 import { boxBrush, orientedBoxBrush, snapBoxCenter, sphereBrush } from './world/edits'
+import type { BrushBounds } from './world/edits'
 import { WorldStore } from './world/storage'
 import {
   CHUNK_SIZE,
@@ -53,7 +54,7 @@ import {
   segmentEnd,
 } from './track/track'
 import type { Segment, TrackKind } from './track/track'
-import { gradeOps } from './track/grading'
+import { gradeOps, gradeVolume } from './track/grading'
 import { MAX_PILLAR } from './track/TrackGraph'
 import { TrainManager } from './train/TrainManager'
 import { CAR_LEN, STATION_COST, TRAIN_COST } from './train/trains'
@@ -303,7 +304,7 @@ async function boot(): Promise<void> {
     }
     if (t.id === 'track') {
       const info = TRACK_INFO[TRACK_KINDS[trackIndex]]
-      const cost = trackPlan ? `　材料 ${segmentCost(trackPlan.seg)}` : ''
+      const cost = trackPlan ? `　材料 ${planCost(trackPlan.seg).label}` : ''
       const head = trackPlan?.from ? '' : '　新しい線'
       return `${t.name} ${info.name}${cost}${hand}${head}　R:線路/道路　ホイール:長さ ${segLen} m`
     }
@@ -339,6 +340,8 @@ async function boot(): Promise<void> {
    * `brushLabel()` が材料の表示に読むので、ここで持つ。
    */
   let trackKey = ''
+  /** 敷く前に見積もった材料（照準が動いたら作り直す）。 */
+  let trackCostCache: { total: number; label: string } | null = null
   let trackPlan: TrackPlan | null = null
   /** 路線を組み立てている最中に選んだ駅（選んだ順）。 */
   let routeSel: number[] = []
@@ -347,6 +350,7 @@ async function boot(): Promise<void> {
 
   function invalidateTrack(): void {
     trackKey = ''
+    trackCostCache = null
   }
   let statsVisible = true
   let started = false
@@ -429,6 +433,20 @@ async function boot(): Promise<void> {
   controls.onToggleStats = () => {
     statsVisible = !statsVisible
     hud.setStatsVisible(statsVisible)
+  }
+  controls.onToggleUnlimited = () => setUnlimited(!inventory.unlimited)
+
+  /**
+   * デバッグ用の無制限モード。溜めた量はそのままに、支払いだけを素通しにする。
+   * 何を建てても減らないので、線路や建築の形をいろいろ試すのに使う。
+   */
+  function setUnlimited(on: boolean): void {
+    if (inventory.unlimited === on) return
+    inventory.unlimited = on
+    hud.refresh()
+    hud.setBrush(brushLabel())
+    invalidateTrack()
+    hud.showToast(on ? 'デバッグ: 材料を無制限にした（F4 で戻す）' : '材料の制限を戻した')
   }
   controls.onLockChange = (locked) => {
     if (!locked && started && !hud.panelOpen && !hud.tradeOpen) hud.setOverlay(true)
@@ -535,6 +553,8 @@ async function boot(): Promise<void> {
     trains: 0,
     /** 列車に乗っているか。 */
     riding: false,
+    /** デバッグ用の無制限モードが入っているか。 */
+    unlimited: false,
     /** 素材の手持ち量（grass, dirt, rock, sand）。 */
     inventory: [0, 0, 0, 0] as number[],
     /** 視線角を直接設定する。 */
@@ -639,6 +659,10 @@ async function boot(): Promise<void> {
     /** 持ち物の個数。 */
     itemCount(id: string): number {
       return inventory.whole(id)
+    },
+    /** 無制限モードでも変わらない、実際に溜めてある量（テスト用）。 */
+    storedCount(id: string): number {
+      return Math.floor(inventory.stored(id))
     },
     /** ホットバーの枠にアイテムを入れて選ぶ（テスト用）。 */
     equip(id: string) {
@@ -796,6 +820,18 @@ async function boot(): Promise<void> {
     surfaceAt(x: number, z: number): number {
       return surfaceY(x, z)
     },
+    /** デバッグ用の無制限モードを切り替える（F4 と同じ）。 */
+    setUnlimited(on: boolean): boolean {
+      setUnlimited(on)
+      return inventory.unlimited
+    },
+    /** 1 区間を敷くのに要る材料の見積もり（軌道 + 築堤）。 */
+    trackCostAt(x: number, y: number, z: number): { rail: number; fill: number; cut: number } | null {
+      const s2 = tracks.nearest(x, y, z, 14)
+      if (!s2) return null
+      const v = gradeVolume(s2, surfaceY)
+      return { rail: segmentCost(s2), fill: v.fill, cut: v.cut }
+    },
     /** 敷いた軌道が持つ当たり判定の箱の数。 */
     trackColliders(): number {
       return tracks.colliderCount
@@ -835,11 +871,11 @@ async function boot(): Promise<void> {
         camYaw: controls.yaw,
         terrain: trackTerrain,
       })
-      const cost = segmentCost(plan.seg)
+      const cost = trackCost(plan.seg)
       if (inventory.count(def.id) < cost) return 'short'
       if (plan.check !== 'ok') return plan.check
       if (!tracks.placePlan(plan)) return 'overlap'
-      inventory.take(def.id, cost)
+      inventory.take(def.id, segmentCost(plan.seg))
       gradeTerrain(plan.seg)
       refreshNetwork()
       railhead = plan.joinTo ? null : endOf(plan.seg)
@@ -1264,12 +1300,15 @@ async function boot(): Promise<void> {
    *
    * 差が {@link GRADE_TOL} 以下のところだけを直す。深い谷は橋脚に任せ、
    * 高すぎる山はそもそも敷けない（{@link TrackGraph.check} が弾く）。
-   * ならしブラシと同じで、**手持ちの材料は増減させない**
-   * （削った土も盛った土も、路盤を整えるぶんとして帳消しにする）。
+   *
+   * 土は掘削・設置とまったく同じ扱いで、**切土で出たぶんは手に入り、
+   * 盛土で積んだぶんは手持ちから減る**。掘ったところの素材はブラシ 1 本ごとに
+   * その場で見るので、草地を削れば草が、岩場を削れば岩が返る。
    */
   function gradeTerrain(seg: Segment): void {
     const ops = gradeOps(seg, surfaceY)
     if (ops.length === 0) return
+    gradeBounds.length = 0
     world.applyBrushBatch(
       ops.map((o) => ({
         x: o.x,
@@ -1279,7 +1318,53 @@ async function boot(): Promise<void> {
         mode: o.mode,
         material: o.mat,
       })),
+      gradeBounds,
     )
+    let filled = 0
+    for (let i = 0; i < ops.length && i < gradeBounds.length; i++) {
+      const o = ops[i]
+      const b = gradeBounds[i]
+      if (o.mode === 'place') {
+        filled += b.solidified
+      } else if (b.cleared > 0) {
+        // 削れたのは路盤のすぐ上。そこの素材を見て手持ちへ返す
+        creditDig(o.x, o.y - o.hy + 0.5, o.z, 1, b.cleared)
+      }
+    }
+    if (filled <= 0) return
+    const def = ITEM_BY_MATERIAL.get(seg.mat)
+    if (def) inventory.takeUpTo(def.id, filled)
+  }
+
+  const gradeBounds: BrushBounds[] = []
+
+  /**
+   * 1 区間を敷くのに要る材料。**軌道そのもの + 築堤で積む土**。
+   *
+   * 積む土の量は敷く前には見積もりでしか分からない（実際に何格子ぶん埋まるかは
+   * ブラシを掛けてみないと数えられない）ので、ここでは体積から見積もって
+   * 足りるかどうかの目安にし、請求はブラシが数えた実数で行う。
+   * 撤去で戻るのは軌道のぶんだけ（積んだ土は地形になったので、掘れば返ってくる）。
+   *
+   * 地面を測るのは安くないので、**ゴーストと同じタイミングでだけ**計算して使い回す。
+   */
+  function planCost(seg: Segment): { total: number; label: string } {
+    if (trackCostCache) return trackCostCache
+    const rail = segmentCost(seg)
+    const { fill, cut } = gradeVolume(seg, surfaceY)
+    const bank = Math.ceil(fill)
+    const dug = Math.floor(cut)
+    const label = bank > 0 ? `${rail}（+築堤 ${bank}）` : dug > 0 ? `${rail}（切土 +${dug}）` : `${rail}`
+    trackCostCache = { total: rail + bank, label }
+    return trackCostCache
+  }
+
+  /** 照準を通さない経路（テスト用フック）でも同じ見積もりを使う。 */
+  function trackCost(seg: Segment): number {
+    trackCostCache = null
+    const n = planCost(seg).total
+    trackCostCache = null
+    return n
   }
 
   function pieceKind(name: string): PieceKind | null {
@@ -1494,6 +1579,7 @@ async function boot(): Promise<void> {
     ].join('|')
     if (key !== trackKey || !trackPlan) {
       trackKey = key
+      trackCostCache = null
       trackPlan = tracks.plan({
         kind,
         mat,
@@ -1508,7 +1594,7 @@ async function boot(): Promise<void> {
       })
     }
     const plan = trackPlan
-    const cost = segmentCost(plan.seg)
+    const cost = planCost(plan.seg).total
     const enough = buildable && held !== null && inventory.count(held.id) >= cost
     tracks.setGhost(plan, plan.check === 'ok' && enough, surfaceY)
     hud.setBrush(brushLabel())
@@ -1551,7 +1637,7 @@ async function boot(): Promise<void> {
       return
     }
     if (tracks.placePlan(plan)) {
-      inventory.take(held.id, cost)
+      inventory.take(held.id, segmentCost(plan.seg))
       gradeTerrain(plan.seg)
       refreshNetwork()
       // 繋ぎ切ったら線は閉じ、そうでなければ終点が次のレールヘッドになる
@@ -2078,6 +2164,7 @@ async function boot(): Promise<void> {
     stats.stations = trains.stations.length
     stats.trains = trains.trains.length
     stats.riding = riding !== null
+    stats.unlimited = inventory.unlimited
     stats.trees = world.treeCount
     stats.tool = TOOLS[tool].id
     stats.timeOfDay = sky.timeOfDay

@@ -224,18 +224,25 @@ test.describe('軌道モード', () => {
       const p = s.state()
       const x = p.x + dx * 8
       const z = p.z + dz * 8
-      const before = s.itemCount('rock')
       const placed = s.trackAim(x, p.y, z)
-      const spent = before - s.itemCount('rock')
+      // 敷いたあとの手持ちを起点にする（切り盛りした土のぶんは戻らないので別勘定）
+      const laid = s.itemCount('rock')
+      const seg = s.trackList()[0]
       const removed = s.removeTrackAt(x, p.y, z, 14)
-      return { placed, spent, removed, after: s.itemCount('rock'), before, count: s.trackCount() }
+      return {
+        placed,
+        removed,
+        refund: s.itemCount('rock') - laid,
+        rail: Math.max(1, Math.round(seg.length * 4)), // 線路は 1 m あたり 4
+        count: s.trackCount(),
+      }
     }, dir)
 
     expect(result.placed).toBe('ok')
-    expect(result.spent).toBeGreaterThan(0)
     expect(result.removed).toBe(true)
     expect(result.count).toBe(0)
-    expect(result.after).toBe(result.before)
+    // 戻るのは線路のぶんきっかり
+    expect(result.refund).toBe(result.rail)
   })
   test('小さな段差は、敷くと地形のほうが路盤に合う（切り盛り）', async ({ page }) => {
     await start(page)
@@ -286,5 +293,118 @@ test.describe('軌道モード', () => {
     // 実際に地形が動いている
     expect(r.after.hollow - r.before.hollow).toBeGreaterThan(0.6)
     expect(r.before.mound - r.after.mound).toBeGreaterThan(0.6)
+  })
+  test('切り盛りした土のぶんだけ材料が増減する', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 8)
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      // 進行方向の右手。2 本の線を左右に離して敷き、互いに重ならないようにする
+      const rx = -dz
+      const rz = dx
+      const rail = (i: number): number => {
+        const seg = s.trackList()[i]
+        return Math.max(1, Math.round(seg.length * 4)) // 線路は 1 m あたり 4
+      }
+
+      // (1) くぼみをまたぐ線 — 築堤ぶん余計に材料を使うはず
+      const ax = p.x + dx * 8 - rx * 7
+      const az = p.z + dz * 8 - rz * 7
+      const hx = ax + dx * 4
+      const hz2 = az + dz * 4
+      s.dig(hx, s.surfaceAt(hx, hz2) + 0.8, hz2, 2.2)
+      s.clearRailhead()
+      const beforeA = s.itemCount('rock')
+      const placedA = s.trackAim(ax, s.surfaceAt(ax, az), az)
+      const spentA = beforeA - s.itemCount('rock')
+
+      // (2) 岩のこぶを削る線 — 削った岩が返るので、線路のぶんより安く済むはず
+      const bx = p.x + dx * 8 + rx * 7
+      const bz = p.z + dz * 8 + rz * 7
+      for (const t of [2, 5]) {
+        const mx = bx + dx * t
+        const mz = bz + dz * t
+        s.fill(mx, s.surfaceAt(mx, mz) + 0.2, mz, 1.5, 'rock')
+      }
+      s.clearRailhead()
+      const beforeB = s.itemCount('rock')
+      const placedB = s.trackAim(bx, s.surfaceAt(bx, bz), bz)
+      const spentB = beforeB - s.itemCount('rock')
+
+      return {
+        placedA,
+        placedB,
+        spentA,
+        spentB,
+        railA: rail(0),
+        railB: rail(1),
+        count: s.trackCount(),
+      }
+    }, dir)
+
+    expect([r.placedA, r.placedB]).toEqual(['ok', 'ok'])
+    expect(r.count).toBe(2)
+    // 築堤に積んだ土のぶん、線路そのものより多く払う
+    expect(r.spentA).toBeGreaterThan(r.railA)
+    // 切土で出た岩が返るので、線路そのものより安くなる
+    expect(r.spentB).toBeLessThan(r.railB)
+    expect(r.spentB).toBeLessThan(r.spentA)
+  })
+
+  test('F4 の無制限モードでは材料なしで敷け、溜めた量も減らない', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await page.evaluate(() => {
+      const s = window.__smooth!
+      s.equip('rock')
+      s.setTool('track')
+      s.setTrackKind('rail')
+      s.setTrackLength(8)
+      s.clearRailhead()
+      s.look(0, -0.35)
+    })
+    const dir = await faceOpenGround(page)
+
+    // 材料が無いので敷けない
+    const short = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      return { r: s.trackAim(p.x + dx * 8, p.y, p.z + dz * 8), rock: s.itemCount('rock') }
+    }, dir)
+    expect(short.rock).toBe(0)
+    expect(short.r).toBe('short')
+
+    // F4 で無制限モードへ
+    await page.keyboard.press('F4')
+    await page.waitForFunction(() => window.__smooth!.unlimited === true, null, { timeout: 10_000 })
+
+    const free = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      s.clearRailhead()
+      const r = s.trackAim(p.x + dx * 8, p.y, p.z + dz * 8)
+      return { r, count: s.trackCount(), stored: s.storedCount('rock') }
+    }, dir)
+    expect(free.r).toBe('ok')
+    expect(free.count).toBe(1)
+    // 溜めてある量は 0 のまま（無制限モードは払いを素通しするだけ）
+    expect(free.stored).toBe(0)
+
+    // もう一度押すと元に戻る
+    await page.keyboard.press('F4')
+    await page.waitForFunction(() => window.__smooth!.unlimited === false, null, { timeout: 10_000 })
+    const back = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      s.clearRailhead()
+      return { r: s.trackAim(p.x + dx * 20, p.y, p.z + dz * 20), rock: s.itemCount('rock') }
+    }, dir)
+    expect(back.rock).toBe(0)
+    expect(back.r).toBe('short')
   })
 })

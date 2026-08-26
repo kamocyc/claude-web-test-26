@@ -36,6 +36,8 @@ export class Controls {
   onInteract: (() => void) | null = null
   onLockChange: ((locked: boolean) => void) | null = null
   onToggleStats: (() => void) | null = null
+  /** F4 キー: デバッグ用に材料を無制限にする（もう一度押すと戻る） */
+  onToggleUnlimited: (() => void) | null = null
   /** デバッグ: 最寄りの村へワープ */
   onWarpVillage: (() => void) | null = null
 
@@ -99,6 +101,12 @@ export class Controls {
     if (e.code === 'F3') {
       e.preventDefault()
       this.onToggleStats?.()
+      return
+    }
+    if (e.code === 'F4') {
+      e.preventDefault()
+      // 押しっぱなしのキーリピートで何度も入れ替わらないように
+      if (!e.repeat) this.onToggleUnlimited?.()
       return
     }
     // 持ち物・交換の画面はポインタロックを外して開くので、
