@@ -33,25 +33,43 @@ async function layLine(page: Page): Promise<void> {
     s.clearRailhead()
     const p = s.state()
     let best = { dx: 0, dz: -1, reach: -1 }
+    const cands: { dx: number; dz: number; reach: number }[] = []
     for (let i = 0; i < 24; i++) {
       const a = (i / 24) * Math.PI * 2
       const dx = Math.cos(a)
       const dz = Math.sin(a)
       let reach = 0
-      for (let d = 2; d <= 40; d += 2) {
+      for (let d = 2; d <= 52; d += 2) {
         const x = p.x + dx * d
         const z = p.z + dz * d
         if (s.density(x, p.y + 0.35, z) > 0) break
         if (s.density(x, p.y - 2.5, z) <= 0) break
         reach = d
       }
+      cands.push({ dx, dz, reach })
       if (reach > best.reach) best = { dx, dz, reach }
     }
-    s.look(Math.atan2(-best.dx, -best.dz), -0.25)
-    const res: string[] = []
-    for (let i = 0; i < 3; i++) {
-      const d = 6 + i * 14
-      res.push(s.trackAim(p.x + best.dx * d, p.y, p.z + best.dz * d))
+    // 村の広場は家に囲まれているので、通りの良い向きから順に試す
+    // （家にぶつかると手前で止まるか敷けないので、その向きは捨てて次を試す）
+    cands.sort((a, b) => b.reach - a.reach)
+    const wipe = (): void => {
+      for (const t of s.trackList()) {
+        s.removeTrackAt((t.x + t.endX) / 2, (t.y + t.endY) / 2, (t.z + t.endZ) / 2, 6)
+      }
+      s.clearRailhead()
+    }
+    let res: string[] = []
+    for (const c of cands) {
+      if (c.reach < 40) break
+      s.look(Math.atan2(-c.dx, -c.dz), -0.25)
+      s.clearRailhead()
+      res = []
+      for (let i = 0; i < 3; i++) {
+        const d = 6 + i * 14
+        res.push(s.trackAim(p.x + c.dx * d, p.y, p.z + c.dz * d))
+      }
+      if (res.every((r) => r === 'ok')) break
+      wipe()
     }
     s.setTool('station')
     return { res, reach: best.reach, segs: s.trackList().length }

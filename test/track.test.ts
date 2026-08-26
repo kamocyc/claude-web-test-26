@@ -208,6 +208,8 @@ function planFrom(
   ground: GroundFn = flat,
   kind: TrackKind = 'rail',
   maxLen = 12,
+  grade: number | null = null,
+  obstacles?: Collider[],
 ): TrackPlan {
   return g.plan({
     kind,
@@ -218,7 +220,17 @@ function planFrom(
     aimY: aim[1],
     aimZ: aim[2],
     camYaw: 0,
-    terrain: { ground },
+    grade,
+    terrain: {
+      ground,
+      obstacles: obstacles
+        ? (_x, _z, _r, out) => {
+            out.length = 0
+            out.push(...obstacles)
+            return out
+          }
+        : undefined,
+    },
   })
 }
 
@@ -376,13 +388,89 @@ describe('敷設', () => {
     expect(planFrom(g, null, [0, 0, 0], level(-40)).check).toBe('toohigh')
   })
 
+  it('狙点が手前でも、ホイールで決めた長さまで伸びる', () => {
+    const g = graphWith()
+    const head: TrackEnd = { seg: null as never, atEnd: true, x: 0, y: 0, z: 0, yaw: 0 }
+    // 狙点は 5 m 先（手の届く範囲）。それでも 20 m 敷ける
+    const long = planFrom(g, head, [0, 0, -5], flat, 'rail', 20)
+    expect(long.seg.length).toBe(20)
+    expect(long.wanted).toBe(20)
+    expect(long.trim).toBe('none')
+    // 長さを変えればそのぶん伸び縮みする
+    expect(planFrom(g, head, [0, 0, -5], flat, 'rail', 8).seg.length).toBe(8)
+    expect(planFrom(g, head, [0, 0, -5], flat, 'rail', 24).seg.length).toBe(24)
+  })
+
+  it('狙点は曲がり方だけを決める（長さは変わらない）', () => {
+    const g = graphWith()
+    const head: TrackEnd = { seg: null as never, atEnd: true, x: 0, y: 0, z: 0, yaw: 0 }
+    const straight = planFrom(g, head, [0, 0, -6], flat, 'rail', 16).seg
+    const left = planFrom(g, head, [-4, 0, -6], flat, 'rail', 16).seg
+    const right = planFrom(g, head, [4, 0, -6], flat, 'rail', 16).seg
+    expect(straight.length).toBe(16)
+    expect(left.length).toBe(16)
+    expect(right.length).toBe(16)
+    expect(straight.curve).toBeCloseTo(0, 9)
+    expect(left.curve).toBeGreaterThan(0)
+    expect(right.curve).toBeLessThan(0)
+  })
+
+  it('勾配は自動なら終点の地面に合わせ、指定すればその勾配で伸びる', () => {
+    const g = graphWith()
+    const head: TrackEnd = { seg: null as never, atEnd: true, x: 0, y: 0, z: 0, yaw: 0 }
+    // 12 m 先が 0.24 m 高い坂（2 %）。自動ならそこへ乗るように登る
+    // （始端の高さ 0 は地面と同じなので、路盤の厚みぶんが上乗せされる）
+    const slope: GroundFn = (_x, z) => -z * 0.02
+    const auto = planFrom(g, head, [0, 0, -6], slope, 'rail', 12).seg
+    expect(auto.rise).toBeCloseTo(0.24 + DECK_T, 6)
+    expect(Math.abs(auto.rise / auto.length)).toBeLessThanOrEqual(TRACK_INFO.rail.maxGrade)
+
+    // 指定すればその勾配（上限まで）
+    const down = planFrom(g, head, [0, 0, -6], slope, 'rail', 12, -0.04).seg
+    expect(down.rise / down.length).toBeCloseTo(-0.04, 9)
+    const level = planFrom(g, head, [0, 0, -6], slope, 'rail', 12, 0).seg
+    expect(level.rise).toBe(0)
+  })
+
+  it('家にぶつかる区間は手前で止まり、理由が分かる', () => {
+    const g = graphWith()
+    const head: TrackEnd = { seg: null as never, atEnd: true, x: 0, y: 0, z: 0, yaw: 0 }
+    // 進行方向（-z）の 10 m 先に建物の壁
+    const wall: Collider = { minX: -4, maxX: 4, minY: -1, maxY: 4, minZ: -11, maxZ: -10 }
+    const plan = planFrom(g, head, [0, 0, -6], flat, 'rail', 20, null, [wall])
+    expect(plan.check).toBe('ok')
+    expect(plan.trim).toBe('blocked')
+    expect(plan.wanted).toBe(20)
+    expect(plan.seg.length).toBeLessThan(10)
+    expect(plan.seg.length).toBeGreaterThanOrEqual(MIN_SEG_LEN)
+    // 壁がすぐ目の前なら、そもそも敷けない
+    const near: Collider = { minX: -4, maxX: 4, minY: -1, maxY: 4, minZ: -3, maxZ: -2 }
+    expect(planFrom(g, head, [0, 0, -6], flat, 'rail', 20, null, [near]).check).toBe('blocked')
+  })
+
+  it('地面にぶつかって切り詰めたときも理由が分かる', () => {
+    const g = graphWith()
+    const cliff: GroundFn = (_x, z) => (z < -8 ? 20 : 0)
+    const plan = planFrom(g, null, [0, 0, 0], cliff, 'rail', 20)
+    expect(plan.check).toBe('ok')
+    expect(plan.trim).toBe('buried')
+    expect(plan.wanted).toBe(20)
+    expect(plan.seg.length).toBeLessThan(20)
+    // 平らなところなら切り詰めない
+    expect(planFrom(g, null, [40, 0, 40], flat, 'rail', 20).trim).toBe('none')
+  })
+
   it('道路は線路より小回りが利き、急坂も登れる', () => {
     const g = graphWith()
     const head: TrackEnd = { seg: null as never, atEnd: true, x: 0, y: 0, z: 0, yaw: 0 }
     const rail = planFrom(g, head, [-9, 3, -9], flat, 'rail', 20).seg
     const road = planFrom(g, head, [-9, 3, -9], flat, 'road', 20).seg
     expect(Math.abs(road.curve)).toBeGreaterThan(Math.abs(rail.curve))
-    expect(Math.abs(road.rise)).toBeGreaterThan(Math.abs(rail.rise))
+    // 同じ勾配を指定しても、上限が違うので道路のほうが急に登れる
+    const railUp = planFrom(g, head, [-9, 3, -9], flat, 'rail', 20, 0.3).seg
+    const roadUp = planFrom(g, head, [-9, 3, -9], flat, 'road', 20, 0.3).seg
+    expect(railUp.rise / railUp.length).toBeCloseTo(TRACK_INFO.rail.maxGrade, 9)
+    expect(roadUp.rise / roadUp.length).toBeCloseTo(TRACK_INFO.road.maxGrade, 9)
   })
 })
 

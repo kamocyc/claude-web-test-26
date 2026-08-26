@@ -44,7 +44,7 @@ async function faceOpenGround(page: Page): Promise<{ dx: number; dz: number; rea
   const dir = await page.evaluate(() => {
     const s = window.__smooth!
     const p = s.state()
-    let best = { dx: 0, dz: -1, reach: -1 }
+    const cands: { dx: number; dz: number; reach: number }[] = []
     for (let i = 0; i < 24; i++) {
       const a = (i / 24) * Math.PI * 2
       const dx = Math.cos(a)
@@ -57,11 +57,24 @@ async function faceOpenGround(page: Page): Promise<{ dx: number; dz: number; rea
         if (s.density(x, p.y - 2.5, z) <= 0) break // 足元が抜けている
         reach = d
       }
-      if (reach > best.reach) best = { dx, dz, reach }
+      cands.push({ dx, dz, reach })
     }
+    cands.sort((a, b) => b.reach - a.reach)
+    // 村の広場は家に囲まれているので、**見積もりが切り詰められない向き**を選ぶ
     // 前方 = (-sin(yaw), -cos(yaw))
-    s.look(Math.atan2(-best.dx, -best.dz), -0.3)
-    return best
+    let pick = cands[0]
+    for (const c of cands) {
+      if (c.reach < 28) break
+      s.look(Math.atan2(-c.dx, -c.dz), -0.3)
+      s.clearRailhead()
+      if (s.trackPreview(p.x + c.dx * 8, p.y, p.z + c.dz * 8).trim === 'none') {
+        pick = c
+        break
+      }
+    }
+    s.look(Math.atan2(-pick.dx, -pick.dz), -0.3)
+    s.clearRailhead()
+    return pick
   })
   expect(dir.reach, '村の周りに平らな向きが見つからない').toBeGreaterThanOrEqual(28)
   return dir
@@ -406,5 +419,118 @@ test.describe('軌道モード', () => {
     }, dir)
     expect(back.rock).toBe(0)
     expect(back.r).toBe('short')
+  })
+  test('ホイールで長さを伸ばすと、狙点が手前でも線路が伸びる', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 8)
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      // まず 1 本敷いて、その終点をレールヘッドにする
+      const first = s.trackAim(p.x + dx * 8, p.y, p.z + dz * 8)
+      const head = s.railhead()!
+      // 狙点はレールヘッドのすぐ先（3 m）。手が届く範囲しか狙えなくても…
+      const ax = head.x + dx * 3
+      const az = head.z + dz * 3
+      const short = s.trackPreview(ax, p.y, az)
+      s.setTrackLength(20)
+      const long = s.trackPreview(ax, p.y, az)
+      s.setTrackLength(12)
+      const mid = s.trackPreview(ax, p.y, az)
+      return { first, short, long, mid }
+    }, dir)
+
+    expect(r.first).toBe('ok')
+    // …ホイールで決めた長さまで伸びる（狙点までの 3 m にはならない）
+    expect(r.short.length).toBeCloseTo(8, 1)
+    expect(r.long.length).toBeCloseTo(20, 1)
+    expect(r.mid.length).toBeCloseTo(12, 1)
+    expect(r.long.trim).toBe('none')
+  })
+
+  test('Shift + ホイールの勾配で登り降りが決まり、G で自動に戻る', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 12)
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      s.trackAim(p.x + dx * 8, p.y, p.z + dz * 8)
+      const head = s.railhead()!
+      const ax = head.x + dx * 3
+      const az = head.z + dz * 3
+
+      s.setTrackGrade(3)
+      const up = s.trackPreview(ax, p.y, az)
+      s.setTrackGrade(-3)
+      const down = s.trackPreview(ax, p.y, az)
+      // 上限（線路は 6 %）を超える指定は丸められる
+      s.setTrackGrade(30)
+      const clamped = s.trackPreview(ax, p.y, az)
+      const shown = s.trackGrade()
+      s.setTrackGrade(null)
+      const auto = s.trackPreview(ax, p.y, az)
+      return { up, down, clamped, shown, auto, autoShown: s.trackGrade() }
+    }, dir)
+
+    expect(r.up.grade).toBeCloseTo(0.03, 3)
+    expect(r.down.grade).toBeCloseTo(-0.03, 3)
+    expect(r.clamped.grade).toBeCloseTo(0.06, 3)
+    expect(r.shown).toBeCloseTo(30, 3)
+    expect(r.autoShown).toBeNull()
+    // 自動は地形なり。平らな広場なのでほぼ水平
+    expect(Math.abs(r.auto.grade)).toBeLessThan(0.03)
+  })
+
+  test('建物にぶつかると手前で止まり、理由が出る', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 20)
+    await page.evaluate(() => window.__smooth!.give('plank', 900))
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      // 6 m 先から線を始め、その 12 m 先に壁を建てる
+      const ax = p.x + dx * 6
+      const az = p.z + dz * 6
+      s.clearRailhead()
+      const clear = s.trackPreview(ax, p.y, az)
+
+      const bx = ax + dx * 12
+      const bz = az + dz * 12
+      const built: string[] = []
+      // 線路（幅 3 m）を塞ぐように、横へ 3 つ並べる
+      for (const t of [-3, 0, 3]) {
+        built.push(s.buildAt('block', bx - dz * t, s.surfaceAt(bx - dz * t, bz + dx * t), bz + dx * t, 'plank'))
+      }
+      const blocked = s.trackPreview(ax, p.y, az)
+      const placed = s.trackAim(ax, p.y, az)
+      const seg = s.trackList()[0]
+      // 敷いた直後の案内（本番の右クリックと同じ経路で出る）
+      const toast = document.getElementById('toast')?.textContent ?? ''
+      return { clear, built, blocked, placed, length: seg?.length ?? 0, toast }
+    }, dir)
+
+    expect(r.built).toContain('ok')
+    // 壁が無ければ 20 m 敷けるはずのところ…
+    expect(r.clear.length).toBeCloseTo(20, 1)
+    // …壁の手前で止まり、理由が分かる
+    expect(r.blocked.trim).toBe('blocked')
+    expect(r.blocked.wanted).toBeCloseTo(20, 1)
+    expect(r.blocked.length).toBeLessThan(16)
+    expect(r.placed).toBe('ok')
+    expect(r.length).toBeLessThan(16)
+    // 理由が画面に出る
+    expect(r.toast).toContain('建物にぶつかった')
   })
 })

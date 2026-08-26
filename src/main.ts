@@ -7,6 +7,7 @@ import { createNoiseTexture } from './render/proceduralTextures'
 import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
 import { VillageManager } from './world/VillageManager'
 import type { Box } from './world/village'
+import type { Collider } from './world/collision'
 import { World, createTreeHit } from './world/World'
 import { boxBrush, orientedBoxBrush, snapBoxCenter, sphereBrush } from './world/edits'
 import type { BrushBounds } from './world/edits'
@@ -95,7 +96,18 @@ const TRACK_REASON: Record<string, string> = {
   buried: '切土が深すぎます（先に掘って切通しを作ってください）',
   toohigh: '高すぎて橋脚が立てられません',
   kink: '繋ぐ相手との向きが違いすぎます（回り込んでください）',
+  blocked: '建物にぶつかります（避けるか、先に壊してください）',
 }
+
+/** 狙った長さに届かなかったときの、短くなった理由。 */
+const TRIM_REASON: Record<string, string> = {
+  buried: '斜面にぶつかった',
+  toohigh: '谷が深すぎた',
+  blocked: '建物にぶつかった',
+}
+
+/** Shift + ホイールで動かす勾配の刻み（0.5 %）。 */
+const GRADE_UI_STEP = 0.005
 
 /** 駅・列車モードで、狙点の近くの駅／列車を拾う距離（m）。 */
 const STATION_PICK = 6
@@ -306,7 +318,18 @@ async function boot(): Promise<void> {
       const info = TRACK_INFO[TRACK_KINDS[trackIndex]]
       const cost = trackPlan ? `　材料 ${planCost(trackPlan.seg).label}` : ''
       const head = trackPlan?.from ? '' : '　新しい線'
-      return `${t.name} ${info.name}${cost}${hand}${head}　R:線路/道路　ホイール:長さ ${segLen} m`
+      // 狙った長さに届かないときは、実際の長さと理由も出す
+      const cut =
+        trackPlan && trackPlan.trim !== 'none'
+          ? ` → ${trackPlan.seg.length.toFixed(1)} m（${TRIM_REASON[trackPlan.trim]}）`
+          : ''
+      const grade =
+        trackGrade === null ? '自動' : `${(trackGrade * 100 >= 0 ? '+' : '')}${(trackGrade * 100).toFixed(1)}%`
+      return (
+        `${t.name} ${info.name}${cost}${hand}${head}` +
+        `　長さ ${segLen} m${cut}　勾配 ${grade}` +
+        `　R:種類　ホイール:長さ　Shift:勾配　G:自動`
+      )
     }
     if (t.id === 'station') {
       const picked =
@@ -332,6 +355,13 @@ async function boot(): Promise<void> {
   /** 軌道モードで選んでいる種類と、1 区間の長さ（m）。 */
   let trackIndex = 0
   let segLen = DEFAULT_SEG_LEN
+  /**
+   * 手で決めた勾配（1 = 45°）。`null` なら**終点の地面に合わせて自動**。
+   * Shift + ホイールで動かし、`G` で自動へ戻す。
+   */
+  let trackGrade: number | null = null
+  /** 同じ理由のトーストを何度も出さないための覚え書き。 */
+  let lastTrim = 'none'
   /** いま伸ばしている端点（レールヘッド）。中クリックで手放して新しい線を始められる。 */
   let railhead: TrackEnd | null = null
   /**
@@ -435,6 +465,13 @@ async function boot(): Promise<void> {
     hud.setStatsVisible(statsVisible)
   }
   controls.onToggleUnlimited = () => setUnlimited(!inventory.unlimited)
+  controls.onResetGrade = () => {
+    if (TOOLS[tool].id !== 'track') return
+    trackGrade = null
+    invalidateTrack()
+    hud.setBrush(brushLabel())
+    hud.showToast('勾配を自動（地形なり）に戻した')
+  }
 
   /**
    * デバッグ用の無制限モード。溜めた量はそのままに、支払いだけを素通しにする。
@@ -846,6 +883,44 @@ async function boot(): Promise<void> {
       hud.setBrush(brushLabel())
       return true
     },
+    /** 勾配を % で決める（null で自動＝地形なり）。 */
+    setTrackGrade(percent: number | null) {
+      trackGrade = percent === null ? null : percent / 100
+      invalidateTrack()
+      hud.setBrush(brushLabel())
+    },
+    /** いまの勾配（%）。自動なら null。 */
+    trackGrade(): number | null {
+      return trackGrade === null ? null : trackGrade * 100
+    },
+    /**
+     * 敷かずに見積もりだけを返す（テスト用）。
+     * 狙った長さ・実際の長さ・切り詰めた理由が分かる。
+     */
+    trackPreview(x: number, y: number, z: number) {
+      const kind = TRACK_KINDS[trackIndex]
+      const def = inventory.held()
+      const plan = tracks.plan({
+        kind,
+        mat: def?.material ?? MAT_PLANK,
+        maxLen: segLen,
+        railhead: pickRailhead(kind, x, y, z),
+        aimX: x,
+        aimY: y,
+        aimZ: z,
+        camYaw: controls.yaw,
+        grade: trackGrade,
+        terrain: trackTerrain,
+      })
+      return {
+        check: plan.check,
+        trim: plan.trim,
+        wanted: plan.wanted,
+        length: plan.seg.length,
+        grade: plan.seg.length > 0 ? plan.seg.rise / plan.seg.length : 0,
+        curve: plan.seg.curve,
+      }
+    },
     /** 1 区間の長さを設定する（テスト用。上下限に丸められる）。 */
     setTrackLength(m: number) {
       segLen = clamp(Math.round(m), MIN_SEG_LEN, MAX_SEG_LEN)
@@ -869,12 +944,14 @@ async function boot(): Promise<void> {
         aimY: y,
         aimZ: z,
         camYaw: controls.yaw,
+        grade: trackGrade,
         terrain: trackTerrain,
       })
       const cost = trackCost(plan.seg)
       if (inventory.count(def.id) < cost) return 'short'
       if (plan.check !== 'ok') return plan.check
       if (!tracks.placePlan(plan)) return 'overlap'
+      reportTrim(plan)
       inventory.take(def.id, segmentCost(plan.seg))
       gradeTerrain(plan.seg)
       refreshNetwork()
@@ -1293,7 +1370,42 @@ async function boot(): Promise<void> {
    * 軌道の敷設可否を測る地形。被りの判定は密度場を直接見るので、
    * **自分で掘った切通しはそのまま「通れる」ようになる**。
    */
-  const trackTerrain = { ground: surfaceY, solid: isSolidAt }
+  const trackTerrain = {
+    ground: surfaceY,
+    solid: isSolidAt,
+    obstacles: trackObstacles,
+  }
+
+  /**
+   * 家や建てたパーツ。軌道がぶつかったら手前で止めるために使う
+   * （`VillageManager.collidersNear` の約束どおり、`out` は空にしてから詰まる）。
+   */
+  function trackObstacles(x: number, z: number, r: number, out: Collider[]): Collider[] {
+    villages.collidersNear(x, z, r, out)
+    return build.collectColliders(x, z, r, out)
+  }
+
+  /** いま見えている区間の勾配（Shift + ホイールの出発点にする）。 */
+  function gradeOfPlan(): number {
+    const seg = trackPlan?.seg
+    return seg && seg.length > 0 ? seg.rise / seg.length : 0
+  }
+
+  /**
+   * 狙った長さに届かなかったときに、その理由を伝える。
+   *
+   * 押しっぱなしで敷き続けても喧しくならないよう、**理由が変わったときだけ**出す。
+   */
+  function reportTrim(plan: TrackPlan): void {
+    if (plan.trim === 'none') {
+      lastTrim = 'none'
+      return
+    }
+    if (plan.trim === lastTrim) return
+    lastTrim = plan.trim
+    const why = TRIM_REASON[plan.trim] ?? 'ぶつかった'
+    hud.showToast(`${why}ので ${plan.seg.length.toFixed(1)} m で止めました`)
+  }
 
   /**
    * 敷いた区間に合わせて地形を切り盛りする。
@@ -1532,11 +1644,20 @@ async function boot(): Promise<void> {
     const kind = TRACK_KINDS[trackIndex]
     const held = inventory.held()
 
-    // 軌道モードではホイールは大きさではなく 1 区間の長さ。Shift で 4 m ずつ
+    // ホイールは 1 区間の長さ。Shift を押しながらだと勾配になる
     if (controls.wheel !== 0) {
-      const fast = controls.keys.has('ShiftLeft') || controls.keys.has('ShiftRight')
-      const step = fast ? 4 : 1
-      segLen = clamp(segLen - Math.sign(controls.wheel) * step, MIN_SEG_LEN, MAX_SEG_LEN)
+      const dir = -Math.sign(controls.wheel)
+      if (controls.keys.has('ShiftLeft') || controls.keys.has('ShiftRight')) {
+        const max = TRACK_INFO[kind].maxGrade
+        const base = trackGrade ?? gradeOfPlan()
+        trackGrade = clamp(
+          Math.round((base + dir * GRADE_UI_STEP) / GRADE_UI_STEP) * GRADE_UI_STEP,
+          -max,
+          max,
+        )
+      } else {
+        segLen = clamp(segLen + dir, MIN_SEG_LEN, MAX_SEG_LEN)
+      }
       controls.wheel = 0
       invalidateTrack()
     }
@@ -1571,6 +1692,7 @@ async function boot(): Promise<void> {
       kind,
       mat,
       segLen,
+      trackGrade ?? 'auto',
       head ? `${head.x.toFixed(2)},${head.z.toFixed(2)},${head.atEnd}` : 'new',
       Math.round(px * 20),
       Math.round(py * 20),
@@ -1588,6 +1710,7 @@ async function boot(): Promise<void> {
         aimX: px,
         aimY: py,
         aimZ: pz,
+        grade: trackGrade,
         aimOnTrack: onTrack,
         camYaw: controls.yaw,
         terrain: trackTerrain,
@@ -1637,6 +1760,7 @@ async function boot(): Promise<void> {
       return
     }
     if (tracks.placePlan(plan)) {
+      reportTrim(plan)
       inventory.take(held.id, segmentCost(plan.seg))
       gradeTerrain(plan.seg)
       refreshNetwork()

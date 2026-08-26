@@ -38,6 +38,8 @@ export class Controls {
   onToggleStats: (() => void) | null = null
   /** F4 キー: デバッグ用に材料を無制限にする（もう一度押すと戻る） */
   onToggleUnlimited: (() => void) | null = null
+  /** G キー: 軌道モードで、手で決めた勾配を自動（地形なり）へ戻す */
+  onResetGrade: (() => void) | null = null
   /** デバッグ: 最寄りの村へワープ */
   onWarpVillage: (() => void) | null = null
 
@@ -150,6 +152,11 @@ export class Controls {
 
     if (e.code === 'KeyV') {
       this.onWarpVillage?.()
+      return
+    }
+
+    if (e.code === 'KeyG') {
+      this.onResetGrade?.()
       return
     }
 

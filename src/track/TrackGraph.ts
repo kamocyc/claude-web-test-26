@@ -21,7 +21,13 @@ import {
 import type { Segment, TrackKind } from './track'
 
 /** 敷ける／敷けない理由。 */
-export type TrackCheck = 'ok' | 'overlap' | 'buried' | 'toohigh' | 'kink'
+export type TrackCheck = 'ok' | 'overlap' | 'buried' | 'toohigh' | 'kink' | 'blocked'
+
+/**
+ * 区間を短く切り詰めた理由（切り詰めていなければ `'none'`）。
+ * 敷けはするが狙った長さに届かなかった、というときの説明に使う。
+ */
+export type TrackTrim = 'none' | 'buried' | 'toohigh' | 'blocked'
 
 /** 地面の高さを外から渡す（テストでは偽の地形を渡せる）。 */
 export type GroundFn = (x: number, z: number) => number
@@ -30,15 +36,23 @@ export type GroundFn = (x: number, z: number) => number
 export type SolidFn = (x: number, y: number, z: number) => boolean
 
 /**
+ * 付近の障害物（村の建物・建てたパーツ）の当たり判定を集める。
+ * `VillageManager.collidersNear` と同じ約束で、**`out` を空にしてから詰める**。
+ */
+export type ObstacleFn = (x: number, z: number, r: number, out: Collider[]) => Collider[]
+
+/**
  * 敷設の可否を測るための地形。
  *
  * `ground` は橋脚の高さと切り盛りの量を見るための地表面。
  * `solid` を渡すと「軌道の上に地面が被っているか」をそちらで見るので、
  * **プレイヤーが掘った切通しがそのまま反映される**。渡さなければ `ground` で代用する。
+ * `obstacles` を渡すと、家や建てたパーツにぶつかる区間も見つけられる。
  */
 export interface Terrain {
   ground: GroundFn
   solid?: SolidFn
+  obstacles?: ObstacleFn
 }
 
 /** 空間索引の 1 マス（m）。 */
@@ -64,6 +78,16 @@ export const MAX_PILLAR = 14
  * 端点で接するだけの区間どうしは通し、面で重なる二重敷きだけを弾く。
  */
 const OVERLAP_SCALE = 0.7
+
+/**
+ * 障害物との当たりを見るときの余裕（m）。
+ *
+ * こちらは**縮めずに等倍**で見る。中心寄りだけを見る {@link OVERLAP_SCALE} の縮め方は
+ * 高さ方向にも効くので、地面に建つ壁と地面に載る路盤のように
+ * 「底面どうしが揃っているもの」が離れてしまう。かすっただけで弾かないよう、
+ * ほんの少し縮めるだけにする。
+ */
+const OBSTACLE_GROW = -0.06
 
 /**
  * 軌道の端点。`yaw` は**そこから先へ伸ばす向き**なので、
@@ -92,12 +116,22 @@ export interface TrackPlan {
   /** 終端を繋いだ相手（繋いでいなければ null）。 */
   joinTo: TrackEnd | null
   check: TrackCheck
+  /** 切り詰める前に狙っていた長さ（m）。 */
+  wanted: number
+  /** 切り詰めた理由。`'none'` なら狙った長さのまま。 */
+  trim: TrackTrim
 }
 
 export interface PlanRequest {
   kind: TrackKind
   mat: number
-  /** ホイールで決める 1 区間の長さの上限（m）。 */
+  /**
+   * ホイールで決める 1 区間の長さ（m）。
+   *
+   * **狙点は「どちらへ曲がるか」だけを決める**ので、狙点が手前にあっても
+   * 区間はこの長さまで伸びる（届く範囲は 9 m しかないのに 24 m の線を敷きたい、
+   * という当たり前のことができるように）。繋ぎに行くときだけは相手までの長さになる。
+   */
   maxLen: number
   /** 伸ばす元の端点。null なら狙点から新しい線を始める。 */
   railhead: TrackEnd | null
@@ -108,6 +142,11 @@ export interface PlanRequest {
   /** 狙点が既に敷いてある軌道の上なら true（その高さをそのまま軌道面として使う）。 */
   aimOnTrack?: boolean
   camYaw: number
+  /**
+   * 勾配（1 = 45°）。`null`（既定）なら**終点の地面に合わせて自動**で決める。
+   * 数を渡すとその勾配で伸ばす（種類ごとの上限でクランプされる）。
+   */
+  grade?: number | null
   terrain: Terrain
 }
 
@@ -133,6 +172,9 @@ export class TrackGraph {
   private readonly ptScratch: number[] = []
   private readonly endScratch: number[] = []
   private readonly endsScratch: TrackEnd[] = []
+  private readonly colsFit: Collider[] = []
+  private readonly obsScratch: Collider[] = []
+  private readonly boundsFit: Box = emptyBox()
   private colliders = 0
 
   get count(): number {
@@ -366,42 +408,75 @@ export class TrackGraph {
         rise: 0,
         mat,
       }
-      const e = segmentEnd(seg, this.endScratch)
-      seg.rise = clampRise(kind, terrain.ground(e[0], e[2]) + DECK_T - deckY, length)
-      return { seg, from: null, joinTo: null, check: this.fit(seg, terrain, true, null, null) }
+      this.applyGrade(seg, terrain, req.grade)
+      return this.finish(seg, terrain, null, null, null, null)
     }
 
     // 狙点の近くの自由端へ繋ぎに行く
     const joinTo = this.nearestEnd(req.aimX, req.aimY, req.aimZ, JOIN_RANGE, kind, head.seg)
     if (joinTo) {
-      const seg = this.arc(kind, mat, head, joinTo.x, joinTo.y, joinTo.z, MAX_SEG_LEN)
+      const seg = this.arcTo(kind, mat, head, joinTo.x, joinTo.y, joinTo.z)
       const e = segmentEnd(seg, this.endScratch)
       const reached = Math.hypot(e[0] - joinTo.x, e[1] - joinTo.y, e[2] - joinTo.z) < 0.6
       if (reached) {
         // 相手の端点へ「入る」向きは、そこから伸ばす向きの逆
         const kink = Math.abs(normalizeAngle(e[3] - (joinTo.yaw + Math.PI))) > JOIN_MAX_ANGLE
-        const check = kink ? 'kink' : this.check(seg, terrain, head.seg, joinTo.seg)
-        return { seg, from: head, joinTo, check }
+        if (kink) {
+          return { seg, from: head, joinTo, check: 'kink', wanted: seg.length, trim: 'none' }
+        }
+        // 繋ぐ区間は相手にぴったり届く長さでないと意味が無いので、切り詰めない
+        const r = this.fit(seg, terrain, false, head.seg, joinTo.seg)
+        return { seg, from: head, joinTo, check: r.check, wanted: seg.length, trim: r.trim }
       }
     }
 
-    const seg = this.arc(kind, mat, head, req.aimX, deckY, req.aimZ, req.maxLen)
-    return { seg, from: head, joinTo: null, check: this.fit(seg, terrain, true, head.seg, null) }
+    const seg = this.arcAlong(kind, mat, head, req.aimX, req.aimZ, req.maxLen)
+    this.applyGrade(seg, terrain, req.grade)
+    return this.finish(seg, terrain, head, null, head.seg, null)
   }
 
-  /** 端点から狙点へ向かう円弧を、上限でクランプしつつ作る。 */
-  private arc(
+  /** 地形を見て切り詰めたうえで、見積もりにまとめる。 */
+  private finish(
+    seg: Segment,
+    terrain: Terrain,
+    from: TrackEnd | null,
+    joinTo: TrackEnd | null,
+    ignoreA: Segment | null,
+    ignoreB: Segment | null,
+  ): TrackPlan {
+    const wanted = seg.length
+    const r = this.fit(seg, terrain, true, ignoreA, ignoreB)
+    return { seg, from, joinTo, check: r.check, wanted, trim: r.trim }
+  }
+
+  /**
+   * 勾配を決める。指定があればその勾配で、無ければ**終点の地面に合わせる**。
+   *
+   * 自動のときに狙点の高さを使わないのは、狙点が近いと
+   * 少し見上げただけで勾配が跳ね上がってしまうから。終点の地面に合わせれば、
+   * 長い区間でも地形なりに素直に伸びる。
+   */
+  private applyGrade(seg: Segment, terrain: Terrain, grade: number | null | undefined): void {
+    if (grade !== null && grade !== undefined) {
+      seg.rise = clampRise(seg.kind, grade * seg.length, seg.length)
+      return
+    }
+    const e = segmentEnd(seg, this.endScratch)
+    seg.rise = clampRise(seg.kind, terrain.ground(e[0], e[2]) + DECK_T - seg.y, seg.length)
+  }
+
+  /** 端点から狙点へ**ぴったり届く**円弧（繋ぎに行くとき用）。 */
+  private arcTo(
     kind: TrackKind,
     mat: number,
     from: TrackEnd,
     tx: number,
     ty: number,
     tz: number,
-    maxLen: number,
   ): Segment {
     const raw = solveArc(from.x, from.z, from.yaw, tx, tz)
-    const fit = clampFit(kind, raw, maxLen)
-    // 狙点まで届かない長さに切り詰めたぶん、高さ差も比例で詰める
+    const fit = clampFit(kind, raw, MAX_SEG_LEN)
+    // 届かない長さに切り詰めたぶん、高さ差も比例で詰める
     const ratio = raw.length > 1e-6 ? Math.min(1, fit.length / raw.length) : 1
     return {
       kind,
@@ -412,6 +487,36 @@ export class TrackGraph {
       curve: fit.curve,
       length: fit.length,
       rise: clampRise(kind, (ty - from.y) * ratio, fit.length),
+      mat,
+    }
+  }
+
+  /**
+   * 端点から**狙点の向きへ、決めた長さだけ**伸ばす円弧。
+   *
+   * 狙点は曲がり方（曲率）を決めるだけで、長さには使わない。手が届くのは 9 m
+   * 先までなので、狙点の距離を長さにしてしまうと**ホイールで長さを伸ばしても
+   * 伸びない**ことになる。
+   */
+  private arcAlong(
+    kind: TrackKind,
+    mat: number,
+    from: TrackEnd,
+    tx: number,
+    tz: number,
+    len: number,
+  ): Segment {
+    const raw = solveArc(from.x, from.z, from.yaw, tx, tz)
+    const fit = clampFit(kind, { curve: raw.curve, length: len }, len)
+    return {
+      kind,
+      x: from.x,
+      y: from.y,
+      z: from.z,
+      yaw: from.yaw,
+      curve: fit.curve,
+      length: fit.length,
+      rise: 0,
       mat,
     }
   }
@@ -429,7 +534,7 @@ export class TrackGraph {
     ignoreA: Segment | null = null,
     ignoreB: Segment | null = null,
   ): TrackCheck {
-    return this.fit(seg, terrain, false, ignoreA, ignoreB)
+    return this.fit(seg, terrain, false, ignoreA, ignoreB).check
   }
 
   /**
@@ -446,10 +551,14 @@ export class TrackGraph {
     trim: boolean,
     ignoreA: Segment | null,
     ignoreB: Segment | null,
-  ): TrackCheck {
+  ): { check: TrackCheck; trim: TrackTrim } {
     const pts = sampleSegment(seg, this.ptScratch)
     const n = pts.length / 4 - 1
     const ds = seg.length / n
+    // 家や建てたパーツ。刻みごとの箱で当たりを見るので、当たり判定と同じ精度になる
+    const obstacles = this.obstaclesNear(seg, terrain)
+    const cols = obstacles ? segmentColliders(seg, this.colsFit) : null
+
     for (let i = 0; i <= n; i++) {
       const x = pts[i * 4]
       const y = pts[i * 4 + 1]
@@ -457,18 +566,32 @@ export class TrackGraph {
       const g = terrain.ground(x, z)
       // 路盤の底面から GRADE_TOL までは敷くときに削るので、そこまでは埋まっていない扱い
       const cutTop = y - DECK_T + GRADE_TOL + GRADE_SLACK
-      const buried = terrain.solid ? terrain.solid(x, cutTop, z) : g > cutTop
-      const high = y - g > MAX_PILLAR
-      if (!buried && !high) continue
-      if (!trim) return buried ? 'buried' : 'toohigh'
-      // 1 つ手前まで戻す。勾配を保ったまま長さを詰める
-      const cut = ds * (i - 1)
-      if (i === 0 || cut < MIN_SEG_LEN) return buried ? 'buried' : 'toohigh'
+      let reason: TrackTrim = 'none'
+      if (terrain.solid ? terrain.solid(x, cutTop, z) : g > cutTop) reason = 'buried'
+      else if (y - g > MAX_PILLAR) reason = 'toohigh'
+      else if (cols && obstacles && i < n && hitsAny(cols[i], obstacles)) reason = 'blocked'
+      if (reason === 'none') continue
+      if (!trim) return { check: reason, trim: 'none' }
+      // ぶつかる手前まで戻す。勾配を保ったまま長さを詰める。
+      // 障害物は「刻み i の箱」に当たっているので、その箱の手前（= ds·i）で止める
+      const cut = reason === 'blocked' ? ds * i : ds * (i - 1)
+      if (cut < MIN_SEG_LEN) return { check: reason, trim: 'none' }
       seg.rise *= cut / seg.length
       seg.length = cut
-      break
+      return { check: this.overlaps(seg, [ignoreA, ignoreB]) ? 'overlap' : 'ok', trim: reason }
     }
-    return this.overlaps(seg, [ignoreA, ignoreB]) ? 'overlap' : 'ok'
+    return { check: this.overlaps(seg, [ignoreA, ignoreB]) ? 'overlap' : 'ok', trim: 'none' }
+  }
+
+  /** 区間の周りの障害物。1 つも無ければ null（毎フレームの当たり判定を省く）。 */
+  private obstaclesNear(seg: Segment, terrain: Terrain): Collider[] | null {
+    if (!terrain.obstacles) return null
+    const b = segmentBounds(seg, this.boundsFit)
+    const cx = (b.minX + b.maxX) / 2
+    const cz = (b.minZ + b.maxZ) / 2
+    const r = Math.max(b.maxX - b.minX, b.maxZ - b.minZ) / 2 + 1
+    const out = terrain.obstacles(cx, cz, r, this.obsScratch)
+    return out.length > 0 ? out : null
   }
 
   /** 既存の区間と面で重なっているか。端点で接するだけの相手は無視する。 */
@@ -622,4 +745,12 @@ export function createTrackHit(): TrackHit {
 
 function emptyBox(): Box {
   return { minX: 0, minY: 0, minZ: 0, maxX: 0, maxY: 0, maxZ: 0 }
+}
+
+/** 箱がどれかの障害物と重なっているか。 */
+function hitsAny(box: Collider, obstacles: readonly Collider[]): boolean {
+  for (const o of obstacles) {
+    if (obbOverlap(box, o, OBSTACLE_GROW)) return true
+  }
+  return false
 }

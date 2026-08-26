@@ -106,6 +106,23 @@ export interface SmoothDebug {
   trackColliders(): number
   /** 軌道の種類（rail / road）を選ぶ。 */
   setTrackKind(name: string): boolean
+  /** 勾配を % で決める（null で自動＝地形なり）。 */
+  setTrackGrade(percent: number | null): void
+  /** いまの勾配（%）。自動なら null。 */
+  trackGrade(): number | null
+  /** 敷かずに見積もりだけを返す。 */
+  trackPreview(
+    x: number,
+    y: number,
+    z: number,
+  ): {
+    check: string
+    trim: string
+    wanted: number
+    length: number
+    grade: number
+    curve: number
+  }
   /** 1 区間の長さ（m）。 */
   setTrackLength(m: number): void
   /** 照準の点を渡して、本番と同じ経路で敷く。 */
