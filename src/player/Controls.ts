@@ -25,7 +25,7 @@ export class Controls {
    * R キー: 建築パーツの切り替え（壁 → 窓 → 戸口 → 床 → 階段 → 屋根 → ブロック）。
    * 軌道モードでは 線路 ⇄ 道路 の切り替えになる。
    */
-  onCyclePiece: (() => void) | null = null
+  onCyclePiece: ((back: boolean) => void) | null = null
   /** 中クリック: 建築の回転を既定へ戻す。軌道モードでは接続を切って新しい線を始める */
   onResetRotation: (() => void) | null = null
   /** T キー: 時刻の切り替え（デバッグ） */
@@ -141,7 +141,7 @@ export class Controls {
     }
 
     if (e.code === 'KeyR') {
-      this.onCyclePiece?.()
+      this.onCyclePiece?.(e.shiftKey)
       return
     }
 

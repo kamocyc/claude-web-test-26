@@ -1,8 +1,16 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
-import { boxGeometry, quadFacing } from './geoUtil'
+import { boxGeometry, quadFacing, triFacing } from './geoUtil'
 import { MATERIAL_INFO, MAT_GLASS } from '../world/constants'
-import { BUILD_CELL, PANEL_T, WINDOW_HALF, localBoxes } from '../build/pieces'
+import type { Box } from '../world/collision'
+import {
+  BUILD_CELL,
+  FENCE_H,
+  PANEL_T,
+  WINDOW_HALF,
+  accentStart,
+  localBoxes,
+} from '../build/pieces'
 import type { PieceKind } from '../build/pieces'
 
 const geoCache = new Map<PieceKind, THREE.BufferGeometry>()
@@ -18,6 +26,27 @@ const paneMaterial = new THREE.MeshStandardMaterial({
   depthWrite: false,
 })
 
+/** ベッドの布。 */
+const linenMaterial = new THREE.MeshStandardMaterial({ color: 0xd8cfc0, roughness: 0.95 })
+
+/** チェストの鉄帯。 */
+const ironMaterial = new THREE.MeshStandardMaterial({
+  color: 0x5b6068,
+  roughness: 0.5,
+  metalness: 0.55,
+})
+
+/**
+ * 差し色のマテリアル。{@link accentStart} 以降の箱をこれで描く。
+ * どの素材で建てても布は布、鉄は鉄に見せたいので、素材 ID には依らない。
+ */
+function accentMaterial(kind: PieceKind): THREE.Material | null {
+  if (kind === 'window') return paneMaterial
+  if (kind === 'bed') return linenMaterial
+  if (kind === 'chest') return ironMaterial
+  return null
+}
+
 /**
  * パーツ種類ごとのジオメトリ。基準点（{@link pieceAnchor}）を原点とする局所座標で作る。
  *
@@ -28,15 +57,28 @@ const paneMaterial = new THREE.MeshStandardMaterial({
 export function pieceGeometry(kind: PieceKind): THREE.BufferGeometry {
   const hit = geoCache.get(kind)
   if (hit) return hit
-  const geo = kind === 'window' ? windowGeometry() : kind === 'roof' ? roofGeometry() : fromBoxes(kind)
+  const geo =
+    kind === 'window'
+      ? windowGeometry()
+      : kind === 'roof'
+        ? roofGeometry()
+        : kind === 'gable'
+          ? gableGeometry()
+          : kind === 'fence'
+            ? fenceGeometry()
+            : fromBoxes(kind)
   geo.computeBoundingSphere()
   geoCache.set(kind, geo)
   return geo
 }
 
-/** パーツに使うマテリアル。窓だけ枠とガラスの 2 つを返す。 */
+/**
+ * パーツに使うマテリアル。窓・ベッド・チェストのように差し色を持つパーツだけ
+ * `[主素材, 差し色]` の 2 つを返す（ジオメトリのグループと同じ並び）。
+ */
 export function pieceMaterials(kind: PieceKind, mat: number): THREE.Material | THREE.Material[] {
-  return kind === 'window' ? [buildMaterial(mat), paneMaterial] : buildMaterial(mat)
+  const accent = accentMaterial(kind)
+  return accent ? [buildMaterial(mat), accent] : buildMaterial(mat)
 }
 
 /** 素材 ID ごとのマテリアル。色は地形と同じ {@link MATERIAL_INFO} から取る。 */
@@ -90,11 +132,71 @@ const GHOST_NG = new THREE.MeshBasicMaterial({
   fog: false,
 })
 
+/**
+ * 当たり判定の箱からそのままジオメトリを作る。
+ * {@link accentStart} 以降の箱は差し色のグループ 1 にまとめる。
+ */
 function fromBoxes(kind: PieceKind): THREE.BufferGeometry {
-  const parts = localBoxes(kind).map((b) => boxGeometry(b))
-  const geo = parts.length === 1 ? parts[0] : mergeGeometries(parts, false)
-  if (parts.length > 1) for (const p of parts) p.dispose()
+  const boxes = localBoxes(kind)
+  const split = accentStart(kind)
+  if (split >= boxes.length) return mergeBoxes(boxes)
+  const main = mergeBoxes(boxes.slice(0, split))
+  const accent = mergeBoxes(boxes.slice(split))
+  const geo = mergeGeometries([main, accent], true)
+  main.dispose()
+  accent.dispose()
   return geo
+}
+
+function mergeBoxes(boxes: readonly Box[]): THREE.BufferGeometry {
+  const parts = boxes.map((b) => boxGeometry(b))
+  if (parts.length === 1) return parts[0]
+  const geo = mergeGeometries(parts, false)
+  for (const p of parts) p.dispose()
+  return geo
+}
+
+/**
+ * 屋根の妻を塞ぐ直角三角形の壁。厚みは {@link PANEL_T}、+z 側が棟で高さ 1 マス。
+ * 当たり判定は階段状の近似だが、こちらは三角形そのものを張る。
+ */
+function gableGeometry(): THREE.BufferGeometry {
+  const h = BUILD_CELL / 2
+  const C = BUILD_CELL
+  const t = PANEL_T / 2
+  const v: number[] = []
+
+  // 面（±x）の三角形
+  triFacing(v, -1, 0, 0, -t, 0, -h, -t, 0, h, -t, C, h)
+  triFacing(v, 1, 0, 0, t, 0, -h, t, 0, h, t, C, h)
+  // 底辺・棟側の垂直面・斜面
+  quadFacing(v, 0, -1, 0, -t, 0, -h, t, 0, -h, t, 0, h, -t, 0, h)
+  quadFacing(v, 0, 0, 1, -t, 0, h, t, 0, h, t, C, h, -t, C, h)
+  quadFacing(v, -1, 1, 0, -t, 0, -h, -t, C, h, t, C, h, t, 0, -h)
+
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(v), 3))
+  geo.computeVertexNormals()
+  return geo
+}
+
+/**
+ * 手すり。**当たり判定は 1 枚の薄い板**（{@link localBoxes}）だが、
+ * 見た目は柱と横桟にする。桟の隙間に体が挟まらないようにするための、意図した食い違い。
+ */
+function fenceGeometry(): THREE.BufferGeometry {
+  const h = BUILD_CELL / 2
+  const t = 0.07
+  const boxes = [
+    // 上の桟と中の桟
+    { minX: -t, minY: FENCE_H - 0.16, minZ: -h, maxX: t, maxY: FENCE_H, maxZ: h },
+    { minX: -t * 0.8, minY: 0.45, minZ: -h, maxX: t * 0.8, maxY: 0.58, maxZ: h },
+  ]
+  // 端の柱は少し内側に寄せる。隣り合う柵と同じ場所に重ならないように
+  for (const cz of [-h + 0.09, 0, h - 0.09]) {
+    boxes.push({ minX: -0.09, minY: 0, minZ: cz - 0.09, maxX: 0.09, maxY: FENCE_H, maxZ: cz + 0.09 })
+  }
+  return mergeBoxes(boxes)
 }
 
 /** 枠（グループ 0）とガラス面（グループ 1）。 */

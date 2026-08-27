@@ -97,6 +97,24 @@ export interface SmoothDebug {
   removePieceAt(x: number, y: number, z: number, range?: number): boolean
   pieceCount(): number
   buildColliders(): number
+  villagePieceCount(): number
+  nearestVillage(): {
+    cx: number
+    cz: number
+    radius: number
+    platformY: number
+    buildings: Array<{
+      kind: string
+      x: number
+      z: number
+      w: number
+      d: number
+      levels: number
+      doorSide: number
+      doorX: number
+      doorZ: number
+    }>
+  } | null
   surfaceAt(x: number, z: number): number
   /** デバッグ用の無制限モードを切り替える（F4 と同じ）。戻り値はいまの状態。 */
   setUnlimited(on: boolean): boolean

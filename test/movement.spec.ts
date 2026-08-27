@@ -91,6 +91,42 @@ test.describe('移動', () => {
     ).toBeLessThan(0.2)
   })
 
+  test('村の家は建築パーツで組まれ、戸口から中へ入れる', async ({ page }) => {
+    await start(page)
+    expect(await page.evaluate(() => window.__smooth!.gotoVillage())).toBe(true)
+    await page.waitForTimeout(2500)
+
+    expect(
+      await page.evaluate(() => window.__smooth!.villagePieceCount()),
+      '村が建築パーツで組まれていない',
+    ).toBeGreaterThan(100)
+
+    const v = await page.evaluate(() => window.__smooth!.nearestVillage())
+    const house = v!.buildings.find((b) => b.kind === 'house')!
+    // 0:+x 1:-x 2:+z 3:-z
+    const dx = [1, -1, 0, 0][house.doorSide]
+    const dz = [0, 0, 1, -1][house.doorSide]
+    // 戸口の 2.5 m 手前に立ち、戸口の方を向いて歩く
+    // （前進は -Z 方向なので、向き (dx, dz) へ進むヨーは atan2(-dx, -dz)）
+    await page.evaluate(
+      (p) => {
+        const s = window.__smooth!
+        s.teleport(p.x, p.z)
+        s.look(Math.atan2(p.dx, p.dz), 0)
+      },
+      { x: house.doorX + dx * 2.5, z: house.doorZ + dz * 2.5, dx, dz },
+    )
+    await page.waitForTimeout(800)
+    await page.keyboard.down('KeyW')
+    await page.waitForTimeout(8000)
+    await page.keyboard.up('KeyW')
+
+    const after = await state(page)
+    // 家の外周の内側に入れたこと（壁に阻まれて外に留まっていない）
+    expect(Math.abs(after.x - house.x), '家の中に入れていない').toBeLessThan(house.w / 2)
+    expect(Math.abs(after.z - house.z), '家の中に入れていない').toBeLessThan(house.d / 2)
+  })
+
   test('村が生成され、壁の当たり判定を持つ', async ({ page }) => {
     await start(page)
     expect(await page.evaluate(() => window.__smooth!.gotoVillage())).toBe(true)

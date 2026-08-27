@@ -1,4 +1,12 @@
-import type { Box } from './village'
+/** 軸平行の直方体（ワールド座標）。当たり判定・空間索引・ジオメトリの共通の器。 */
+export interface Box {
+  minX: number
+  minY: number
+  minZ: number
+  maxX: number
+  maxY: number
+  maxZ: number
+}
 
 /**
  * 回転を持てる当たり判定。

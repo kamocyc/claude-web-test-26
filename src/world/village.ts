@@ -1,31 +1,42 @@
+import { BUILD_CELL } from '../build/pieces'
 import { SEA_LEVEL, VILLAGE_CELL } from './constants'
 import { mulberry32, smoothstep } from './noise'
 
-export interface Box {
-  minX: number
-  minY: number
-  minZ: number
-  maxX: number
-  maxY: number
-  maxZ: number
-}
+export type { Box } from './collision'
 
 export type BuildingKind = 'house' | 'hall' | 'shed' | 'well' | 'tower'
 
+/**
+ * 村の建物 1 棟の**間取り**。
+ *
+ * 壁や屋根そのものはここには入っていない。建物は
+ * {@link import('../build/villagePieces').buildingPieces} が
+ * **プレイヤーが使うのと同じ建築パーツ**へ展開する。
+ * だから寸法は自由な実数ではなく、パーツの基準寸法 {@link BUILD_CELL} の
+ * **セル数**で持つ（`cw` × `cd` マス、壁は `levels` 段）。
+ */
 export interface Building {
   kind: BuildingKind
+  /** 建物の中心（ワールド）。 */
   x: number
   z: number
-  /** x 方向の全幅・z 方向の全奥行き（回転は 90 度単位なので AABB のまま扱える）。 */
+  /** 間口・奥行きのマス数。1 マス = {@link BUILD_CELL} m。 */
+  cw: number
+  cd: number
+  /** 積んだ壁の段数。1 段 = {@link BUILD_CELL} m。 */
+  levels: number
+  /** x 方向の全幅・z 方向の全奥行き（m）。`cw`/`cd` から決まる。 */
   w: number
   d: number
+  /** 壁の高さ（m）。`levels` から決まる。 */
   wallH: number
-  roofH: number
   /** 0:+x 1:-x 2:+z 3:-z のどの面にドアを開けるか。 */
   doorSide: number
-  /** 屋根の棟が x 方向に走るか。 */
+  /** 屋根の棟が x 方向に走るか。棟と直交する側は必ず 2 マス。 */
   ridgeAlongX: boolean
   palette: number
+  /** 窓の open/閉じや家具の並べ方を決める種。建物ごとに固定。 */
+  seed: number
 }
 
 export interface Village {
@@ -40,14 +51,47 @@ export interface Village {
   paths: Array<[number, number, number, number]>
 }
 
-const WALL_T = 0.34
-const DOOR_W = 1.5
-const DOOR_H = 2.15
-
 function cellRandom(vx: number, vz: number, seed: number): () => number {
   let h = (Math.imul(vx, 374761393) + Math.imul(vz, 668265263) + Math.imul(seed, 2246822519)) | 0
   h = Math.imul(h ^ (h >>> 13), 1274126177)
   return mulberry32((h ^ (h >>> 16)) >>> 0)
+}
+
+/**
+ * 間取りを 1 つ組み立てる。棟と直交する側を 2 マスに固定しているのは、
+ * 屋根パーツが 1 マスで 1 マスぶん昇る（45°）ので、**2 マスあれば
+ * 左右の斜面がちょうど真ん中で棟を作る**ため。
+ */
+function makeBuilding(
+  kind: BuildingKind,
+  x: number,
+  z: number,
+  along: number,
+  levels: number,
+  ridgeAlongX: boolean,
+  doorSide: number,
+  palette: number,
+  seed: number,
+): Building {
+  // 屋根を載せる建物は、棟と直交する側が必ず 2 マス（屋根パーツ 2 枚で棟ができる）。
+  // 井戸には屋根が無いので `along` 四方のまま
+  const cw = kind === 'well' ? along : ridgeAlongX ? along : 2
+  const cd = kind === 'well' ? along : ridgeAlongX ? 2 : along
+  return {
+    kind,
+    x,
+    z,
+    cw,
+    cd,
+    levels,
+    w: cw * BUILD_CELL,
+    d: cd * BUILD_CELL,
+    wallH: levels * BUILD_CELL,
+    doorSide,
+    ridgeAlongX,
+    palette,
+    seed,
+  }
 }
 
 /**
@@ -88,56 +132,40 @@ export function makeVillage(
   }
   if (!ok) return null
 
-  const radius = 42 + rand() * 20
+  // パーツで組むと 1 棟が 6〜12 m になるので、敷地は以前より広く取る
+  const radius = 54 + rand() * 22
   const buildings: Building[] = []
   const paths: Array<[number, number, number, number]> = []
 
-  // 中央の井戸
-  buildings.push({
-    kind: 'well',
-    x: cx,
-    z: cz,
-    w: 2.6,
-    d: 2.6,
-    wallH: 1.1,
-    roofH: 1.3,
-    doorSide: 0,
-    ridgeAlongX: true,
-    palette: 0,
-  })
+  // 中央の井戸（1 マスの囲いと、桶を吊るす柱と梁）
+  buildings.push(makeBuilding('well', cx, cz, 1, 0, true, 0, 0, (rand() * 2 ** 30) >>> 0))
 
-  const count = 6 + Math.floor(rand() * 6)
+  const count = 7 + Math.floor(rand() * 6)
   for (let i = 0; i < count; i++) {
     const ang = (i / count) * Math.PI * 2 + (rand() - 0.5) * 0.55
-    const dist = radius * 0.32 + rand() * radius * 0.30
+    const dist = radius * 0.30 + rand() * radius * 0.34
     const bx = cx + Math.cos(ang) * dist
     const bz = cz + Math.sin(ang) * dist
 
     const roll = rand()
-    const kind: BuildingKind = roll < 0.12 ? 'hall' : roll < 0.26 ? 'shed' : 'house'
-    let w: number
-    let d: number
-    let wallH: number
+    const kind: BuildingKind = roll < 0.14 ? 'hall' : roll < 0.30 ? 'shed' : 'house'
+    let along: number
+    let levels: number
     if (kind === 'hall') {
-      w = 9 + rand() * 3
-      d = 6.5 + rand() * 2
-      wallH = 4.2
+      along = 3 + Math.floor(rand() * 2)
+      levels = 2 // 仕切りの無い 6 m の大広間
     } else if (kind === 'shed') {
-      w = 4 + rand() * 1.5
-      d = 3.4 + rand() * 1.2
-      wallH = 2.5
+      along = 2
+      levels = 1
     } else {
-      w = 5.5 + rand() * 2.5
-      d = 4.8 + rand() * 2
-      wallH = 3.1 + rand() * 0.7
+      along = 2 + Math.floor(rand() * 2)
+      levels = rand() < 0.45 ? 2 : 1 // 2 段なら中に床と階段が入る
     }
-    if (rand() < 0.5) {
-      const t = w
-      w = d
-      d = t
-    }
+    const ridgeAlongX = rand() < 0.5
 
     // 既存の建物と重ならないように
+    const w = (ridgeAlongX ? along : 2) * BUILD_CELL
+    const d = (ridgeAlongX ? 2 : along) * BUILD_CELL
     let clash = false
     for (const other of buildings) {
       const need = (Math.max(w, d) + Math.max(other.w, other.d)) * 0.5 + 3
@@ -153,38 +181,33 @@ export function makeVillage(
     const dz = cz - bz
     const doorSide = Math.abs(dx) > Math.abs(dz) ? (dx > 0 ? 0 : 1) : dz > 0 ? 2 : 3
 
-    buildings.push({
-      kind,
-      x: bx,
-      z: bz,
-      w,
-      d,
-      wallH,
-      roofH: 1.6 + rand() * 1.3,
-      doorSide,
-      ridgeAlongX: w >= d,
-      palette: Math.floor(rand() * 4),
-    })
+    buildings.push(
+      makeBuilding(
+        kind,
+        bx,
+        bz,
+        along,
+        levels,
+        ridgeAlongX,
+        doorSide,
+        Math.floor(rand() * 4),
+        (rand() * 2 ** 30) >>> 0,
+      ),
+    )
     paths.push([cx, cz, bx, bz])
   }
 
-  // 見張り台
+  // 見張り台。2 段の壁の上が手すり付きの露台になる
   if (rand() < 0.7) {
     const ang = rand() * Math.PI * 2
-    const bx = cx + Math.cos(ang) * radius * 0.64
-    const bz = cz + Math.sin(ang) * radius * 0.64
-    buildings.push({
-      kind: 'tower',
-      x: bx,
-      z: bz,
-      w: 3.2,
-      d: 3.2,
-      wallH: 7.5,
-      roofH: 1.8,
-      doorSide: 0,
-      ridgeAlongX: true,
-      palette: 2,
-    })
+    const bx = cx + Math.cos(ang) * radius * 0.66
+    const bz = cz + Math.sin(ang) * radius * 0.66
+    const dx = cx - bx
+    const dz = cz - bz
+    const doorSide = Math.abs(dx) > Math.abs(dz) ? (dx > 0 ? 0 : 1) : dz > 0 ? 2 : 3
+    buildings.push(
+      makeBuilding('tower', bx, bz, 2, 2, true, doorSide, 2, (rand() * 2 ** 30) >>> 0),
+    )
     paths.push([cx, cz, bx, bz])
   }
 
@@ -246,76 +269,4 @@ function distanceToSegment(
   let t = ((px - x1) * dx + (pz - z1) * dz) / len2
   t = t < 0 ? 0 : t > 1 ? 1 : t
   return Math.hypot(px - (x1 + dx * t), pz - (z1 + dz * t))
-}
-
-/**
- * 建物の壁を軸平行ボックスに分解する。ドアの部分は開口として抜く。
- * 描画も物理もこの同じ配列を使うので、見た目と当たり判定が必ず一致する。
- */
-export function buildingBoxes(b: Building, baseY: number): Box[] {
-  const out: Box[] = []
-  const hw = b.w / 2
-  const hd = b.d / 2
-  const y0 = baseY
-  const y1 = baseY + b.wallH
-
-  if (b.kind === 'well') {
-    // 井戸：低い石囲いを 4 枚
-    const r = hw
-    push(out, b.x - r, y0, b.z - r, b.x + r, y0 + b.wallH, b.z - r + 0.3)
-    push(out, b.x - r, y0, b.z + r - 0.3, b.x + r, y0 + b.wallH, b.z + r)
-    push(out, b.x - r, y0, b.z - r, b.x - r + 0.3, y0 + b.wallH, b.z + r)
-    push(out, b.x + r - 0.3, y0, b.z - r, b.x + r, y0 + b.wallH, b.z + r)
-    return out
-  }
-
-  // 0:+x 1:-x 2:+z 3:-z
-  addWall(out, b, 0, b.x + hw - WALL_T, b.x + hw, b.z - hd, b.z + hd, y0, y1, false)
-  addWall(out, b, 1, b.x - hw, b.x - hw + WALL_T, b.z - hd, b.z + hd, y0, y1, false)
-  addWall(out, b, 2, b.x - hw, b.x + hw, b.z + hd - WALL_T, b.z + hd, y0, y1, true)
-  addWall(out, b, 3, b.x - hw, b.x + hw, b.z - hd, b.z - hd + WALL_T, y0, y1, true)
-  return out
-}
-
-function addWall(
-  out: Box[],
-  b: Building,
-  side: number,
-  minX: number,
-  maxX: number,
-  minZ: number,
-  maxZ: number,
-  y0: number,
-  y1: number,
-  alongX: boolean,
-): void {
-  const hasDoor = b.doorSide === side && b.kind !== 'tower'
-  if (!hasDoor) {
-    push(out, minX, y0, minZ, maxX, y1, maxZ)
-    return
-  }
-  const doorY = Math.min(y0 + DOOR_H, y1)
-  if (alongX) {
-    const c = b.x
-    push(out, minX, y0, minZ, c - DOOR_W / 2, y1, maxZ)
-    push(out, c + DOOR_W / 2, y0, minZ, maxX, y1, maxZ)
-    if (doorY < y1) push(out, c - DOOR_W / 2, doorY, minZ, c + DOOR_W / 2, y1, maxZ)
-  } else {
-    const c = b.z
-    push(out, minX, y0, minZ, maxX, y1, c - DOOR_W / 2)
-    push(out, minX, y0, c + DOOR_W / 2, maxX, y1, maxZ)
-    if (doorY < y1) push(out, minX, doorY, c - DOOR_W / 2, maxX, y1, c + DOOR_W / 2)
-  }
-}
-
-function push(
-  out: Box[],
-  minX: number,
-  minY: number,
-  minZ: number,
-  maxX: number,
-  maxY: number,
-  maxZ: number,
-): void {
-  out.push({ minX, minY, minZ, maxX, maxY, maxZ })
 }

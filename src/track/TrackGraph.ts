@@ -1,4 +1,4 @@
-import type { Box } from '../world/village'
+import type { Box } from '../world/collision'
 import type { Collider } from '../world/collision'
 import { colliderBounds, obbOverlap, rayCollider } from '../world/collision'
 import {

@@ -1,5 +1,4 @@
-import type { Box } from '../world/village'
-import type { Collider } from '../world/collision'
+import type { Box, Collider } from '../world/collision'
 import { colliderBounds, obbOverlap, rayCollider } from '../world/collision'
 import {
   PIECE_KINDS,
@@ -126,6 +125,15 @@ export class BuildGrid {
     if (this.overlaps(p)) return false
     this.insert(p)
     return true
+  }
+
+  /**
+   * 重なりを調べずにまとめて入れる。**すでに整合していると分かっている一式**
+   * （村の建物のように生成側が組み方を保証しているもの）を空間索引へ流し込むためのもので、
+   * プレイヤーの設置には使わない（そちらは {@link place} が重なりを見る）。
+   */
+  fill(pieces: Iterable<Piece>): void {
+    for (const p of pieces) this.insert(p)
   }
 
   /** 取り除く。取り除いたパーツを返す。 */
@@ -625,10 +633,13 @@ export class BuildGrid {
 
 /**
  * 地形に直接置くときの既定の向き。
- * 板は**プレイヤーの方を向き**、階段と屋根は**プレイヤーから見て奥へ昇る**。
+ * 板と家具は**プレイヤーの方を向き**、階段・屋根・妻壁は**プレイヤーから見て奥へ昇る**。
  */
 export function defaultYaw(kind: PieceKind, camYaw: number): number {
-  if (kind === 'stair' || kind === 'roof') return yawFromRad(camYaw + Math.PI / 2)
+  // 昇る向き・棟の向きを持つパーツはプレイヤーから見て奥へ、それ以外は手前を向く
+  if (kind === 'stair' || kind === 'roof' || kind === 'gable') {
+    return yawFromRad(camYaw + Math.PI / 2)
+  }
   return yawFromRad(camYaw - Math.PI / 2)
 }
 

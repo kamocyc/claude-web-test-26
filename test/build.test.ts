@@ -6,6 +6,7 @@ import {
   PIECE_COST,
   PIECE_KINDS,
   STAIR_STEPS,
+  isPanel,
   localBoxes,
   normalizeYaw,
   pieceColliders,
@@ -351,18 +352,11 @@ describe('材料', () => {
     // 掘った体積 = 盛れる体積、という既存の釣り合いを崩さないための歯止め。
     // 壁族は開口があっても同じ値（穴を開けたぶん安くはならない）
     const panel = volume('wall')
-    const ref: Record<PieceKind, number> = {
-      wall: panel,
-      window: panel,
-      door: panel,
-      floor: volume('floor'),
-      stair: volume('stair'),
-      roof: volume('roof'),
-      block: volume('block'),
-    }
     for (const kind of PIECE_KINDS) {
-      expect(PIECE_COST[kind], `${kind} が安すぎる`).toBeGreaterThan(ref[kind] * 0.7)
-      expect(PIECE_COST[kind], `${kind} が高すぎる`).toBeLessThan(ref[kind] * 1.7)
+      const ref = isPanel(kind) ? panel : volume(kind)
+      // 柱や家具は 1 m³ に満たない。体積どおりだと 0 になってしまうので 1〜2 に丸めてある
+      expect(PIECE_COST[kind], `${kind} が安すぎる`).toBeGreaterThan(Math.min(ref * 0.7, 0.9))
+      expect(PIECE_COST[kind], `${kind} が高すぎる`).toBeLessThan(Math.max(ref * 1.7, 2.5))
     }
   })
 

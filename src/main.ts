@@ -6,7 +6,6 @@ import { createGlassMaterial, createTerrainMaterial } from './render/TerrainMate
 import { createNoiseTexture } from './render/proceduralTextures'
 import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
 import { VillageManager } from './world/VillageManager'
-import type { Box } from './world/village'
 import { worldToLocal } from './world/collision'
 import type { Collider } from './world/collision'
 import { World, createTreeHit } from './world/World'
@@ -33,6 +32,7 @@ import { ITEM_BY_MATERIAL, RECIPES, TRADES, item, tryItem } from './items/items'
 import { MobManager } from './mobs/MobManager'
 import { TorchManager } from './world/TorchManager'
 import { BuildManager } from './build/BuildManager'
+import { doorPosition } from './build/villagePieces'
 import type { PlaceCheck, SnapResult } from './build/BuildGrid'
 import {
   BUILD_CELL,
@@ -287,7 +287,7 @@ async function boot(): Promise<void> {
   scene.add(water.mesh)
 
   const VIEW_RANGE = VIEW_DISTANCE * CHUNK_SIZE
-  const boxScratch: Box[] = []
+  const boxScratch: Collider[] = []
 
   const player = new Player()
   if (meta) {
@@ -533,7 +533,7 @@ async function boot(): Promise<void> {
     hud.setBrush(brushLabel())
     hud.showToast('向きを既定に戻しました')
   }
-  controls.onCyclePiece = () => {
+  controls.onCyclePiece = (back: boolean) => {
     if (TOOLS[tool].id === 'station') {
       departRoute()
       hud.setBrush(brushLabel())
@@ -552,7 +552,9 @@ async function boot(): Promise<void> {
       hud.showToast('建築・軌道・駅のモードで使えます（B で切替）')
       return
     }
-    pieceIndex = (pieceIndex + 1) % PIECE_KINDS.length
+    // 種類が増えたので、Shift を押していれば逆回りに戻れる
+    const step = back ? PIECE_KINDS.length - 1 : 1
+    pieceIndex = (pieceIndex + step) % PIECE_KINDS.length
     hud.showToast(`パーツ: ${PIECE_NAME[PIECE_KINDS[pieceIndex]]}`)
     hud.setBrush(brushLabel())
   }
@@ -972,6 +974,51 @@ async function boot(): Promise<void> {
     /** 建てたパーツが持つ当たり判定の箱の数。 */
     buildColliders(): number {
       return build.colliderCount
+    },
+    /** 村の建物を組んでいる建築パーツの数。 */
+    villagePieceCount(): number {
+      return villages.pieceCount
+    },
+    /** 最寄りの村の間取り（テスト用）。 */
+    nearestVillage(): {
+      cx: number
+      cz: number
+      radius: number
+      platformY: number
+      buildings: Array<{
+        kind: string
+        x: number
+        z: number
+        w: number
+        d: number
+        levels: number
+        doorSide: number
+        doorX: number
+        doorZ: number
+      }>
+    } | null {
+      const v = world.field.villageNear(player.position.x, player.position.z)
+      if (!v) return null
+      return {
+        cx: v.cx,
+        cz: v.cz,
+        radius: v.radius,
+        platformY: v.platformY,
+        buildings: v.buildings.map((b) => {
+          const door = doorPosition(b)
+          return {
+            kind: b.kind,
+            x: b.x,
+            z: b.z,
+            w: b.w,
+            d: b.d,
+            levels: b.levels,
+            doorSide: b.doorSide,
+            doorX: door.x,
+            doorZ: door.z,
+          }
+        }),
+      }
     },
     /** 敷いた軌道の区間数。 */
     trackCount(): number {
@@ -1398,7 +1445,7 @@ async function boot(): Promise<void> {
     trunksNear: (x, y, z, r) => world.collectTrunks(x, y, z, r, mobTrunkBuf),
     boxesNear: (x, y, z, r, out) => {
       // 村の建物（out を空にして詰める）に、建てたパーツを足す
-      villages.collidersNear(x, z, r, out)
+      villages.collidersNear(x, z, r, out, y - 2, y + 4)
       build.collectColliders(x, z, r, out, y - 2, y + 4)
       tracks.collectColliders(x, z, r, out, y - 2, y + 4)
       return trains.collectColliders(x, z, r, out, y - 2, y + 4)
@@ -2249,7 +2296,14 @@ async function boot(): Promise<void> {
 
     // 木の幹と建物の壁の当たり判定は毎フレーム 1 回だけ集める
     player.trunks = world.collectTrunks(player.position.x, player.position.y, player.position.z, 4)
-    player.boxes = villages.collidersNear(player.position.x, player.position.z, 1.2, boxScratch)
+    player.boxes = villages.collidersNear(
+      player.position.x,
+      player.position.z,
+      1.2,
+      boxScratch,
+      player.position.y - 1.2,
+      player.position.y + player.height + 0.5,
+    )
     build.collectColliders(
       player.position.x,
       player.position.z,

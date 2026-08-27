@@ -3,40 +3,31 @@ import { BuildGrid, createPieceHit } from './BuildGrid'
 import type { PieceHit, PlaceCheck, SnapResult, SolidFn } from './BuildGrid'
 import { PIECE_COST, pieceColliders, yawRad } from './pieces'
 import type { Piece, PieceKind } from './pieces'
-import { ghostMaterial, pieceGeometry, pieceMaterials, snapMarkerMaterial } from '../render/buildMeshes'
+import { ghostMaterial, pieceGeometry, snapMarkerMaterial } from '../render/buildMeshes'
+import { PieceRenderer } from '../render/PieceRenderer'
 import type { Collider } from '../world/collision'
-
-interface InstanceGroup {
-  kind: PieceKind
-  mat: number
-  pieces: Piece[]
-  mesh: THREE.InstancedMesh | null
-  dirty: boolean
-}
 
 /**
  * 置いた建築パーツの描画と保持。
  *
- * 判定は {@link BuildGrid}（three 非依存）に任せ、ここは
- * 「種類 × 素材」ごとの {@link THREE.InstancedMesh} と設置予定のゴーストだけを持つ。
- * 村の建物（`VillageManager`）と同じく、当たり判定は `Box` の配列で外へ渡す。
+ * 判定は {@link BuildGrid}（three 非依存）に任せ、描画は {@link PieceRenderer} に任せる。
+ * ここが持つのは設置予定のゴーストと吸着の印だけ。
+ * 描画を村（`VillageManager`）と共有しているので、**自分で建てたパーツと村の建物は
+ * 同じジオメトリ・同じマテリアルで描かれる**。
  */
 export class BuildManager {
-  readonly group = new THREE.Group()
   readonly grid = new BuildGrid()
 
-  private readonly groups = new Map<string, InstanceGroup>()
+  private readonly renderer = new PieceRenderer('build')
   private readonly ghost: THREE.Mesh
   /** どの接続点に噛んだかを見せる印。これが無いと吸着先が読めない。 */
   private readonly marker: THREE.Mesh
-  private readonly dummy = new THREE.Object3D()
   private readonly hit = createPieceHit()
   private readonly boxScratch: Collider[] = []
   private colliders = 0
 
   constructor(scene: THREE.Scene) {
-    this.group.name = 'build'
-    scene.add(this.group)
+    scene.add(this.renderer.group)
     this.ghost = new THREE.Mesh(pieceGeometry('wall'), ghostMaterial(true))
     this.ghost.visible = false
     this.ghost.matrixAutoUpdate = true
@@ -67,9 +58,7 @@ export class BuildManager {
   place(p: Piece): boolean {
     if (!this.grid.place(p)) return false
     this.colliders += pieceColliders(p, this.boxScratch).length
-    const g = this.groupOf(p.kind, p.mat)
-    g.pieces.push(p)
-    g.dirty = true
+    this.renderer.add(p)
     return true
   }
 
@@ -77,20 +66,14 @@ export class BuildManager {
     const gone = this.grid.remove(p)
     if (!gone) return null
     this.colliders -= pieceColliders(gone, this.boxScratch).length
-    const g = this.groupOf(gone.kind, gone.mat)
-    const i = g.pieces.indexOf(gone)
-    if (i >= 0) g.pieces.splice(i, 1)
-    g.dirty = true
+    this.renderer.remove(gone)
     return gone
   }
 
   clear(): void {
     this.grid.clear()
     this.colliders = 0
-    for (const g of this.groups.values()) {
-      g.pieces.length = 0
-      g.dirty = true
-    }
+    this.renderer.clear()
     this.rebuild()
   }
 
@@ -144,41 +127,7 @@ export class BuildManager {
 
   /** 変更のあった「種類 × 素材」だけ作り直す。何も変わっていなければ何もしない。 */
   rebuild(): void {
-    for (const g of this.groups.values()) {
-      if (!g.dirty) continue
-      g.dirty = false
-      const n = g.pieces.length
-      if (g.mesh && g.mesh.instanceMatrix.count < n) {
-        this.group.remove(g.mesh)
-        g.mesh.dispose()
-        g.mesh = null
-      }
-      if (n === 0) {
-        if (g.mesh) g.mesh.count = 0
-        continue
-      }
-      if (!g.mesh) {
-        const capacity = Math.max(32, Math.ceil(n * 1.6))
-        // 窓だけはジオメトリのグループで枠とガラスを塗り分けるのでマテリアルが 2 つになる
-        const mesh = new THREE.InstancedMesh(
-          pieceGeometry(g.kind),
-          pieceMaterials(g.kind, g.mat) as THREE.Material,
-          capacity,
-        )
-        mesh.castShadow = true
-        mesh.receiveShadow = true
-        mesh.frustumCulled = false
-        g.mesh = mesh
-        this.group.add(mesh)
-      }
-      for (let i = 0; i < n; i++) {
-        this.applyTransform(g.pieces[i])
-        g.mesh.setMatrixAt(i, this.dummy.matrix)
-      }
-      g.mesh.count = n
-      g.mesh.instanceMatrix.needsUpdate = true
-      g.mesh.computeBoundingSphere()
-    }
+    this.renderer.rebuild()
   }
 
   /** 設置予定の半透明表示と、吸着した接続点の印。`p` が null なら隠す。 */
@@ -214,36 +163,14 @@ export class BuildManager {
 
   private rebuildFrom(fill: () => void): void {
     this.grid.clear()
-    for (const g of this.groups.values()) {
-      g.pieces.length = 0
-      g.dirty = true
-    }
+    this.renderer.clear()
     fill()
     this.colliders = 0
     for (const p of this.grid.pieces()) {
       this.colliders += pieceColliders(p, this.boxScratch).length
-      const g = this.groupOf(p.kind, p.mat)
-      g.pieces.push(p)
-      g.dirty = true
+      this.renderer.add(p)
     }
     this.rebuild()
-  }
-
-  private applyTransform(p: Piece): void {
-    this.dummy.position.set(p.x, p.y, p.z)
-    this.dummy.rotation.set(0, yawRad(p.yaw), 0)
-    this.dummy.scale.setScalar(1)
-    this.dummy.updateMatrix()
-  }
-
-  private groupOf(kind: PieceKind, mat: number): InstanceGroup {
-    const key = `${kind}|${mat}`
-    let g = this.groups.get(key)
-    if (!g) {
-      g = { kind, mat, pieces: [], mesh: null, dirty: true }
-      this.groups.set(key, g)
-    }
-    return g
   }
 }
 
