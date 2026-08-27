@@ -69,30 +69,6 @@ const REACH = 9
 const MIN_BRUSH = 1
 const MAX_BRUSH = 6
 const EDIT_INTERVAL = 0.09
-
-/**
- * 1 回の掘削で削る深さ（m）の範囲と刻み。
- *
- * 掘るのは一気にではなく、掛けるたびにブラシの形へこの深さぶんずつ近づく。
- * 上限を超えると {@link DIG_ALL} になり、昔どおり 1 回でブラシの形を抜く。
- */
-const MIN_DIG_DEPTH = 0.1
-const MAX_DIG_DEPTH = 1.5
-const DIG_DEPTH_STEP = 0.1
-const DEFAULT_DIG_DEPTH = 0.4
-
-/** 掘る強さを 1 段ずらす。上限の 1 つ上が「一気に」。 */
-export function stepDigDepth(depth: number, dir: number): number {
-  if (depth >= DIG_ALL) return dir > 0 ? DIG_ALL : MAX_DIG_DEPTH
-  const next = Math.round((depth + dir * DIG_DEPTH_STEP) * 10) / 10
-  if (next > MAX_DIG_DEPTH + 1e-9) return DIG_ALL
-  return Math.max(MIN_DIG_DEPTH, next)
-}
-
-/** 掘る強さの表示。 */
-export function digDepthLabel(depth: number): string {
-  return depth >= DIG_ALL ? '一気に' : `${depth.toFixed(1)} m/回`
-}
 const CHOP_INTERVAL = 0.25
 const ATTACK_INTERVAL = 0.42
 const MAX_HEALTH = 20
@@ -178,6 +154,30 @@ const MAX_BOX_EDGE = 8
  * 整数にしておくと半サイズが 0.5 の倍数になり、
  * 面を格子平面にぴったり乗せられる（= 稜が丸まらない）。
  */
+/**
+ * 1 回の掘削で削る深さ（m）の範囲と刻み。
+ *
+ * 掘るのは一気にではなく、掛けるたびにブラシの形へこの深さぶんずつ近づく。
+ * 上限を超えると {@link DIG_ALL} になり、昔どおり 1 回でブラシの形を抜く。
+ */
+const MIN_DIG_DEPTH = 0.1
+const MAX_DIG_DEPTH = 1.5
+const DIG_DEPTH_STEP = 0.1
+const DEFAULT_DIG_DEPTH = 0.4
+
+/** 掘る強さを 1 段ずらす。上限の 1 つ上が「一気に」。 */
+export function stepDigDepth(depth: number, dir: number): number {
+  if (depth >= DIG_ALL) return dir > 0 ? DIG_ALL : MAX_DIG_DEPTH
+  const next = Math.round((depth + dir * DIG_DEPTH_STEP) * 10) / 10
+  if (next > MAX_DIG_DEPTH + 1e-9) return DIG_ALL
+  return Math.max(MIN_DIG_DEPTH, next)
+}
+
+/** 掘る強さの表示。 */
+export function digDepthLabel(depth: number): string {
+  return depth >= DIG_ALL ? '一気に' : `${depth.toFixed(1)} m/回`
+}
+
 export function boxEdge(radius: number): number {
   const t = Math.max(0, Math.min(1, (radius - MIN_BRUSH) / (MAX_BRUSH - MIN_BRUSH)))
   return Math.round(MIN_BOX_EDGE + t * (MAX_BOX_EDGE - MIN_BOX_EDGE))

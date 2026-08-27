@@ -16,7 +16,14 @@ import {
 import { DensityField } from './density'
 import { Chunk, TREE_FIELDS, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
 import type { EditMap } from './Chunk'
-import { DIG_ALL, applyBrush, applyBrushes, applySmoothBrush, isLooseMaterial, settleLoose } from './edits'
+import {
+  DIG_ALL,
+  applyBrush,
+  applyBrushes,
+  applySmoothBrush,
+  isLooseMaterial,
+  settleLoose,
+} from './edits'
 import type { BrushBounds, BrushMode, BrushOp, BrushShape } from './edits'
 import { TREE_CELL, TREE_STRIDE, treeCellKey } from './vegetation'
 import { WorkerPool } from './WorkerPool'
