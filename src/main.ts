@@ -33,7 +33,7 @@ import { MobManager } from './mobs/MobManager'
 import { TorchManager } from './world/TorchManager'
 import { BuildManager } from './build/BuildManager'
 import { doorPosition } from './build/villagePieces'
-import type { PlaceCheck, SnapResult } from './build/BuildGrid'
+import type { PieceHit, PlaceCheck, SnapResult } from './build/BuildGrid'
 import {
   BUILD_CELL,
   PIECE_COST,
@@ -266,6 +266,11 @@ async function boot(): Promise<void> {
   // pieces2 が新形式。格子だった頃の pieces しか無いワールドは移して読む
   if (meta?.pieces2) build.load(meta.pieces2)
   else if (meta?.pieces) build.loadLegacy(meta.pieces, BUILD_CELL)
+  // 村の建物を「近隣のパーツ」として設置判定に混ぜる。
+  // これで村の壁の接続点に吸着でき、同じ場所へ二重に置くこともなくなる
+  build.grid.neighbors = (minX, minY, minZ, maxX, maxY, maxZ, out) =>
+    villages.piecesInBounds(minX, minY, minZ, maxX, maxY, maxZ, out)
+  if (meta?.villageEdits) villages.load(meta.villageEdits)
 
   // 敷いた線路と道路。建築パーツと同じく地形とは別レイヤに持ち、当たり判定だけ合流する
   const tracks = new TrackManager(scene)
@@ -649,6 +654,7 @@ async function boot(): Promise<void> {
       inventory: inventory.toJSON(),
       torches: [...torches.torches],
       pieces2: build.serialize(),
+      villageEdits: villages.serialize(),
       tracks: tracks.serialize(),
       stations: trains.serialize().stations,
       trainRoutes: trains.serialize().trains,
@@ -958,8 +964,10 @@ async function boot(): Promise<void> {
     },
     /** 指定座標にいちばん近いパーツを壊す（テスト用）。材料は戻る。 */
     removePieceAt(x: number, y: number, z: number, range = 3): boolean {
-      const p = build.nearest(x, y, z, range)
-      const gone = p ? build.remove(p) : null
+      // 自分が建てたパーツを優先し、無ければ村の建物を壊す
+      const mine = build.nearest(x, y, z, range)
+      const theirs = mine ? null : villages.nearestPiece(x, y, z, range)
+      const gone = mine ? build.remove(mine) : theirs ? villages.remove(theirs) : null
       if (!gone) return false
       const def = ITEM_BY_MATERIAL.get(gone.mat)
       if (def) inventory.add(def.id, PIECE_COST[gone.kind])
@@ -970,6 +978,29 @@ async function boot(): Promise<void> {
     /** 建てたパーツの数。 */
     pieceCount(): number {
       return build.count
+    },
+    /** いま照準が当たっているパーツ（`village` が true なら村の建物）。テスト用。 */
+    aimedPiece(): {
+      kind: string
+      village: boolean
+      distance: number
+      x: number
+      y: number
+      z: number
+      deg: number
+    } | null {
+      const a = aimPiece()
+      if (!a.hit) return null
+      const q = a.hit.piece
+      return {
+        kind: q.kind as string,
+        village: a.village,
+        distance: a.hit.distance,
+        x: q.x,
+        y: q.y,
+        z: q.z,
+        deg: yawDeg(q.yaw),
+      }
     },
     /** 建てたパーツが持つ当たり判定の箱の数。 */
     buildColliders(): number {
@@ -1716,6 +1747,20 @@ async function boot(): Promise<void> {
   }
 
   /**
+   * 照準に当たっているパーツ。自分が建てたものと村の建物のうち**手前の方**を返す
+   * （`village` でどちらか分かる）。毎フレーム呼ぶので使い回しの器に詰める。
+   */
+  function aimPiece(): { hit: PieceHit | null; village: boolean } {
+    const mine = build.raycast(eye.x, eye.y, eye.z, lookDir.x, lookDir.y, lookDir.z, REACH)
+    const theirs = villages.raycast(eye.x, eye.y, eye.z, lookDir.x, lookDir.y, lookDir.z, REACH)
+    AIM.village = theirs !== null && (mine === null || theirs.distance < mine.distance)
+    AIM.hit = AIM.village ? theirs : mine
+    return AIM
+  }
+
+  const AIM: { hit: PieceHit | null; village: boolean } = { hit: null, village: false }
+
+  /**
    * 建築モードの 1 フレーム。
    *
    * 照準の当たった点を既存パーツの接続点へ吸着させてゴーストを出し、
@@ -1734,8 +1779,10 @@ async function boot(): Promise<void> {
       invalidateBuild()
     }
 
-    // 照準は「建てたパーツ」と「地形」の手前の方
-    const pieceHit = build.raycast(eye.x, eye.y, eye.z, lookDir.x, lookDir.y, lookDir.z, REACH)
+    // 照準は「建てたパーツ」「村の建物」「地形」のいちばん手前
+    const aim = aimPiece()
+    const pieceHit = aim.hit
+    const fromVillage = aim.village
     const terrain = raycastTerrain(world, eye, lookDir, REACH, hit)
     const onPiece =
       pieceHit !== null && pieceHit.distance < (terrain ? terrain.distance : Infinity)
@@ -1783,9 +1830,14 @@ async function boot(): Promise<void> {
 
     if (editCooldown > 0) return
 
-    // 左クリック = 解体。材料は全額戻る
+    // 左クリック = 解体。材料は全額戻る（村の建物も同じように壊せる）
     if (controls.digging) {
-      const gone = onPiece && pieceHit ? build.remove(pieceHit.piece) : null
+      const gone =
+        onPiece && pieceHit
+          ? fromVillage
+            ? villages.remove(pieceHit.piece)
+            : build.remove(pieceHit.piece)
+          : null
       if (gone) {
         const def = ITEM_BY_MATERIAL.get(gone.mat)
         if (def) inventory.add(def.id, PIECE_COST[gone.kind])

@@ -68,11 +68,15 @@ export function doorPosition(b: Building): { x: number; z: number } {
   }
 }
 
-/** 村ひとつぶんの建築パーツ。 */
+/**
+ * 村ひとつぶんの建築パーツ。
+ *
+ * 基準面を敷地高さの {@link PANEL_T} 下に置くので、**1 階の床板の上面が
+ * ちょうど外の地面と同じ高さ**になる。戸口に段差が生まれず、そのまま歩いて入れる。
+ */
 export function villagePieces(v: Village, out: Piece[] = []): Piece[] {
   out.length = 0
-  const baseY = v.platformY - 0.2
-  for (const b of v.buildings) buildingPieces(b, baseY, out)
+  for (const b of v.buildings) buildingPieces(b, v.platformY - PANEL_T, out)
   return out
 }
 

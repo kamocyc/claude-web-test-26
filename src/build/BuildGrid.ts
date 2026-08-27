@@ -71,6 +71,17 @@ export function createPieceHit(): PieceHit {
   }
 }
 
+/** 近隣のパーツを `out` に**追記する**関数（{@link BuildGrid.neighbors}）。 */
+export type PieceSource = (
+  minX: number,
+  minY: number,
+  minZ: number,
+  maxX: number,
+  maxY: number,
+  maxZ: number,
+  out: Piece[],
+) => void
+
 export interface SnapResult {
   piece: Piece
   /** 吸着に使った接続点（ワールド）。地形に直接置くときは null。 */
@@ -96,6 +107,16 @@ export class BuildGrid {
    */
   private readonly lo = [Infinity, Infinity, Infinity]
   private readonly hi = [-Infinity, -Infinity, -Infinity]
+
+  /**
+   * 自分が持っていない近隣のパーツを供給する（村の建物）。
+   *
+   * **置けるか・どこへ吸着するか・支えがあるか**の判定にだけ使う。
+   * 当たり判定の収集やレイキャストには関わらない（そちらは持ち主それぞれが自分のぶんを出す）。
+   * これがあるので、村の家の壁にそのまま建て増しができ、
+   * 村の壁と同じ場所に二重置きすることもない。
+   */
+  neighbors: PieceSource | null = null
 
   private readonly seen = new Set<Piece>()
   private readonly nearScratch: Piece[] = []
@@ -202,6 +223,19 @@ export class BuildGrid {
     out: Piece[],
   ): Piece[] {
     out.length = 0
+    return this.appendPiecesInBounds(minX, minY, minZ, maxX, maxY, maxZ, out)
+  }
+
+  /** {@link piecesInBounds} と同じだが `out` を空にせず**追記する**。 */
+  appendPiecesInBounds(
+    minX: number,
+    minY: number,
+    minZ: number,
+    maxX: number,
+    maxY: number,
+    maxZ: number,
+    out: Piece[],
+  ): Piece[] {
     if (this.all.size === 0) return out
     const seen = this.seen
     seen.clear()
@@ -230,6 +264,21 @@ export class BuildGrid {
 
   // ------------------------------------------------------------ 置けるかどうか
 
+  /** 置けるかどうかの判定に使うパーツ（自分のぶん＋{@link neighbors}）。 */
+  private placementPieces(
+    minX: number,
+    minY: number,
+    minZ: number,
+    maxX: number,
+    maxY: number,
+    maxZ: number,
+    out: Piece[],
+  ): Piece[] {
+    this.piecesInBounds(minX, minY, minZ, maxX, maxY, maxZ, out)
+    this.neighbors?.(minX, minY, minZ, maxX, maxY, maxZ, out)
+    return out
+  }
+
   canPlace(p: Piece, isSolid: SolidFn): PlaceCheck {
     if (this.overlaps(p)) return 'overlap'
     return this.isSupported(p, isSolid) ? 'ok' : 'unsupported'
@@ -249,7 +298,7 @@ export class BuildGrid {
    */
   private hits(p: Piece, grow: number, scale: number): boolean {
     const b = pieceBounds(p, this.boundsA)
-    this.piecesInBounds(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ, this.overlapScratch)
+    this.placementPieces(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ, this.overlapScratch)
     if (this.overlapScratch.length === 0) return false
     const mine = pieceColliders(p, this.colsA)
     for (const q of this.overlapScratch) {
@@ -299,7 +348,7 @@ export class BuildGrid {
     // 2. 既存のパーツ
     const b = pieceBounds(p, this.boundsB)
     const r = SUPPORT_REACH
-    this.piecesInBounds(
+    this.placementPieces(
       b.minX - r,
       b.minY - r,
       b.minZ - r,
@@ -352,7 +401,7 @@ export class BuildGrid {
     this.candPoint.length = 0
 
     const r = SNAP_RANGE
-    this.piecesInBounds(px - r, py - r, pz - r, px + r, py + r, pz + r, this.nearScratch)
+    this.placementPieces(px - r, py - r, pz - r, px + r, py + r, pz + r, this.nearScratch)
 
     for (const q of this.nearScratch) {
       const qPts = snapPoints(q.kind)

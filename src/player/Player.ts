@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import type { World, FieldSample } from '../world/World'
 import { SEA_LEVEL, WALKABLE_NY, WORLD_MIN_Y } from '../world/constants'
 import type { Controls } from './Controls'
-import { deltaToWorld, worldToLocal } from '../world/collision'
+import { deltaToLocal, deltaToWorld, escapeDelta, worldToLocal } from '../world/collision'
 import type { Collider } from '../world/collision'
 
 const RADIUS = 0.38
@@ -152,9 +152,14 @@ export class Player {
       this.velocity.multiplyScalar(1 - Math.min(1, 2.2 * dt))
       this.velocity.y = Math.max(this.velocity.y, -4.5)
     } else {
-      // 箱の天面は「地形に立てていないとき」だけ見る（地形が優先）
+      // 立っているのが箱の天面なら**そちらを優先する**。
+      // 地形を先に見ると、床板を地面の上に張ったときに「地形に立っている」と判定され、
+      // `snapToGround` が地形まで引き戻す → 次のフレームで床板に乗り直す、を毎フレーム
+      // 繰り返して足元がばたつく（板厚ぶんの小さな段差ほど起きやすい）。
+      // `probeBoxGround` は足元が天面とほぼ同じ高さのときしか true にならないので、
+      // 床の下をくぐっているときに拾ってしまうことはない。
       this.boxGroundY = -Infinity
-      const grounded = this.probeGround(world) || this.probeBoxGround()
+      const grounded = this.probeBoxGround() || this.probeGround(world)
       this.onGround = grounded
 
       const speed = sprint ? SPRINT_SPEED : WALK_SPEED
@@ -253,18 +258,22 @@ export class Player {
 
   /** 接地しているのに浮いている分だけ真下に降ろす。 */
   private snapToGround(world: World): void {
-    // 建てた床・階段の上では、その天面へ降ろす。これが無いと最大 GROUND_PROBE ぶん浮く
-    if (this.boxGroundY > -Infinity) {
-      const gap = this.position.y - this.boxGroundY
-      if (gap > 0 && gap < GROUND_PROBE) this.position.y = this.boxGroundY
-      return
-    }
     const s = this.sample
     world.sample(this.position.x, this.position.y + RADIUS, this.position.z, s)
     const g = Math.hypot(s.gx, s.gy, s.gz)
-    if (g < 1e-5) return
-    const gap = -(s.d / g) - RADIUS
-    if (gap > 0 && gap < GROUND_PROBE) this.position.y -= gap
+    const terrain = g < 1e-5 ? Infinity : -(s.d / g) - RADIUS
+
+    // 建てた床・階段の上では、その天面へ降ろす。これが無いと最大 GROUND_PROBE ぶん浮く。
+    // ただし**地形より下に埋まっている床は使わない** — 地面に立っているのに
+    // 埋まった床まで引きずり降ろされ、地形の押し出しと毎フレーム引っ張り合いになる
+    if (this.boxGroundY > -Infinity) {
+      const box = this.position.y - this.boxGroundY
+      if (box >= 0 && box <= terrain) {
+        if (box > 0 && box < GROUND_PROBE) this.position.y = this.boxGroundY
+        return
+      }
+    }
+    if (terrain > 0 && terrain < GROUND_PROBE) this.position.y -= terrain
   }
 
   /**
@@ -418,7 +427,7 @@ export class Player {
 
       // 段差に乗る（屋根や台の上、階段の 1 段）
       const oy = b.maxY - feet
-      if (oy > 0 && oy <= BOX_STEP && this.velocity.y <= 0 && this.boxFreeAbove(b.maxY)) {
+      if (oy > 0 && oy <= BOX_STEP && this.velocity.y <= 0 && this.boxFreeAbove(b.maxY, feet)) {
         this.position.y = b.maxY
         if (this.velocity.y < 0) this.velocity.y = 0
         this.onGround = true
@@ -426,18 +435,13 @@ export class Player {
         continue
       }
 
-      // 最小移動量の向きをローカルで決め、その移動量だけワールドへ回して押し出す
-      const ox1 = px - minX
-      const ox2 = maxX - px
-      const oz1 = pz - minZ
-      const oz2 = maxZ - pz
-      const best = Math.min(ox1, ox2, oz1, oz2)
-      let dx = 0
-      let dz = 0
-      if (best === ox1) dx = -ox1
-      else if (best === ox2) dx = ox2
-      else if (best === oz1) dz = -oz1
-      else dz = oz2
+      // 押し出す向き。単純な最小移動量ではなく、**進んできた向きへは押さない**
+      // （{@link escapeDelta}）。3 m の板を並べた村の壁では、これが無いと
+      // 部屋の中から壁の外へ押し出されてしまう
+      deltaToLocal(b, this.velocity.x, this.velocity.z, VEL)
+      escapeDelta(px, pz, minX, maxX, minZ, maxZ, VEL[0], VEL[1], DELTA)
+      const dx = DELTA[0]
+      const dz = DELTA[1]
       deltaToWorld(b, dx, dz, LOCAL)
       this.position.x += LOCAL[0]
       this.position.z += LOCAL[1]
@@ -454,13 +458,21 @@ export class Player {
     }
   }
 
-  /** 足元 `feet` に立ったとき、他の箱に頭や体がぶつからないか。 */
-  private boxFreeAbove(feet: number): boolean {
+  /**
+   * 足元 `feet` に立ったとき、他の箱に頭や体がぶつからないか。
+   *
+   * **`from` の高さで既にめり込んでいる箱は数えない**。その箱はどのみち水平に
+   * 押し戻してくるので、段差に乗れるかどうかとは関係がない。
+   * これを数えていると、**壁際や戸口の脇では床スラブに乗れず**、
+   * 代わりにスラブが水平に押してきて引っかかる（戸口で足を取られる原因だった）。
+   */
+  private boxFreeAbove(feet: number, from: number): boolean {
     for (const b of this.boxes) {
       if (b.maxY <= feet + 1e-3) continue
       worldToLocal(b, this.position.x, this.position.z, FREE)
       if (FREE[0] <= b.minX - RADIUS || FREE[0] >= b.maxX + RADIUS) continue
       if (FREE[1] <= b.minZ - RADIUS || FREE[1] >= b.maxZ + RADIUS) continue
+      if (from + HEIGHT > b.minY && from < b.maxY) continue
       if (feet + HEIGHT > b.minY && feet < b.maxY) return false
     }
     return true
@@ -495,6 +507,10 @@ export const PLAYER_EYE = EYE
 const LOCAL = [0, 0]
 const PROBE = [0, 0]
 const FREE = [0, 0]
+
+/** 押し出し量（ローカル）と、ローカルへ移した速度の作業用。 */
+const DELTA = [0, 0]
+const VEL = [0, 0]
 
 /** 上から降りてきて最初に固体になる高さ。見つからなければ null。 */
 function surfaceY(world: World, x: number, z: number): number | null {

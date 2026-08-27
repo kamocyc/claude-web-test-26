@@ -2,6 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { Player } from '../src/player/Player'
 import type { World } from '../src/world/World'
 import type { Controls } from '../src/player/Controls'
+import { BuildGrid } from '../src/build/BuildGrid'
+import { BUILD_CELL, PANEL_T, normalizeYaw } from '../src/build/pieces'
+import type { PieceKind } from '../src/build/pieces'
+import { MAT_PLANK } from '../src/world/constants'
+import type { Collider } from '../src/world/collision'
 
 interface Sample {
   d: number
@@ -138,5 +143,93 @@ describe('斜面', () => {
     run(p, world, controls(['KeyW']), 6)
     expect(p.position.x, `壁を越えてしまった (x=${p.position.x.toFixed(2)})`).toBeLessThan(0.1)
     expect(p.position.y, '壁をよじ登ってしまった').toBeLessThan(0.4)
+  })
+})
+
+/** y < 0 が地面の、まったいらな疑似ワールド。 */
+const flatGround = heightWorld(
+  () => 0,
+  () => 0,
+)
+
+/** ヨー `yaw` の向きへ全速で前進する入力。 */
+function sprintAt(yaw: number): Controls {
+  return { keys: new Set(['KeyW', 'ShiftLeft']), yaw, pitch: 0 } as unknown as Controls
+}
+
+/**
+ * 自分で建てた部屋（床板と壁 4 面）を組む。
+ * 床板の上面は地面より板厚だけ高い — 平地に部屋を建てると必ずこうなる。
+ */
+function builtRoom(cells: number): BuildGrid {
+  const g = new BuildGrid()
+  const C = BUILD_CELL
+  const half = (cells * C) / 2
+  const put = (kind: PieceKind, x: number, y: number, z: number, deg: number) =>
+    g.place({ kind, x, y, z, yaw: normalizeYaw(deg / 5), mat: MAT_PLANK })
+  for (let j = 0; j < cells; j++) {
+    for (let i = 0; i < cells; i++) {
+      put('floor', -half + (i + 0.5) * C, 0, -half + (j + 0.5) * C, 0)
+    }
+  }
+  for (let k = 0; k < cells; k++) {
+    const c = -half + (k + 0.5) * C
+    put('wall', half, C / 2, c, 0)
+    put('wall', -half, C / 2, c, 0)
+    put('wall', c, C / 2, half, 90)
+    put('wall', c, C / 2, -half, 90)
+  }
+  return g
+}
+
+describe('部屋の中の当たり判定', () => {
+  it('建てた部屋の中から壁をすり抜けない', () => {
+    // 押し出しを「いちばん近い向き」だけで決めていた頃は、板の厚みの半分より
+    // 深く入った瞬間に外向きのほうが近くなり、部屋の中から壁の外へ弾き出されていた。
+    // 床板が水平に押してくるとそこまで一気に入り込むので、実際に頻繁に起きていた
+    for (const cells of [2, 3]) {
+      const g = builtRoom(cells)
+      const half = (cells * BUILD_CELL) / 2
+      const cols: Collider[] = []
+      for (let a = 0; a < 16; a++) {
+        const p = new Player()
+        // 中心はマスの角なので、少しずらした所から全方位へ突進する
+        p.position.set(0.7, 0.5, 0.7)
+        for (let i = 0; i < 600; i++) {
+          cols.length = 0
+          g.collectColliders(p.position.x, p.position.z, 1.4, cols)
+          p.boxes = cols
+          p.update(1 / 60, flatGround, sprintAt((a / 16) * Math.PI * 2))
+        }
+        const esc = Math.max(Math.abs(p.position.x), Math.abs(p.position.z))
+        expect(
+          esc,
+          `${cells}×${cells} の部屋から (${p.position.x.toFixed(2)}, ${p.position.z.toFixed(2)}) へ抜けた`,
+        ).toBeLessThan(half)
+      }
+    }
+  })
+
+  it('床板 1 枚ぶんの段差は壁際でも足を取られない', () => {
+    // 地面に張った床板は上面が板厚だけ高い。この小さな段差で足元がばたついたり、
+    // 壁が近いせいで乗れずに水平へ押されたりしないこと
+    const g = builtRoom(2)
+    const cols: Collider[] = []
+    const p = new Player()
+    p.position.set(0.7, 0.5, 0.7)
+    const heights: number[] = []
+    for (let i = 0; i < 240; i++) {
+      cols.length = 0
+      g.collectColliders(p.position.x, p.position.z, 1.4, cols)
+      p.boxes = cols
+      p.update(1 / 60, flatGround, sprintAt(Math.PI))
+      if (i > 60) heights.push(p.position.y)
+    }
+    expect(p.onGround, '床の上で接地していない').toBe(true)
+    expect(p.position.y, '床の上に立てていない').toBeCloseTo(PANEL_T, 2)
+    // 毎フレーム地面と床板を行き来していないこと
+    const lo = Math.min(...heights)
+    const hi = Math.max(...heights)
+    expect(hi - lo, `足元が ${(hi - lo).toFixed(2)} m ばたついている`).toBeLessThan(0.05)
   })
 })

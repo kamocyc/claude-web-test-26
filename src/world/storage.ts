@@ -33,6 +33,11 @@ export interface SaveMeta {
   stations?: number[]
   /** 走らせている路線（素材, 駅数, 駅番号… の繰り返し）。 */
   trainRoutes?: number[]
+  /**
+   * 取り壊した村の建物のパーツ（`VillageManager.serialize()` の平坦配列）。
+   * 村そのものはシードから作り直せるので、**壊した番号だけ**を持てば復元できる。
+   */
+  villageEdits?: number[]
   /** 伐採した木のセルキー。 */
   chopped: number[]
 }

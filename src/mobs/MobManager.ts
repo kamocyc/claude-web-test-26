@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import { SEA_LEVEL, WALKABLE_NY } from '../world/constants'
 import type { FieldSample, World } from '../world/World'
-import { deltaToWorld, worldToLocal } from '../world/collision'
+import { deltaToLocal, deltaToWorld, escapeDelta, worldToLocal } from '../world/collision'
 import type { Collider } from '../world/collision'
 import type { ItemId } from '../items/items'
 import { MOB_DEFS, type MobDef, type MobKind, type MobModel, buildMobModel } from './mobs'
@@ -403,7 +403,7 @@ export class MobManager {
     }
   }
 
-  /** 建物の壁や建てたパーツから最小移動量で押し出す。屋根には乗らない。 */
+  /** 建物の壁や建てたパーツから押し出す。屋根には乗らない。 */
   private resolveBoxes(m: Mob, boxes: readonly Collider[]): void {
     const r = m.def.radius
     for (const b of boxes) {
@@ -417,18 +417,11 @@ export class MobManager {
       const maxZ = b.maxZ + r
       if (px <= minX || px >= maxX || pz <= minZ || pz >= maxZ) continue
       if (m.pos.y + m.def.height <= b.minY || m.pos.y >= b.maxY) continue
-      const ox1 = px - minX
-      const ox2 = maxX - px
-      const oz1 = pz - minZ
-      const oz2 = maxZ - pz
-      const best = Math.min(ox1, ox2, oz1, oz2)
-      let dx = 0
-      let dz = 0
-      if (best === ox1) dx = -ox1
-      else if (best === ox2) dx = ox2
-      else if (best === oz1) dz = -oz1
-      else dz = oz2
-      deltaToWorld(b, dx, dz, PUSH)
+      // プレイヤーと同じく、**進んできた向きへは押さない**（`escapeDelta`）。
+      // 最小移動量だけで決めると、村の壁のような 3 m の板の継ぎ目ですり抜けてしまう
+      deltaToLocal(b, m.vel.x, m.vel.z, VEL)
+      escapeDelta(px, pz, minX, maxX, minZ, maxZ, VEL[0], VEL[1], DELTA)
+      deltaToWorld(b, DELTA[0], DELTA[1], PUSH)
       m.pos.x += PUSH[0]
       m.pos.z += PUSH[1]
 
@@ -623,3 +616,5 @@ export class MobManager {
 // ローカル座標へ移すときの作業用
 const GO = [0, 0]
 const PUSH = [0, 0]
+const DELTA = [0, 0]
+const VEL = [0, 0]

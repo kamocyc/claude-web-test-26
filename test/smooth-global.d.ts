@@ -98,6 +98,15 @@ export interface SmoothDebug {
   pieceCount(): number
   buildColliders(): number
   villagePieceCount(): number
+  aimedPiece(): {
+    kind: string
+    village: boolean
+    distance: number
+    x: number
+    y: number
+    z: number
+    deg: number
+  } | null
   nearestVillage(): {
     cx: number
     cz: number

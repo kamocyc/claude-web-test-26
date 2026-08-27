@@ -230,4 +230,69 @@ test.describe('建築モード', () => {
     await page.waitForFunction(() => window.__smooth?.ready === true, null, { timeout: 75_000 })
     expect((await api(page)).pieces, 'リロードで建てたものが消えた').toBe(built.pieces)
   })
+
+  test('村の建物も同じ建築モードで壊せて、リロードしても戻らない', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page)
+
+    const before = await page.evaluate(() => window.__smooth!.villagePieceCount())
+    expect(before, '村が建築パーツで組まれていない').toBeGreaterThan(100)
+
+    // 戸口の脇の壁の前に立ち、その壁へ照準を合わせる
+    const v = await page.evaluate(() => window.__smooth!.nearestVillage())
+    const house = v!.buildings.find((b) => b.kind === 'house')!
+    const ox = [1, -1, 0, 0][house.doorSide]
+    const oz = [0, 0, 1, -1][house.doorSide]
+    await page.evaluate(
+      (h) => {
+        const s = window.__smooth!
+        s.teleport(h.x, h.z)
+        s.look(Math.atan2(-(h.tx - h.x), -(h.tz - h.z)), 0)
+      },
+      {
+        // 戸口の 3 m 手前に立ち、戸口の 1.6 m 横（＝壁）を狙う
+        x: house.doorX + ox * 3,
+        z: house.doorZ + oz * 3,
+        tx: house.doorX + oz * 1.6,
+        tz: house.doorZ + ox * 1.6,
+      },
+    )
+    await page.waitForTimeout(1500)
+
+    const aimed = await page.evaluate(() => window.__smooth!.aimedPiece())
+    expect(aimed, '村の建物に照準が当たっていない').not.toBeNull()
+    expect(aimed!.village, '当たったのが村の建物ではない').toBe(true)
+
+    // 村の壁と同じ場所には置けない（村の建物も設置判定に入っている）
+    expect(
+      await page.evaluate(
+        (a) => window.__smooth!.buildAt('wall', a.x, a.y, a.z, 'plank', a.deg),
+        aimed!,
+      ),
+      '村の壁と同じ場所に二重に置けてしまう',
+    ).toBe('overlap')
+
+    const planks = await page.evaluate(() => window.__smooth!.itemCount('plank'))
+    await holdUntil(page, 0, `() => window.__smooth.villagePieceCount() < ${before}`)
+    const after = await page.evaluate(() => window.__smooth!.villagePieceCount())
+    expect(after, '村のパーツが減っていない').toBeLessThan(before)
+
+    // 材料は戻る
+    expect(
+      await page.evaluate(() => window.__smooth!.itemCount('plank')),
+      '材料が戻っていない',
+    ).toBeGreaterThan(planks)
+
+    // 保存を待ってリロード。壊した壁は戻らない
+    await page.waitForTimeout(2500)
+    await page.reload()
+    await page.waitForFunction(() => window.__smooth?.ready === true, null, { timeout: 75_000 })
+    await page.click('#play')
+    await page.waitForTimeout(3000)
+    expect(
+      await page.evaluate(() => window.__smooth!.villagePieceCount()),
+      'リロードで壊した壁が戻った',
+    ).toBe(after)
+  })
 })

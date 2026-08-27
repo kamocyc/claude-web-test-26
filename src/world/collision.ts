@@ -48,6 +48,15 @@ export function worldToLocal(c: Collider, wx: number, wz: number, out: number[])
   return out
 }
 
+/** ワールドの移動量をローカルの移動量へ（{@link deltaToWorld} の逆）。 */
+export function deltaToLocal(c: Collider, wx: number, wz: number, out: number[]): number[] {
+  const cos = c.cos ?? 1
+  const sin = c.sin ?? 0
+  out[0] = wx * cos - wz * sin
+  out[1] = wx * sin + wz * cos
+  return out
+}
+
 /** ローカルの移動量をワールドの移動量へ（平行移動を含まない回転だけ）。 */
 export function deltaToWorld(c: Collider, dx: number, dz: number, out: number[]): number[] {
   const cos = c.cos ?? 1
@@ -148,6 +157,67 @@ export function obbOverlap(a: Collider, b: Collider, grow: number, scale = 1): b
   }
   return true
 }
+
+/**
+ * 半径ぶん膨らませた箱から抜け出す移動量（ローカル座標、`out` に入れて返す）。
+ *
+ * 候補は 4 方向（-x, +x, -z, +z）。移動量が小さい順に選ぶが、
+ * **入ってきた向きへさらに押す向きは選ばない**（`vx`/`vz` はローカルの速度）。
+ *
+ * 単純な最小移動量だけだと、板の厚み（0.3 m）の半分より深く入った瞬間に
+ * 「向こう側へ抜ける」ほうが近くなり、そのまま壁をすり抜けてしまう。
+ * 3 m の板を並べた村の壁では、継ぎ目や角でこれが実際に起きていた
+ * （部屋の中から壁の外へ押し出されていた）。
+ *
+ * `px`/`pz` は箱のローカル座標での位置、`minX` ほかは**膨らませたあと**の境界。
+ */
+export function escapeDelta(
+  px: number,
+  pz: number,
+  minX: number,
+  maxX: number,
+  minZ: number,
+  maxZ: number,
+  vx: number,
+  vz: number,
+  out: number[],
+): number[] {
+  DIST[0] = px - minX
+  DIST[1] = maxX - px
+  DIST[2] = pz - minZ
+  DIST[3] = maxZ - pz
+  // 近い順（4 要素の挿入ソート。確保はしない）
+  for (let i = 0; i < 4; i++) ORDER[i] = i
+  for (let i = 1; i < 4; i++) {
+    const v = ORDER[i]
+    let j = i - 1
+    while (j >= 0 && DIST[ORDER[j]] > DIST[v]) {
+      ORDER[j + 1] = ORDER[j]
+      j--
+    }
+    ORDER[j + 1] = v
+  }
+
+  let pick = -1
+  for (let k = 0; k < 4 && pick < 0; k++) {
+    const i = ORDER[k]
+    // 向き i の外向き（0:-x 1:+x 2:-z 3:+z）が、いまの速度と同じ側なら捨てる
+    const along = i === 0 ? -vx : i === 1 ? vx : i === 2 ? -vz : vz
+    if (along <= VEL_EPS) pick = i
+  }
+  // 全部が「進んできた向き」なら（＝ほぼ静止している）いちばん近い向きへ逃がす
+  if (pick < 0) pick = ORDER[0]
+
+  out[0] = pick === 0 ? -DIST[0] : pick === 1 ? DIST[1] : 0
+  out[1] = pick === 2 ? -DIST[2] : pick === 3 ? DIST[3] : 0
+  return out
+}
+
+/** これ以下の速度成分は「その向きへ進んでいる」とみなさない（m/s）。 */
+const VEL_EPS = 1e-3
+
+const DIST = [0, 0, 0, 0]
+const ORDER = [0, 1, 2, 3]
 
 /** 点が当たり判定の中にあるか。 */
 export function colliderContains(c: Collider, x: number, y: number, z: number): boolean {
