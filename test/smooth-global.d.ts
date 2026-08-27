@@ -234,6 +234,15 @@ export interface SmoothDebug {
   setDigDepth(m: number): void
   /** いまの掘る強さ（m/回）。「一気に」なら Infinity。 */
   digDepth(): number
+  /** いま照準が指している点の勾配。狙っていなければ null。 */
+  gradeReading(): {
+    rise: number
+    run: number
+    grade: number
+    degrees: number
+    level: boolean
+    vertical: boolean
+  } | null
   density(x: number, y: number, z: number): number
 }
 

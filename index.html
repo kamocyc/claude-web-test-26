@@ -31,6 +31,13 @@
       #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
       #crosshair::after { top: 8px; left: 0; height: 2px; width: 18px; }
 
+      /* 照準の勾配。目の高さ（水平）から狙点がどれだけ上下しているか */
+      #grade {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, 26px);
+        font: 12px ui-monospace, monospace; opacity: .85; color: #cfefff;
+        white-space: nowrap; text-shadow: 0 1px 3px rgba(0,0,0,.9);
+      }
+
       #stats {
         position: absolute; left: 12px; top: 12px;
         font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -182,6 +189,7 @@
   <body>
     <div id="hud">
       <div id="crosshair"></div>
+      <div id="grade"></div>
       <div id="stats"></div>
       <div id="brush"></div>
       <div id="toast"></div>

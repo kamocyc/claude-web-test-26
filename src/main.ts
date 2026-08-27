@@ -26,6 +26,7 @@ import {
 import { Player, PLAYER_EYE } from './player/Player'
 import { Controls } from './player/Controls'
 import { createRayHit, raycastTerrain } from './player/terrainRaycast'
+import { emptyGrade, gradeLabel, readGrade } from './player/grade'
 import { Hud } from './ui/hud'
 import { Inventory } from './items/Inventory'
 import { ITEM_BY_MATERIAL, RECIPES, TRADES, item, tryItem } from './items/items'
@@ -330,6 +331,55 @@ async function boot(): Promise<void> {
   )
   boxGhost.visible = false
   scene.add(boxGhost)
+
+  // --- 勾配の目安 ---
+  // 目の高さに水平のライン（青）を出し、そこから狙点までの落差を縦のライン（橙）で結ぶ。
+  // 測るための線なので、地形に隠れないよう深度テストを切って常に手前へ描く。
+  const LEVEL_BAR_LEN = 3.2
+  const LEVEL_BAR_THICK = 0.05
+  const guideMaterial = (color: number): THREE.MeshBasicMaterial =>
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.85,
+      depthTest: false,
+      depthWrite: false,
+      fog: false,
+    })
+  const levelBar = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), guideMaterial(0x8fe8ff))
+  const dropBar = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), guideMaterial(0xffd166))
+  for (const m of [levelBar, dropBar]) {
+    m.renderOrder = 5
+    m.visible = false
+    scene.add(m)
+  }
+
+  /** 照準の勾配。狙っていないフレームは `gradeValid` が false。 */
+  const gradeScratch = emptyGrade()
+  let gradeValid = false
+
+  /** 狙点の勾配を測って、目安の線と HUD を更新する。 */
+  function showGrade(x: number, y: number, z: number): void {
+    readGrade(eye.x, eye.y, eye.z, x, y, z, gradeScratch)
+    gradeValid = true
+    hud.setGrade(gradeLabel(gradeScratch))
+    // 水平のラインは視線に直交させる（rotation.y = yaw の局所 +x が「右」）
+    levelBar.visible = true
+    levelBar.position.set(x, eye.y, z)
+    levelBar.rotation.y = controls.yaw
+    levelBar.scale.set(LEVEL_BAR_LEN, LEVEL_BAR_THICK, LEVEL_BAR_THICK)
+    const rise = gradeScratch.rise
+    dropBar.visible = Math.abs(rise) > LEVEL_BAR_THICK
+    dropBar.position.set(x, eye.y + rise / 2, z)
+    dropBar.scale.set(LEVEL_BAR_THICK, Math.abs(rise), LEVEL_BAR_THICK)
+  }
+
+  function hideGrade(): void {
+    gradeValid = false
+    levelBar.visible = false
+    dropBar.visible = false
+    hud.setGrade('')
+  }
 
   /** HUD に出すブラシの説明。 */
   function brushLabel(note: string | null = null): string {
@@ -749,6 +799,10 @@ async function boot(): Promise<void> {
     /** いまの掘る強さ（m/回）。「一気に」なら Infinity。 */
     digDepth(): number {
       return digDepth
+    },
+    /** いま照準が指している点の勾配。狙っていなければ null。 */
+    gradeReading() {
+      return gradeValid ? { ...gradeScratch } : null
     },
     /** 密度場の値。> 0 が固体。 */
     density(x: number, y: number, z: number): number {
@@ -2242,6 +2296,8 @@ async function boot(): Promise<void> {
     }
 
     // --- ブラシと戦闘 ---
+    // 勾配の目安は地形を掘るブラシのときだけ出す。下の分岐で狙点が決まったら出し直す
+    hideGrade()
     if (started && controls.locked && TOOLS[tool].id === 'build') {
       camera.getWorldDirection(lookDir)
       editCooldown -= dt
@@ -2368,6 +2424,9 @@ async function boot(): Promise<void> {
           ? '木（左クリックで伐採）'
           : null
       hud.setBrush(brushLabel(note))
+
+      // 勾配はブラシの中心ではなく地面に当たった点で測る（コメントは grade.ts）
+      if (target && !busy) showGrade(target.point.x, target.point.y, target.point.z)
 
       editCooldown -= dt
       if (editCooldown <= 0 && controls.digging && onMob && mobHit) {

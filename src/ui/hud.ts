@@ -9,6 +9,7 @@ export class Hud {
   private readonly stats = el<HTMLDivElement>('stats')
   private readonly hotbar = el<HTMLDivElement>('hotbar')
   private readonly brush = el<HTMLDivElement>('brush')
+  private readonly grade = el<HTMLDivElement>('grade')
   private readonly toast = el<HTMLDivElement>('toast')
   private readonly overlay = el<HTMLDivElement>('overlay')
   private readonly loading = el<HTMLDivElement>('loading')
@@ -205,6 +206,11 @@ export class Hud {
 
   setBrush(label: string): void {
     this.brush.textContent = label
+  }
+
+  /** 照準の勾配。空文字で消える。 */
+  setGrade(label: string): void {
+    this.grade.textContent = label
   }
 
   showToast(text: string, ms = 1800): void {

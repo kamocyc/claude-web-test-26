@@ -307,6 +307,63 @@ test.describe('掘る強さ', () => {
   })
 })
 
+test.describe('照準の勾配', () => {
+  test('カメラを水平にすると「水平」、見下ろすと下りの勾配が出る', async ({ page }) => {
+    await start(page)
+    await page.evaluate(() => window.__smooth!.setTool('sphere'))
+
+    // 完全に水平。地面が見えるところまでヨーを回して狙点を作る。
+    // 数 fps しか出ないので、待つのは時間ではなく「フレームが進んだこと」
+    const found = await page.evaluate(async () => {
+      const s = window.__smooth!
+      const nextFrames = async (n: number) => {
+        const f = s.frames
+        while (s.frames < f + n) await new Promise((r) => setTimeout(r, 30))
+      }
+      for (let i = 0; i < 24; i++) {
+        const yaw = (i * Math.PI) / 12
+        s.look(yaw, 0)
+        await nextFrames(3)
+        const g = s.gradeReading()
+        if (g) return { g, yaw }
+      }
+      return null
+    })
+    expect(found, '水平に構えたとき地形を狙えていない').not.toBeNull()
+    const level = found!.g
+    expect(level.level, `水平のはずが rise=${level.rise}`).toBe(true)
+    expect(Math.abs(level.rise)).toBeLessThan(1e-6)
+    expect(await page.textContent('#grade')).toBe('水平')
+
+    // 同じ向きから見下ろすと下り。角度はカメラのピッチと一致する
+    const down = await page.evaluate(async (yaw) => {
+      const s = window.__smooth!
+      s.look(yaw, -0.35)
+      const f = s.frames
+      while (s.frames < f + 3) await new Promise((r) => setTimeout(r, 30))
+      return s.gradeReading()
+    }, found!.yaw)
+    expect(down).not.toBeNull()
+    expect(down!.level).toBe(false)
+    expect(down!.rise).toBeLessThan(0)
+    expect(down!.degrees).toBeCloseTo((-0.35 * 180) / Math.PI, 3)
+    expect(await page.textContent('#grade')).toContain('下り')
+  })
+
+  test('建築モードでは出ない', async ({ page }) => {
+    await start(page)
+    await lookDown(page)
+    await page.waitForFunction(() => window.__smooth!.gradeReading() !== null, null, {
+      timeout: 10_000,
+    })
+    await page.evaluate(() => window.__smooth!.setTool('build'))
+    await page.waitForFunction(() => window.__smooth!.gradeReading() === null, null, {
+      timeout: 10_000,
+    })
+    expect(await page.textContent('#grade')).toBe('')
+  })
+})
+
 test.describe('ならしブラシ', () => {
   test('地形は変わるが手持ちは増減しない', async ({ page }) => {
     await start(page)
