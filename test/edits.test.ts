@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { MAX_FRAGMENT_CORNERS, applySphereBrush } from '../src/world/edits'
+import { DIG_ALL, MAX_FRAGMENT_CORNERS, applySphereBrush } from '../src/world/edits'
 import { MAT_NONE } from '../src/world/constants'
 
 function makeField(initial: (x: number, y: number, z: number) => number) {
@@ -135,5 +135,82 @@ describe('球ブラシ', () => {
       }
     }
     expect(solidWithMat).toBeGreaterThan(20)
+  })
+})
+
+describe('徐々に削る（強さ）', () => {
+  /** 一様な固体を 1 回だけ掘って、中心の密度がいくつ下がったかを返す。 */
+  function cutOnce(depth: number): number {
+    const f = makeField(() => 5)
+    applySphereBrush(0, 0, 0, 4, 'dig', 0, f.readD, f.readMat, f.write, -1000, 1000, depth)
+    return 5 - f.store.get('0,0,0')!.d
+  }
+
+  it('1 回で削れる深さが強さそのものになる', () => {
+    expect(cutOnce(0.3)).toBeCloseTo(0.3, 6)
+    expect(cutOnce(1)).toBeCloseTo(1, 6)
+  })
+
+  it('弱いほど 1 回の削れ方が浅い', () => {
+    expect(cutOnce(0.2)).toBeLessThan(cutOnce(0.8))
+  })
+
+  it('「一気に」はブラシの形をそのまま抜く', () => {
+    const f = makeField(() => 5)
+    applySphereBrush(0, 0, 0, 4, 'dig', 0, f.readD, f.readMat, f.write, -1000, 1000, DIG_ALL)
+    // 中心の密度は球の符号付き距離そのもの（-半径）まで落ちる
+    expect(f.store.get('0,0,0')!.d).toBeCloseTo(-4, 6)
+  })
+
+  it('掘り進むほど穴が深くなり、最後は一気に掘ったのと同じ深さで止まる', () => {
+    // y < 0 が固体の平らな地面。中心の柱で「いちばん上の固体」を探して穴の深さにする
+    const craterDepth = (strokes: number, depth: number): number => {
+      const f = makeField((_x, y) => -y)
+      for (let i = 0; i < strokes; i++) {
+        applySphereBrush(0, 0, 0, 4, 'dig', 0, f.readD, f.readMat, f.write, -1000, 1000, depth)
+      }
+      for (let y = 0; y > -12; y--) if (f.readD(0, y, 0) > 0) return -y
+      return 12
+    }
+
+    const one = craterDepth(1, 0.5)
+    const two = craterDepth(2, 0.5)
+    const four = craterDepth(4, 0.5)
+    expect(one).toBeLessThan(two)
+    expect(two).toBeLessThan(four)
+    expect(craterDepth(40, 0.5)).toBe(craterDepth(1, DIG_ALL))
+  })
+
+  it('掛け続けると「一気に」と同じ形へ収束する', () => {
+    const slow = makeField(() => 5)
+    for (let i = 0; i < 40; i++) {
+      applySphereBrush(0, 0, 0, 4, 'dig', 0, slow.readD, slow.readMat, slow.write, -1000, 1000, 0.3)
+    }
+    const once = makeField(() => 5)
+    applySphereBrush(0, 0, 0, 4, 'dig', 0, once.readD, once.readMat, once.write, -1000, 1000)
+    for (const [k, v] of once.store) {
+      expect(slow.store.get(k)!.d, k).toBeCloseTo(v.d, 6)
+    }
+  })
+
+  it('削った体積の合計は一気に削ったのと変わらない', () => {
+    const slow = makeField(() => 5)
+    let cleared = 0
+    for (let i = 0; i < 40; i++) {
+      cleared += applySphereBrush(
+        0, 0, 0, 4, 'dig', 0, slow.readD, slow.readMat, slow.write, -1000, 1000, 0.3,
+      ).cleared
+    }
+    const once = makeField(() => 5)
+    const atOnce = applySphereBrush(
+      0, 0, 0, 4, 'dig', 0, once.readD, once.readMat, once.write, -1000, 1000,
+    )
+    expect(cleared).toBe(atOnce.cleared)
+  })
+
+  it('強さは設置には効かない', () => {
+    const f = makeField(() => -5) // 空中
+    applySphereBrush(0, 0, 0, 3, 'place', 2, f.readD, f.readMat, f.write, -1000, 1000, 0.1)
+    expect(f.store.get('0,0,0')!.d).toBeCloseTo(3, 3)
   })
 })

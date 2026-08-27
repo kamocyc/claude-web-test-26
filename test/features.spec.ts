@@ -235,6 +235,78 @@ test.describe('ブラシの切り替え', () => {
   })
 })
 
+/** (x, z) の地表の高さ。top から下へ密度を見て、固体になった最初の高さを返す。 */
+async function groundY(page: Page, x: number, z: number, top: number): Promise<number> {
+  return page.evaluate(
+    ([px, pz, ptop]) => {
+      const s = window.__smooth!
+      for (let y = ptop; y > ptop - 24; y -= 0.05) if (s.density(px, y, pz) > 0) return y
+      return ptop - 24
+    },
+    [x, z, top] as const,
+  )
+}
+
+test.describe('掘る強さ', () => {
+  test('弱いと 1 回では削り切らず、掘り続けると一気に掘ったのと同じ穴になる', async ({ page }) => {
+    await start(page)
+    const p = await page.evaluate(() => window.__smooth!.state())
+    const x = p.x + 6
+    const z = p.z + 6
+    const top = p.y + 6
+    const h0 = await groundY(page, x, z, top)
+    const cy = h0 - 0.25
+
+    // 強さ 0.3 m/回 で 1 回。球ぶん（半径 2.5 m）は抜けない
+    await page.evaluate(([ax, ay, az]) => window.__smooth!.dig(ax, ay, az, 2.5, 0.3), [
+      x,
+      cy,
+      z,
+    ] as const)
+    const h1 = await groundY(page, x, z, top)
+    expect(h0 - h1, '1 回で削れていない').toBeGreaterThan(0.02)
+    expect(h0 - h1, '弱くしたのに一気に削れている').toBeLessThan(1.4)
+
+    // 掛け続けると球の形まで届く
+    await page.evaluate(
+      ([ax, ay, az]) => {
+        for (let i = 0; i < 30; i++) window.__smooth!.dig(ax, ay, az, 2.5, 0.3)
+      },
+      [x, cy, z] as const,
+    )
+    const slow = await groundY(page, x, z, top)
+    expect(h0 - slow, '掘り続けても穴が深くならない').toBeGreaterThan(1.5)
+
+    // そこから「一気に」で掘っても、もう削るところが残っていない
+    await page.evaluate(([ax, ay, az]) => window.__smooth!.dig(ax, ay, az, 2.5), [
+      x,
+      cy,
+      z,
+    ] as const)
+    const all = await groundY(page, x, z, top)
+    expect(Math.abs(all - slow), '徐々に掘った穴が一気に掘った穴と違う').toBeLessThan(0.3)
+  })
+
+  test('Shift + ホイールで強さが変わり、HUD に出る', async ({ page }) => {
+    await start(page)
+    await page.evaluate(() => window.__smooth!.setTool('sphere'))
+    await page.waitForTimeout(200)
+    expect(await page.textContent('#brush')).toMatch(/強さ \d+\.\d m\/回/)
+
+    const before = await page.evaluate(() => window.__smooth!.digDepth())
+    await page.keyboard.down('Shift')
+    await page.mouse.wheel(0, -100)
+    await page.waitForFunction((b) => window.__smooth!.digDepth() > b, before, { timeout: 10_000 })
+    await page.keyboard.up('Shift')
+
+    // Shift を離せばホイールはブラシの大きさに戻る（強さは動かない）
+    const held = await page.evaluate(() => window.__smooth!.digDepth())
+    await page.mouse.wheel(0, -100)
+    await page.waitForTimeout(400)
+    expect(await page.evaluate(() => window.__smooth!.digDepth())).toBe(held)
+  })
+})
+
 test.describe('ならしブラシ', () => {
   test('地形は変わるが手持ちは増減しない', async ({ page }) => {
     await start(page)

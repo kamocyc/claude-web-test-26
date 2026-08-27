@@ -50,7 +50,7 @@ export interface SmoothDebug {
   gotoVillage(): boolean
   nearestTree(): { x: number; y: number; z: number; r: number; h: number } | null
   treeColliders(): number[]
-  dig(x: number, y: number, z: number, r?: number): void
+  dig(x: number, y: number, z: number, r?: number, depth?: number): void
   fill(x: number, y: number, z: number, r?: number, itemId?: string): void
   giveMaterial(index: number, amount: number): void
   give(id: string, amount: number): void
@@ -230,6 +230,10 @@ export interface SmoothDebug {
   setTool(name: string): void
   setTime(hours: number | null): void
   setBrushRadius(r: number): void
+  /** 1 回で削る深さ（m）。0 以下で「一気に」。 */
+  setDigDepth(m: number): void
+  /** いまの掘る強さ（m/回）。「一気に」なら Infinity。 */
+  digDepth(): number
   density(x: number, y: number, z: number): number
 }
 

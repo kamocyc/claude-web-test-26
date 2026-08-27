@@ -10,7 +10,7 @@ import type { Box } from './world/village'
 import { worldToLocal } from './world/collision'
 import type { Collider } from './world/collision'
 import { World, createTreeHit } from './world/World'
-import { boxBrush, orientedBoxBrush, snapBoxCenter, sphereBrush } from './world/edits'
+import { DIG_ALL, boxBrush, orientedBoxBrush, snapBoxCenter, sphereBrush } from './world/edits'
 import type { BrushBounds } from './world/edits'
 import { WorldStore } from './world/storage'
 import {
@@ -69,6 +69,30 @@ const REACH = 9
 const MIN_BRUSH = 1
 const MAX_BRUSH = 6
 const EDIT_INTERVAL = 0.09
+
+/**
+ * 1 回の掘削で削る深さ（m）の範囲と刻み。
+ *
+ * 掘るのは一気にではなく、掛けるたびにブラシの形へこの深さぶんずつ近づく。
+ * 上限を超えると {@link DIG_ALL} になり、昔どおり 1 回でブラシの形を抜く。
+ */
+const MIN_DIG_DEPTH = 0.1
+const MAX_DIG_DEPTH = 1.5
+const DIG_DEPTH_STEP = 0.1
+const DEFAULT_DIG_DEPTH = 0.4
+
+/** 掘る強さを 1 段ずらす。上限の 1 つ上が「一気に」。 */
+export function stepDigDepth(depth: number, dir: number): number {
+  if (depth >= DIG_ALL) return dir > 0 ? DIG_ALL : MAX_DIG_DEPTH
+  const next = Math.round((depth + dir * DIG_DEPTH_STEP) * 10) / 10
+  if (next > MAX_DIG_DEPTH + 1e-9) return DIG_ALL
+  return Math.max(MIN_DIG_DEPTH, next)
+}
+
+/** 掘る強さの表示。 */
+export function digDepthLabel(depth: number): string {
+  return depth >= DIG_ALL ? '一気に' : `${depth.toFixed(1)} m/回`
+}
 const CHOP_INTERVAL = 0.25
 const ATTACK_INTERVAL = 0.42
 const MAX_HEALTH = 20
@@ -348,14 +372,21 @@ async function boot(): Promise<void> {
             }`
       return `${t.name}（駅 ${STATION_COST}）${hand}${picked}`
     }
+    // 掘る強さは掘れるブラシのときだけ出す（ならしは体積を動かさない）
+    const power =
+      t.id === 'sphere' || t.id === 'box'
+        ? `　強さ ${digDepthLabel(digDepth)}（Shift+ホイール）`
+        : ''
     if (t.id === 'box') {
       const n = boxEdge(brushRadius)
-      return `${t.name} ${n}×${n}×${n} m${hand}${grain}`
+      return `${t.name} ${n}×${n}×${n} m${hand}${grain}${power}`
     }
-    return `${t.name} 半径 ${brushRadius.toFixed(1)} m${hand}${grain}`
+    return `${t.name} 半径 ${brushRadius.toFixed(1)} m${hand}${grain}${power}`
   }
 
   let brushRadius = 2.5
+  /** 1 回で削る深さ（m）。Shift + ホイールで変える。 */
+  let digDepth = DEFAULT_DIG_DEPTH
   let tool = 0
   /** 建築モードで選んでいるパーツと、向きのオフセット（5° 刻みの 0..71）。 */
   let pieceIndex = 0
@@ -671,8 +702,8 @@ async function boot(): Promise<void> {
       return best
     },
     /** 指定座標を球ブラシで掘る（テスト用。照準を通さず直接叩く）。 */
-    dig(x: number, y: number, z: number, r = 2.5) {
-      world.applyBrush(x, y, z, sphereBrush(r), 'dig', MATERIAL_INFO[0].id)
+    dig(x: number, y: number, z: number, r = 2.5, depth = DIG_ALL) {
+      world.applyBrush(x, y, z, sphereBrush(r), 'dig', MATERIAL_INFO[0].id, depth)
     },
     /** 指定座標へ球ブラシで盛る（テスト用。照準を通さず直接叩く）。 */
     fill(x: number, y: number, z: number, r = 2.5, itemId = 'rock') {
@@ -709,6 +740,15 @@ async function boot(): Promise<void> {
     setBrushRadius(r: number) {
       brushRadius = clamp(r, MIN_BRUSH, MAX_BRUSH)
       hud.setBrush(brushLabel())
+    },
+    /** 1 回で削る深さ（m）を設定する。0 以下なら「一気に」（テスト用）。 */
+    setDigDepth(m: number) {
+      digDepth = m > 0 ? Math.min(m, DIG_ALL) : DIG_ALL
+      hud.setBrush(brushLabel())
+    },
+    /** いまの掘る強さ（m/回）。「一気に」なら Infinity。 */
+    digDepth(): number {
+      return digDepth
     },
     /** 密度場の値。> 0 が固体。 */
     density(x: number, y: number, z: number): number {
@@ -2228,7 +2268,13 @@ async function boot(): Promise<void> {
       build.setGhost(null, false)
       tracks.setGhost(null, false, surfaceY)
       if (controls.wheel !== 0) {
-        brushRadius = clamp(brushRadius - Math.sign(controls.wheel) * 0.5, MIN_BRUSH, MAX_BRUSH)
+        const dir = -Math.sign(controls.wheel)
+        // Shift を押しながらだと掘る強さ、押していなければブラシの大きさ
+        if (controls.keys.has('ShiftLeft') || controls.keys.has('ShiftRight')) {
+          digDepth = stepDigDepth(digDepth, dir)
+        } else {
+          brushRadius = clamp(brushRadius + dir * 0.5, MIN_BRUSH, MAX_BRUSH)
+        }
         controls.wheel = 0
       }
 
@@ -2368,7 +2414,15 @@ async function boot(): Promise<void> {
           // 粒状かどうかは素材 ID から決まるので、盛る側の呼び分けは要らない
           const bounds = smoothing
             ? world.applySmooth(cx, cy, cz, brushRadius, 1)
-            : world.applyBrush(cx, cy, cz, shape, dig ? 'dig' : 'place', material)
+            : world.applyBrush(
+                cx,
+                cy,
+                cz,
+                shape,
+                dig ? 'dig' : 'place',
+                material,
+                dig ? digDepth : DIG_ALL,
+              )
           if (bounds) {
             if (smoothing) {
               // 収支なし

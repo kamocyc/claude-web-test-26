@@ -196,6 +196,12 @@ const OUTSIDE = -1e9
  */
 const SURFACE_BIAS = 1e-4
 
+/**
+ * 一度に削る深さの上限を「無し」にする値。
+ * これを渡すと掘削はブラシの形をそのまま抜く（従来の挙動）。
+ */
+export const DIG_ALL = Infinity
+
 /** とげを削る回数。2 回で「幅 1 格子の触手」まで消える。 */
 const ERODE_PASSES = 2
 
@@ -336,6 +342,11 @@ function writeBack(reg: Region, bounds: BrushBounds, write: CornerWriter): void 
  * 掘ったあとは、影響範囲の中で本体から切り離された小さな塊を取り除く。
  * 地形の等値面は「密度が正の格子点」があるところにしか生まれないので、
  * 格子点の連結成分を見れば目に見える切れ端を漏れなく検出できる。
+ *
+ * `depth` を渡すと**一度に削る深さがその値までに制限される**（{@link DIG_ALL} で無制限）。
+ * 掘削は `d = min(d, max(s, d - depth))` になり、掛けるたびにブラシの形へ `depth` ずつ
+ * 近づいて、最後は無制限で掛けたのとまったく同じ形（`min(d, s)`）で止まる。
+ * 途中の形も等値面なので、削りかけでも穴の底はなめらかなまま。設置には効かない。
  */
 export function applyBrush(
   wx: number,
@@ -349,6 +360,7 @@ export function applyBrush(
   write: CornerWriter,
   clampMinY: number,
   clampMaxY: number,
+  depth: number = DIG_ALL,
 ): BrushBounds {
   const cx = wx / VOXEL_SIZE
   const cy = wy / VOXEL_SIZE
@@ -358,6 +370,8 @@ export function applyBrush(
   const reg = region(cx, cy, cz, shape.ex, shape.ey, shape.ez, clampMinY, clampMaxY)
   if (!reg) return bounds
   const { w, h, d, i0, j0, k0, ox, oy, oz } = reg
+  // 密度は格子単位のおおよその距離なので、深さも格子単位に直してから使う
+  const cut = depth > 0 && depth < DIG_ALL ? depth / VOXEL_SIZE : DIG_ALL
 
   // --- 1. ブラシの届く範囲だけ現在の値を読み込み、その場でブラシを合成する ---
   // 範囲外は OUTSIDE のままにしておく。書き戻されず、掃除の対象にもならない。
@@ -386,7 +400,9 @@ export function applyBrush(
         bufOrigD[idx] = cur
         bufOrigMat[idx] = m
         if (cur > 0 && isLooseMaterial(m)) bounds.looseTouched++
-        const next = place ? Math.max(cur, SURFACE_BIAS - s) : Math.min(cur, s)
+        const next = place
+          ? Math.max(cur, SURFACE_BIAS - s)
+          : Math.min(cur, Math.max(s, cur - cut))
         bufD[idx] = next
         // 素材を刻むのは新しく固体になった格子点だけ。
         // 既にあった地形まで「置いた土砂」に化けると、山肌ごと崩れてしまう。
@@ -473,6 +489,7 @@ export function applySphereBrush(
   write: CornerWriter,
   clampMinY: number,
   clampMaxY: number,
+  depth: number = DIG_ALL,
 ): BrushBounds {
   return applyBrush(
     wx,
@@ -486,6 +503,7 @@ export function applySphereBrush(
     write,
     clampMinY,
     clampMaxY,
+    depth,
   )
 }
 
