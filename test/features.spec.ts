@@ -209,10 +209,10 @@ async function lookDown(page: Page): Promise<void> {
 }
 
 test.describe('ブラシの切り替え', () => {
-  test('B キーで 球 → 直方体 → ならし → 建築 と巡回する', async ({ page }) => {
+  test('B キーで 球 → 直方体 → ならし → 建築 → 軌道 → 駅 と巡回する', async ({ page }) => {
     await start(page)
     expect((await api(page)).tool).toBe('sphere')
-    for (const expected of ['box', 'smooth', 'build', 'sphere']) {
+    for (const expected of ['box', 'smooth', 'build', 'track', 'station', 'sphere']) {
       await page.keyboard.press('KeyB')
       // 数 fps しか出ないので、次のフレームで stats が更新されるまで待つ
       await page.waitForFunction((t) => window.__smooth?.tool === t, expected, { timeout: 10_000 })
@@ -232,6 +232,135 @@ test.describe('ブラシの切り替え', () => {
     expect(changed(before, await probe(page, c)), '直方体で掘っても地形が変わらない').toBeGreaterThan(
       20,
     )
+  })
+})
+
+/** (x, z) の地表の高さ。top から下へ密度を見て、固体になった最初の高さを返す。 */
+async function groundY(page: Page, x: number, z: number, top: number): Promise<number> {
+  return page.evaluate(
+    ([px, pz, ptop]) => {
+      const s = window.__smooth!
+      for (let y = ptop; y > ptop - 24; y -= 0.05) if (s.density(px, y, pz) > 0) return y
+      return ptop - 24
+    },
+    [x, z, top] as const,
+  )
+}
+
+test.describe('掘る強さ', () => {
+  test('弱いと 1 回では削り切らず、掘り続けると一気に掘ったのと同じ穴になる', async ({ page }) => {
+    await start(page)
+    const p = await page.evaluate(() => window.__smooth!.state())
+    const x = p.x + 6
+    const z = p.z + 6
+    const top = p.y + 6
+    const h0 = await groundY(page, x, z, top)
+    const cy = h0 - 0.25
+
+    // 強さ 0.3 m/回 で 1 回。球ぶん（半径 2.5 m）は抜けない
+    await page.evaluate(([ax, ay, az]) => window.__smooth!.dig(ax, ay, az, 2.5, 0.3), [
+      x,
+      cy,
+      z,
+    ] as const)
+    const h1 = await groundY(page, x, z, top)
+    expect(h0 - h1, '1 回で削れていない').toBeGreaterThan(0.02)
+    expect(h0 - h1, '弱くしたのに一気に削れている').toBeLessThan(1.4)
+
+    // 掛け続けると球の形まで届く
+    await page.evaluate(
+      ([ax, ay, az]) => {
+        for (let i = 0; i < 30; i++) window.__smooth!.dig(ax, ay, az, 2.5, 0.3)
+      },
+      [x, cy, z] as const,
+    )
+    const slow = await groundY(page, x, z, top)
+    expect(h0 - slow, '掘り続けても穴が深くならない').toBeGreaterThan(1.5)
+
+    // そこから「一気に」で掘っても、もう削るところが残っていない
+    await page.evaluate(([ax, ay, az]) => window.__smooth!.dig(ax, ay, az, 2.5), [
+      x,
+      cy,
+      z,
+    ] as const)
+    const all = await groundY(page, x, z, top)
+    expect(Math.abs(all - slow), '徐々に掘った穴が一気に掘った穴と違う').toBeLessThan(0.3)
+  })
+
+  test('Shift + ホイールで強さが変わり、HUD に出る', async ({ page }) => {
+    await start(page)
+    await page.evaluate(() => window.__smooth!.setTool('sphere'))
+    await page.waitForTimeout(200)
+    expect(await page.textContent('#brush')).toMatch(/強さ \d+\.\d m\/回/)
+
+    const before = await page.evaluate(() => window.__smooth!.digDepth())
+    await page.keyboard.down('Shift')
+    await page.mouse.wheel(0, -100)
+    await page.waitForFunction((b) => window.__smooth!.digDepth() > b, before, { timeout: 10_000 })
+    await page.keyboard.up('Shift')
+
+    // Shift を離せばホイールはブラシの大きさに戻る（強さは動かない）
+    const held = await page.evaluate(() => window.__smooth!.digDepth())
+    await page.mouse.wheel(0, -100)
+    await page.waitForTimeout(400)
+    expect(await page.evaluate(() => window.__smooth!.digDepth())).toBe(held)
+  })
+})
+
+test.describe('照準の勾配', () => {
+  test('カメラを水平にすると「水平」、見下ろすと下りの勾配が出る', async ({ page }) => {
+    await start(page)
+    await page.evaluate(() => window.__smooth!.setTool('sphere'))
+
+    // 完全に水平。地面が見えるところまでヨーを回して狙点を作る。
+    // 数 fps しか出ないので、待つのは時間ではなく「フレームが進んだこと」
+    const found = await page.evaluate(async () => {
+      const s = window.__smooth!
+      const nextFrames = async (n: number) => {
+        const f = s.frames
+        while (s.frames < f + n) await new Promise((r) => setTimeout(r, 30))
+      }
+      for (let i = 0; i < 24; i++) {
+        const yaw = (i * Math.PI) / 12
+        s.look(yaw, 0)
+        await nextFrames(3)
+        const g = s.gradeReading()
+        if (g) return { g, yaw }
+      }
+      return null
+    })
+    expect(found, '水平に構えたとき地形を狙えていない').not.toBeNull()
+    const level = found!.g
+    expect(level.level, `水平のはずが rise=${level.rise}`).toBe(true)
+    expect(Math.abs(level.rise)).toBeLessThan(1e-6)
+    expect(await page.textContent('#grade')).toBe('水平')
+
+    // 同じ向きから見下ろすと下り。角度はカメラのピッチと一致する
+    const down = await page.evaluate(async (yaw) => {
+      const s = window.__smooth!
+      s.look(yaw, -0.35)
+      const f = s.frames
+      while (s.frames < f + 3) await new Promise((r) => setTimeout(r, 30))
+      return s.gradeReading()
+    }, found!.yaw)
+    expect(down).not.toBeNull()
+    expect(down!.level).toBe(false)
+    expect(down!.rise).toBeLessThan(0)
+    expect(down!.degrees).toBeCloseTo((-0.35 * 180) / Math.PI, 3)
+    expect(await page.textContent('#grade')).toContain('下り')
+  })
+
+  test('建築モードでは出ない', async ({ page }) => {
+    await start(page)
+    await lookDown(page)
+    await page.waitForFunction(() => window.__smooth!.gradeReading() !== null, null, {
+      timeout: 10_000,
+    })
+    await page.evaluate(() => window.__smooth!.setTool('build'))
+    await page.waitForFunction(() => window.__smooth!.gradeReading() === null, null, {
+      timeout: 10_000,
+    })
+    expect(await page.textContent('#grade')).toBe('')
   })
 })
 

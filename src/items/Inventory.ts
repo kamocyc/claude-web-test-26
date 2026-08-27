@@ -16,6 +16,9 @@ const DEFAULT_HOTBAR: (ItemId | null)[] = [
   null,
 ]
 
+/** 無制限モードで返す手持ち量。実際には減らないので、値そのものに意味は無い。 */
+export const UNLIMITED = 1e9
+
 /**
  * 持ち物。
  *
@@ -27,10 +30,25 @@ export class Inventory {
   readonly hotbar: (ItemId | null)[] = [...DEFAULT_HOTBAR]
   selected = 0
 
+  /**
+   * デバッグ用の無制限モード。
+   *
+   * **溜めてある量はそのまま持ったまま**、支払いだけを素通しにする
+   * （`count` が {@link UNLIMITED} を返し、`take` は減らさない）。
+   * 戻せば元の量から続けられるので、試したあとで普通に遊べる。
+   */
+  unlimited = false
+
   /** 変化したときに呼ばれる（HUD の更新用）。 */
   onChange: (() => void) | null = null
 
   count(id: ItemId): number {
+    if (this.unlimited) return UNLIMITED
+    return this.counts.get(id) ?? 0
+  }
+
+  /** 無制限モードでも変わらない、実際に溜めてある量。 */
+  stored(id: ItemId): number {
     return this.counts.get(id) ?? 0
   }
 
@@ -39,7 +57,7 @@ export class Inventory {
     return Math.floor(this.count(id))
   }
 
-  /** 何かしら持っているアイテムを、レジストリの順で返す。 */
+  /** 何かしら持っているアイテムを、レジストリの順で返す（無制限モードでは全部）。 */
   owned(): ItemDef[] {
     return ITEMS.filter((d) => this.whole(d.id) > 0)
   }
@@ -48,27 +66,29 @@ export class Inventory {
     if (amount <= 0) return
     const def = tryItem(id)
     if (!def) return
-    const had = this.whole(id)
-    const next = def.unique ? Math.min(1, this.count(id) + amount) : this.count(id) + amount
+    const had = Math.floor(this.stored(id))
+    const next = def.unique ? Math.min(1, this.stored(id) + amount) : this.stored(id) + amount
     this.counts.set(id, next)
     // 初めて手に入れたものはホットバーの空きに入れて、すぐ使えるようにする
     if (had === 0 && Math.floor(next) > 0) this.assignToFreeSlot(id)
     this.onChange?.()
   }
 
-  /** 足りていれば減らして true。 */
+  /** 足りていれば減らして true。無制限モードでは減らさずに true。 */
   take(id: ItemId, amount: number): boolean {
-    if (this.count(id) < amount) return false
-    this.counts.set(id, this.count(id) - amount)
+    if (this.unlimited) return true
+    if (this.stored(id) < amount) return false
+    this.counts.set(id, this.stored(id) - amount)
     this.onChange?.()
     return true
   }
 
   /** 足りているぶんだけ減らし、実際に減らせた量を返す。 */
   takeUpTo(id: ItemId, amount: number): number {
-    const n = Math.min(this.count(id), amount)
+    if (this.unlimited) return Math.max(0, amount)
+    const n = Math.min(this.stored(id), amount)
     if (n <= 0) return 0
-    this.counts.set(id, this.count(id) - n)
+    this.counts.set(id, this.stored(id) - n)
     this.onChange?.()
     return n
   }
@@ -79,13 +99,14 @@ export class Inventory {
 
   private pay(cost: readonly Cost[]): boolean {
     if (!this.canPay(cost)) return false
-    for (const [id, n] of cost) this.counts.set(id, this.count(id) - n)
+    if (this.unlimited) return true
+    for (const [id, n] of cost) this.counts.set(id, this.stored(id) - n)
     return true
   }
 
   canCraft(r: Recipe): boolean {
     // 道具・防具は 1 個持っていたらもう作れない
-    if (item(r.out).unique && this.whole(r.out) > 0) return false
+    if (item(r.out).unique && Math.floor(this.stored(r.out)) > 0) return false
     return this.canPay(r.cost)
   }
 

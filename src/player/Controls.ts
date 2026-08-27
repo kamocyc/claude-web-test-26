@@ -19,11 +19,14 @@ export class Controls {
 
   onSlot: ((index: number) => void) | null = null
   onToggleFly: (() => void) | null = null
-  /** B キー: ブラシの切り替え */
+  /** B キー: ブラシの切り替え（球 → 直方体 → ならし → 建築 → 軌道） */
   onCycleTool: (() => void) | null = null
-  /** R キー: 建築パーツの切り替え（壁 → 窓 → 戸口 → 床 → 階段 → 屋根 → ブロック） */
+  /**
+   * R キー: 建築パーツの切り替え（壁 → 窓 → 戸口 → 床 → 階段 → 屋根 → ブロック）。
+   * 軌道モードでは 線路 ⇄ 道路 の切り替えになる。
+   */
   onCyclePiece: (() => void) | null = null
-  /** 中クリック: 建築の回転を既定へ戻す */
+  /** 中クリック: 建築の回転を既定へ戻す。軌道モードでは接続を切って新しい線を始める */
   onResetRotation: (() => void) | null = null
   /** T キー: 時刻の切り替え（デバッグ） */
   onCycleTime: (() => void) | null = null
@@ -33,6 +36,10 @@ export class Controls {
   onInteract: (() => void) | null = null
   onLockChange: ((locked: boolean) => void) | null = null
   onToggleStats: (() => void) | null = null
+  /** F4 キー: デバッグ用に材料を無制限にする（もう一度押すと戻る） */
+  onToggleUnlimited: (() => void) | null = null
+  /** G キー: 軌道モードで、手で決めた勾配を自動（地形なり）へ戻す */
+  onResetGrade: (() => void) | null = null
   /** デバッグ: 最寄りの村へワープ */
   onWarpVillage: (() => void) | null = null
 
@@ -98,6 +105,12 @@ export class Controls {
       this.onToggleStats?.()
       return
     }
+    if (e.code === 'F4') {
+      e.preventDefault()
+      // 押しっぱなしのキーリピートで何度も入れ替わらないように
+      if (!e.repeat) this.onToggleUnlimited?.()
+      return
+    }
     // 持ち物・交換の画面はポインタロックを外して開くので、
     // ここだけはロックの有無に関係なく受け取る
     if (e.code === 'KeyE' && !e.repeat) {
@@ -139,6 +152,11 @@ export class Controls {
 
     if (e.code === 'KeyV') {
       this.onWarpVillage?.()
+      return
+    }
+
+    if (e.code === 'KeyG') {
+      this.onResetGrade?.()
       return
     }
 

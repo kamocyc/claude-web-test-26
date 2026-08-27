@@ -97,17 +97,7 @@ export function boxBrush(hx: number, hy: number, hz: number): BrushShape {
     ex: ax,
     ey: ay,
     ez: az,
-    sdf: (dx, dy, dz) => {
-      const qx = Math.abs(dx) - ax
-      const qy = Math.abs(dy) - ay
-      const qz = Math.abs(dz) - az
-      const ox = qx > 0 ? qx : 0
-      const oy = qy > 0 ? qy : 0
-      const oz = qz > 0 ? qz : 0
-      const outside = Math.sqrt(ox * ox + oy * oy + oz * oz)
-      const inside = Math.min(Math.max(qx, qy, qz), 0)
-      return outside + inside
-    },
+    sdf: (dx, dy, dz) => boxSdf(dx, dy, dz, ax, ay, az),
     span: (dx, dz, out) => {
       const hit = Math.abs(dx) <= ax && Math.abs(dz) <= az
       out.lo = hit ? -ay : 1
@@ -115,6 +105,57 @@ export function boxBrush(hx: number, hy: number, hz: number): BrushShape {
       return out
     },
   }
+}
+
+/**
+ * Y 軸まわりに回した直方体ブラシ。半サイズは m、`yaw` はラジアン。
+ *
+ * 回転の規約は {@link Collider} と同じで、**局所 +x が右、局所 +z が後ろ**。
+ * だから `hx` が幅方向、`hz` が進行方向の半サイズになり、軌道の 1 コマを
+ * そのまま切り盛りできる。走査範囲は回した箱を包む大きさに広げる。
+ */
+export function orientedBoxBrush(hx: number, hy: number, hz: number, yaw: number): BrushShape {
+  const ax = hx / VOXEL_SIZE
+  const ay = hy / VOXEL_SIZE
+  const az = hz / VOXEL_SIZE
+  const cos = Math.cos(yaw)
+  const sin = Math.sin(yaw)
+  const ac = Math.abs(cos)
+  const as = Math.abs(sin)
+  return {
+    ex: ax * ac + az * as,
+    ey: ay,
+    ez: ax * as + az * ac,
+    sdf: (dx, dy, dz) => boxSdf(dx * cos - dz * sin, dy, dx * sin + dz * cos, ax, ay, az),
+    span: (dx, dz, out) => {
+      const lx = dx * cos - dz * sin
+      const lz = dx * sin + dz * cos
+      const hit = Math.abs(lx) <= ax && Math.abs(lz) <= az
+      out.lo = hit ? -ay : 1
+      out.hi = hit ? ay : -1
+      return out
+    },
+  }
+}
+
+/** 中心を原点とする軸平行の直方体の符号付き距離。 */
+function boxSdf(
+  dx: number,
+  dy: number,
+  dz: number,
+  ax: number,
+  ay: number,
+  az: number,
+): number {
+  const qx = Math.abs(dx) - ax
+  const qy = Math.abs(dy) - ay
+  const qz = Math.abs(dz) - az
+  const ox = qx > 0 ? qx : 0
+  const oy = qy > 0 ? qy : 0
+  const oz = qz > 0 ? qz : 0
+  const outside = Math.sqrt(ox * ox + oy * oy + oz * oz)
+  const inside = Math.min(Math.max(qx, qy, qz), 0)
+  return outside + inside
 }
 
 /**
@@ -154,6 +195,12 @@ const OUTSIDE = -1e9
  * 直方体の角が 2/3 格子ぶん欠ける。
  */
 const SURFACE_BIAS = 1e-4
+
+/**
+ * 一度に削る深さの上限を「無し」にする値。
+ * これを渡すと掘削はブラシの形をそのまま抜く（従来の挙動）。
+ */
+export const DIG_ALL = Infinity
 
 /** とげを削る回数。2 回で「幅 1 格子の触手」まで消える。 */
 const ERODE_PASSES = 2
@@ -295,6 +342,11 @@ function writeBack(reg: Region, bounds: BrushBounds, write: CornerWriter): void 
  * 掘ったあとは、影響範囲の中で本体から切り離された小さな塊を取り除く。
  * 地形の等値面は「密度が正の格子点」があるところにしか生まれないので、
  * 格子点の連結成分を見れば目に見える切れ端を漏れなく検出できる。
+ *
+ * `depth` を渡すと**一度に削る深さがその値までに制限される**（{@link DIG_ALL} で無制限）。
+ * 掘削は `d = min(d, max(s, d - depth))` になり、掛けるたびにブラシの形へ `depth` ずつ
+ * 近づいて、最後は無制限で掛けたのとまったく同じ形（`min(d, s)`）で止まる。
+ * 途中の形も等値面なので、削りかけでも穴の底はなめらかなまま。設置には効かない。
  */
 export function applyBrush(
   wx: number,
@@ -308,6 +360,7 @@ export function applyBrush(
   write: CornerWriter,
   clampMinY: number,
   clampMaxY: number,
+  depth: number = DIG_ALL,
 ): BrushBounds {
   const cx = wx / VOXEL_SIZE
   const cy = wy / VOXEL_SIZE
@@ -317,6 +370,8 @@ export function applyBrush(
   const reg = region(cx, cy, cz, shape.ex, shape.ey, shape.ez, clampMinY, clampMaxY)
   if (!reg) return bounds
   const { w, h, d, i0, j0, k0, ox, oy, oz } = reg
+  // 密度は格子単位のおおよその距離なので、深さも格子単位に直してから使う
+  const cut = depth > 0 && depth < DIG_ALL ? depth / VOXEL_SIZE : DIG_ALL
 
   // --- 1. ブラシの届く範囲だけ現在の値を読み込み、その場でブラシを合成する ---
   // 範囲外は OUTSIDE のままにしておく。書き戻されず、掃除の対象にもならない。
@@ -345,7 +400,9 @@ export function applyBrush(
         bufOrigD[idx] = cur
         bufOrigMat[idx] = m
         if (cur > 0 && isLooseMaterial(m)) bounds.looseTouched++
-        const next = place ? Math.max(cur, SURFACE_BIAS - s) : Math.min(cur, s)
+        const next = place
+          ? Math.max(cur, SURFACE_BIAS - s)
+          : Math.min(cur, Math.max(s, cur - cut))
         bufD[idx] = next
         // 素材を刻むのは新しく固体になった格子点だけ。
         // 既にあった地形まで「置いた土砂」に化けると、山肌ごと崩れてしまう。
@@ -365,6 +422,60 @@ export function applyBrush(
   return bounds
 }
 
+/** まとめて掛けるブラシ 1 本ぶんの指定。 */
+export interface BrushOp {
+  x: number
+  y: number
+  z: number
+  shape: BrushShape
+  mode: BrushMode
+  /** 置くときの素材。掘るときは使われない。 */
+  material: number
+}
+
+/**
+ * 複数のブラシを順に掛け、影響範囲をひとまとめにして返す。
+ *
+ * 1 本ずつ掛けるのと結果は同じだが、**呼び出し側がメッシュの作り直しを 1 回で済ませられる**。
+ * 軌道の切り盛りのように、細かい箱を何十本も並べて掛ける用途向け。
+ *
+ * `each` を渡すと 1 本ごとの結果もそこへ順に積む。掘った土の素材は場所ごとに違うので、
+ * **どの箱がどれだけ掘ったか**を知りたい呼び出し側はこれを使う。
+ */
+export function applyBrushes(
+  ops: readonly BrushOp[],
+  readD: CornerReader,
+  readMat: CornerMatReader,
+  write: CornerWriter,
+  clampMinY: number,
+  clampMaxY: number,
+  each?: BrushBounds[],
+): BrushBounds {
+  const total = emptyBounds()
+  for (const op of ops) {
+    const b = applyBrush(
+      op.x,
+      op.y,
+      op.z,
+      op.shape,
+      op.mode,
+      op.material,
+      readD,
+      readMat,
+      write,
+      clampMinY,
+      clampMaxY,
+    )
+    total.solidified += b.solidified
+    total.cleared += b.cleared
+    total.fragmentsRemoved += b.fragmentsRemoved
+    total.looseTouched += b.looseTouched
+    mergeBounds(total, b)
+    each?.push(b)
+  }
+  return total
+}
+
 /** 球ブラシ。既存の呼び出し向けの薄いラッパ。 */
 export function applySphereBrush(
   wx: number,
@@ -378,6 +489,7 @@ export function applySphereBrush(
   write: CornerWriter,
   clampMinY: number,
   clampMaxY: number,
+  depth: number = DIG_ALL,
 ): BrushBounds {
   return applyBrush(
     wx,
@@ -391,6 +503,7 @@ export function applySphereBrush(
     write,
     clampMinY,
     clampMaxY,
+    depth,
   )
 }
 

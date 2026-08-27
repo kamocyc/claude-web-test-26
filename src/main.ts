@@ -7,8 +7,11 @@ import { createNoiseTexture } from './render/proceduralTextures'
 import { createTreePrototypes, treeMaterial } from './render/treeMeshes'
 import { VillageManager } from './world/VillageManager'
 import type { Box } from './world/village'
+import { worldToLocal } from './world/collision'
+import type { Collider } from './world/collision'
 import { World, createTreeHit } from './world/World'
-import { boxBrush, snapBoxCenter, sphereBrush } from './world/edits'
+import { DIG_ALL, boxBrush, orientedBoxBrush, snapBoxCenter, sphereBrush } from './world/edits'
+import type { BrushBounds } from './world/edits'
 import { WorldStore } from './world/storage'
 import {
   CHUNK_SIZE,
@@ -23,6 +26,7 @@ import {
 import { Player, PLAYER_EYE } from './player/Player'
 import { Controls } from './player/Controls'
 import { createRayHit, raycastTerrain } from './player/terrainRaycast'
+import { emptyGrade, gradeLabel, readGrade } from './player/grade'
 import { Hud } from './ui/hud'
 import { Inventory } from './items/Inventory'
 import { ITEM_BY_MATERIAL, RECIPES, TRADES, item, tryItem } from './items/items'
@@ -40,6 +44,26 @@ import {
   yawDeg,
 } from './build/pieces'
 import type { PieceKind } from './build/pieces'
+import { TrackManager } from './track/TrackManager'
+import type { TrackEnd, TrackPlan } from './track/TrackManager'
+import {
+  DEFAULT_SEG_LEN,
+  GRADE_TOL,
+  MAX_SEG_LEN,
+  MIN_SEG_LEN,
+  TRACK_INFO,
+  TRACK_KINDS,
+  segmentCost,
+  segmentEnd,
+} from './track/track'
+import type { Segment, TrackKind } from './track/track'
+import { gradeOps, gradeVolume } from './track/grading'
+import { MAX_PILLAR } from './track/TrackGraph'
+import { TrainManager } from './train/TrainManager'
+import { CAR_LEN, STATION_COST, TRAIN_COST } from './train/trains'
+import type { Train } from './train/trains'
+import { carColliders, trainImpact } from './train/impact'
+import type { Impact } from './train/impact'
 
 const VIEW_DISTANCE = 7
 const REACH = 9
@@ -59,11 +83,53 @@ const TOOLS = [
   { id: 'box', name: '直方体' },
   { id: 'smooth', name: 'ならし' },
   { id: 'build', name: '建築' },
+  { id: 'track', name: '軌道' },
+  { id: 'station', name: '駅・列車' },
 ] as const
 
 /** 建築モードの操作間隔（秒）。 */
 const BUILD_INTERVAL = 0.18
 const DEMOLISH_INTERVAL = 0.25
+
+/** 軌道モードの操作間隔（秒）。1 区間が長いので建築より少し重くする。 */
+const TRACK_INTERVAL = 0.24
+
+/** 敷けない理由の説明。 */
+const TRACK_REASON: Record<string, string> = {
+  overlap: 'そこには他の軌道と重なってしまいます',
+  buried: '切土が深すぎます（先に掘って切通しを作ってください）',
+  toohigh: '高すぎて橋脚が立てられません',
+  kink: '繋ぐ相手との向きが違いすぎます（回り込んでください）',
+  blocked: '建物にぶつかります（避けるか、先に壊してください）',
+}
+
+/** 狙った長さに届かなかったときの、短くなった理由。 */
+const TRIM_REASON: Record<string, string> = {
+  buried: '斜面にぶつかった',
+  toohigh: '谷が深すぎた',
+  blocked: '建物にぶつかった',
+}
+
+/** Shift + ホイールで動かす勾配の刻み（0.5 %）。 */
+const GRADE_UI_STEP = 0.005
+
+/** 駅・列車モードで、狙点の近くの駅／列車を拾う距離（m）。 */
+const STATION_PICK = 6
+const TRAIN_PICK = 5
+
+/** 列車に乗り込める距離（m）と、降りたときに脇へよける距離（m）。 */
+const RIDE_RANGE = 4.5
+const RIDE_OFF = 2.6
+
+/** 一度はねられてから、次にはねられるまでの間（秒）。轢かれ続けないための猶予。 */
+const TRAIN_HIT_COOLDOWN = 1.2
+/** はね飛ばされたときに地面から浮かせる高さ（m）。摩擦に食われないようにする。 */
+const TRAIN_HIT_LIFT_OFF = 0.15
+
+/** 狙点の近くでレールヘッドを拾う距離（m）。 */
+const RAILHEAD_RANGE = 4
+/** 握っているレールヘッドから離れすぎたら手放す距離（m）。 */
+const RAILHEAD_DROP = 60
 
 /** T キーで巡回するデバッグ用の時刻。`null` は自動で進む状態。 */
 const TIME_PRESETS: Array<{ name: string; t: number } | null> = [
@@ -89,6 +155,30 @@ const MAX_BOX_EDGE = 8
  * 整数にしておくと半サイズが 0.5 の倍数になり、
  * 面を格子平面にぴったり乗せられる（= 稜が丸まらない）。
  */
+/**
+ * 1 回の掘削で削る深さ（m）の範囲と刻み。
+ *
+ * 掘るのは一気にではなく、掛けるたびにブラシの形へこの深さぶんずつ近づく。
+ * 上限を超えると {@link DIG_ALL} になり、昔どおり 1 回でブラシの形を抜く。
+ */
+const MIN_DIG_DEPTH = 0.1
+const MAX_DIG_DEPTH = 1.5
+const DIG_DEPTH_STEP = 0.1
+const DEFAULT_DIG_DEPTH = 0.4
+
+/** 掘る強さを 1 段ずらす。上限の 1 つ上が「一気に」。 */
+export function stepDigDepth(depth: number, dir: number): number {
+  if (depth >= DIG_ALL) return dir > 0 ? DIG_ALL : MAX_DIG_DEPTH
+  const next = Math.round((depth + dir * DIG_DEPTH_STEP) * 10) / 10
+  if (next > MAX_DIG_DEPTH + 1e-9) return DIG_ALL
+  return Math.max(MIN_DIG_DEPTH, next)
+}
+
+/** 掘る強さの表示。 */
+export function digDepthLabel(depth: number): string {
+  return depth >= DIG_ALL ? '一気に' : `${depth.toFixed(1)} m/回`
+}
+
 export function boxEdge(radius: number): number {
   const t = Math.max(0, Math.min(1, (radius - MIN_BRUSH) / (MAX_BRUSH - MIN_BRUSH)))
   return Math.round(MIN_BOX_EDGE + t * (MAX_BOX_EDGE - MIN_BOX_EDGE))
@@ -177,6 +267,15 @@ async function boot(): Promise<void> {
   if (meta?.pieces2) build.load(meta.pieces2)
   else if (meta?.pieces) build.loadLegacy(meta.pieces, BUILD_CELL)
 
+  // 敷いた線路と道路。建築パーツと同じく地形とは別レイヤに持ち、当たり判定だけ合流する
+  const tracks = new TrackManager(scene)
+  if (meta?.tracks) tracks.load(meta.tracks)
+
+  // 駅と列車。線路の網（経路探索）はここが持ち、線路が変わるたびに組み直す
+  const trains = new TrainManager(scene)
+  trains.rebuildNetwork(tracks.graph.segments())
+  if (meta?.stations || meta?.trainRoutes) trains.load(meta.stations, meta.trainRoutes)
+
   let health = typeof meta?.health === 'number' ? meta.health : MAX_HEALTH
   let sinceHurt = REGEN_DELAY
   hud.setHealth(health, MAX_HEALTH)
@@ -233,6 +332,55 @@ async function boot(): Promise<void> {
   boxGhost.visible = false
   scene.add(boxGhost)
 
+  // --- 勾配の目安 ---
+  // 目の高さに水平のライン（青）を出し、そこから狙点までの落差を縦のライン（橙）で結ぶ。
+  // 測るための線なので、地形に隠れないよう深度テストを切って常に手前へ描く。
+  const LEVEL_BAR_LEN = 3.2
+  const LEVEL_BAR_THICK = 0.05
+  const guideMaterial = (color: number): THREE.MeshBasicMaterial =>
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.85,
+      depthTest: false,
+      depthWrite: false,
+      fog: false,
+    })
+  const levelBar = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), guideMaterial(0x8fe8ff))
+  const dropBar = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), guideMaterial(0xffd166))
+  for (const m of [levelBar, dropBar]) {
+    m.renderOrder = 5
+    m.visible = false
+    scene.add(m)
+  }
+
+  /** 照準の勾配。狙っていないフレームは `gradeValid` が false。 */
+  const gradeScratch = emptyGrade()
+  let gradeValid = false
+
+  /** 狙点の勾配を測って、目安の線と HUD を更新する。 */
+  function showGrade(x: number, y: number, z: number): void {
+    readGrade(eye.x, eye.y, eye.z, x, y, z, gradeScratch)
+    gradeValid = true
+    hud.setGrade(gradeLabel(gradeScratch))
+    // 水平のラインは視線に直交させる（rotation.y = yaw の局所 +x が「右」）
+    levelBar.visible = true
+    levelBar.position.set(x, eye.y, z)
+    levelBar.rotation.y = controls.yaw
+    levelBar.scale.set(LEVEL_BAR_LEN, LEVEL_BAR_THICK, LEVEL_BAR_THICK)
+    const rise = gradeScratch.rise
+    dropBar.visible = Math.abs(rise) > LEVEL_BAR_THICK
+    dropBar.position.set(x, eye.y + rise / 2, z)
+    dropBar.scale.set(LEVEL_BAR_THICK, Math.abs(rise), LEVEL_BAR_THICK)
+  }
+
+  function hideGrade(): void {
+    gradeValid = false
+    levelBar.visible = false
+    dropBar.visible = false
+    hud.setGrade('')
+  }
+
   /** HUD に出すブラシの説明。 */
   function brushLabel(note: string | null = null): string {
     if (note) return note
@@ -248,18 +396,91 @@ async function boot(): Promise<void> {
       const turn = buildYawOffset === 0 ? '' : ` ${yawDeg(buildYawOffset)}°`
       return `${t.name} ${PIECE_NAME[k]}（${PIECE_COST[k]}）${hand}${turn}　R:種類　ホイール:5°`
     }
+    if (t.id === 'track') {
+      const info = TRACK_INFO[TRACK_KINDS[trackIndex]]
+      const cost = trackPlan ? `　材料 ${planCost(trackPlan.seg).label}` : ''
+      const head = trackPlan?.from ? '' : '　新しい線'
+      // 狙った長さに届かないときは、実際の長さと理由も出す
+      const cut =
+        trackPlan && trackPlan.trim !== 'none'
+          ? ` → ${trackPlan.seg.length.toFixed(1)} m（${TRIM_REASON[trackPlan.trim]}）`
+          : ''
+      const grade =
+        trackGrade === null ? '自動' : `${(trackGrade * 100 >= 0 ? '+' : '')}${(trackGrade * 100).toFixed(1)}%`
+      return (
+        `${t.name} ${info.name}${cost}${hand}${head}` +
+        `　長さ ${segLen} m${cut}　勾配 ${grade}` +
+        `　R:種類　ホイール:長さ　Shift:勾配　G:自動`
+      )
+    }
+    if (t.id === 'station') {
+      const picked =
+        routeSel.length === 0
+          ? '　駅に照準を合わせて右クリックで路線に追加'
+          : `　路線: ${routeSel.map((i) => `駅${i + 1}`).join(' → ')}${
+              routeSel.length >= 2 ? `　R:発車（${TRAIN_COST}）` : ''
+            }`
+      return `${t.name}（駅 ${STATION_COST}）${hand}${picked}`
+    }
+    // 掘る強さは掘れるブラシのときだけ出す（ならしは体積を動かさない）
+    const power =
+      t.id === 'sphere' || t.id === 'box'
+        ? `　強さ ${digDepthLabel(digDepth)}（Shift+ホイール）`
+        : ''
     if (t.id === 'box') {
       const n = boxEdge(brushRadius)
-      return `${t.name} ${n}×${n}×${n} m${hand}${grain}`
+      return `${t.name} ${n}×${n}×${n} m${hand}${grain}${power}`
     }
-    return `${t.name} 半径 ${brushRadius.toFixed(1)} m${hand}${grain}`
+    return `${t.name} 半径 ${brushRadius.toFixed(1)} m${hand}${grain}${power}`
   }
 
   let brushRadius = 2.5
+  /** 1 回で削る深さ（m）。Shift + ホイールで変える。 */
+  let digDepth = DEFAULT_DIG_DEPTH
   let tool = 0
   /** 建築モードで選んでいるパーツと、向きのオフセット（5° 刻みの 0..71）。 */
   let pieceIndex = 0
   let buildYawOffset = 0
+  /** 軌道モードで選んでいる種類と、1 区間の長さ（m）。 */
+  let trackIndex = 0
+  let segLen = DEFAULT_SEG_LEN
+  /**
+   * 手で決めた勾配（1 = 45°）。`null` なら**終点の地面に合わせて自動**。
+   * Shift + ホイールで動かし、`G` で自動へ戻す。
+   */
+  let trackGrade: number | null = null
+  /** 同じ理由のトーストを何度も出さないための覚え書き。 */
+  let lastTrim = 'none'
+  /** いま伸ばしている端点（レールヘッド）。中クリックで手放して新しい線を始められる。 */
+  let railhead: TrackEnd | null = null
+  /**
+   * 敷設の見積もり（近くの端点集めと重なり判定）も毎フレームは重いので、
+   * 建築と同じく**照準が 5 cm 以上動くか、種類・長さ・素材が変わったときだけ**やり直す。
+   * `brushLabel()` が材料の表示に読むので、ここで持つ。
+   */
+  let trackKey = ''
+  /** 敷く前に見積もった材料（照準が動いたら作り直す）。 */
+  let trackCostCache: { total: number; label: string } | null = null
+  let trackPlan: TrackPlan | null = null
+  /** 路線を組み立てている最中に選んだ駅（選んだ順）。 */
+  let routeSel: number[] = []
+  /** いま乗っている列車。 */
+  let riding: Train | null = null
+  /** 起動からの経過秒。はねられた間隔を測るのに使う。 */
+  let elapsed = 0
+  /** 次にはねられるまでの残り時間（プレイヤーぶん）。 */
+  let trainHitCd = 0
+  /** MOB がはねられた時刻。消えた MOB を掴んだままにしないよう WeakMap で持つ。 */
+  const mobHitAt = new WeakMap<object, number>()
+  /** 当たり判定と、はねられた結果の置き場（毎フレーム使い回す）。 */
+  const carScratch: Collider[] = []
+  const impactScratch: Impact = { nx: 0, nz: 0, push: 0, lift: 0, damage: 0 }
+  const roofScratch = [0, 0]
+
+  function invalidateTrack(): void {
+    trackKey = ''
+    trackCostCache = null
+  }
   let statsVisible = true
   let started = false
   let editCooldown = 0
@@ -292,6 +513,20 @@ async function boot(): Promise<void> {
     hud.setBrush(brushLabel())
   }
   controls.onResetRotation = () => {
+    if (TOOLS[tool].id === 'station') {
+      if (routeSel.length === 0) return
+      clearRouteSelection()
+      hud.setBrush(brushLabel())
+      hud.showToast('選んだ路線を取り消しました')
+      return
+    }
+    if (TOOLS[tool].id === 'track') {
+      if (!railhead) return
+      railhead = null
+      invalidateTrack()
+      hud.showToast('接続を切りました（次はここから新しい線を始めます）')
+      return
+    }
     if (TOOLS[tool].id !== 'build' || buildYawOffset === 0) return
     buildYawOffset = 0
     invalidateBuild()
@@ -299,8 +534,22 @@ async function boot(): Promise<void> {
     hud.showToast('向きを既定に戻しました')
   }
   controls.onCyclePiece = () => {
+    if (TOOLS[tool].id === 'station') {
+      departRoute()
+      hud.setBrush(brushLabel())
+      return
+    }
+    if (TOOLS[tool].id === 'track') {
+      trackIndex = (trackIndex + 1) % TRACK_KINDS.length
+      // 種類が変わると繋げる相手も変わるので、握っていた端点は手放す
+      railhead = null
+      invalidateTrack()
+      hud.showToast(`軌道: ${TRACK_INFO[TRACK_KINDS[trackIndex]].name}`)
+      hud.setBrush(brushLabel())
+      return
+    }
     if (TOOLS[tool].id !== 'build') {
-      hud.showToast('建築モードで使えます（B で切替）')
+      hud.showToast('建築・軌道・駅のモードで使えます（B で切替）')
       return
     }
     pieceIndex = (pieceIndex + 1) % PIECE_KINDS.length
@@ -313,6 +562,27 @@ async function boot(): Promise<void> {
   controls.onToggleStats = () => {
     statsVisible = !statsVisible
     hud.setStatsVisible(statsVisible)
+  }
+  controls.onToggleUnlimited = () => setUnlimited(!inventory.unlimited)
+  controls.onResetGrade = () => {
+    if (TOOLS[tool].id !== 'track') return
+    trackGrade = null
+    invalidateTrack()
+    hud.setBrush(brushLabel())
+    hud.showToast('勾配を自動（地形なり）に戻した')
+  }
+
+  /**
+   * デバッグ用の無制限モード。溜めた量はそのままに、支払いだけを素通しにする。
+   * 何を建てても減らないので、線路や建築の形をいろいろ試すのに使う。
+   */
+  function setUnlimited(on: boolean): void {
+    if (inventory.unlimited === on) return
+    inventory.unlimited = on
+    hud.refresh()
+    hud.setBrush(brushLabel())
+    invalidateTrack()
+    hud.showToast(on ? 'デバッグ: 材料を無制限にした（F4 で戻す）' : '材料の制限を戻した')
   }
   controls.onLockChange = (locked) => {
     if (!locked && started && !hud.panelOpen && !hud.tradeOpen) hud.setOverlay(true)
@@ -332,6 +602,12 @@ async function boot(): Promise<void> {
     inventory.clear()
     torches.clear()
     build.clear()
+    tracks.clear()
+    trains.clear()
+    stats.trainHits = 0
+    railhead = null
+    riding = null
+    routeSel = []
     mobs.clear()
     health = MAX_HEALTH
     hud.setHealth(health, MAX_HEALTH)
@@ -371,6 +647,9 @@ async function boot(): Promise<void> {
       inventory: inventory.toJSON(),
       torches: [...torches.torches],
       pieces2: build.serialize(),
+      tracks: tracks.serialize(),
+      stations: trains.serialize().stations,
+      trainRoutes: trains.serialize().trains,
       health,
       chopped: world.choppedList,
     }
@@ -404,6 +683,17 @@ async function boot(): Promise<void> {
     torches: 0,
     /** 置いた建築パーツの数。 */
     pieces: 0,
+    /** 敷いた軌道の区間数。 */
+    tracks: 0,
+    /** 建てた駅の数と、走っている列車の数。 */
+    stations: 0,
+    trains: 0,
+    /** 列車に乗っているか。 */
+    riding: false,
+    /** 列車にはねられた回数。 */
+    trainHits: 0,
+    /** デバッグ用の無制限モードが入っているか。 */
+    unlimited: false,
     /** 素材の手持ち量（grass, dirt, rock, sand）。 */
     inventory: [0, 0, 0, 0] as number[],
     /** 視線角を直接設定する。 */
@@ -432,6 +722,15 @@ async function boot(): Promise<void> {
       player.position.y -= 1.0
       world.update(x, player.position.y, z)
     },
+    /**
+     * 高さも指定して置く（テスト用）。地表を探さないので、
+     * 列車の屋根の上のような**足場の上**へ直に降ろせる。
+     */
+    placeAt(x: number, y: number, z: number) {
+      player.position.set(x, y, z)
+      player.velocity.set(0, 0, 0)
+      world.update(x, y, z)
+    },
     /** 一番近い木の根元の位置と幹の当たり判定（デバッグ／テスト用）。 */
     nearestTree(): { x: number; y: number; z: number; r: number; h: number } | null {
       const t = world.collectTrunks(
@@ -453,8 +752,14 @@ async function boot(): Promise<void> {
       return best
     },
     /** 指定座標を球ブラシで掘る（テスト用。照準を通さず直接叩く）。 */
-    dig(x: number, y: number, z: number, r = 2.5) {
-      world.applyBrush(x, y, z, sphereBrush(r), 'dig', MATERIAL_INFO[0].id)
+    dig(x: number, y: number, z: number, r = 2.5, depth = DIG_ALL) {
+      world.applyBrush(x, y, z, sphereBrush(r), 'dig', MATERIAL_INFO[0].id, depth)
+    },
+    /** 指定座標へ球ブラシで盛る（テスト用。照準を通さず直接叩く）。 */
+    fill(x: number, y: number, z: number, r = 2.5, itemId = 'rock') {
+      const def = tryItem(itemId)
+      if (def?.material === undefined) return
+      world.applyBrush(x, y, z, sphereBrush(r), 'place', def.material)
     },
     /** 近くの木の当たり判定（縦円柱。x, y, 半径, 高さ の順で 5 要素ずつ）。 */
     treeColliders(): number[] {
@@ -486,6 +791,19 @@ async function boot(): Promise<void> {
       brushRadius = clamp(r, MIN_BRUSH, MAX_BRUSH)
       hud.setBrush(brushLabel())
     },
+    /** 1 回で削る深さ（m）を設定する。0 以下なら「一気に」（テスト用）。 */
+    setDigDepth(m: number) {
+      digDepth = m > 0 ? Math.min(m, DIG_ALL) : DIG_ALL
+      hud.setBrush(brushLabel())
+    },
+    /** いまの掘る強さ（m/回）。「一気に」なら Infinity。 */
+    digDepth(): number {
+      return digDepth
+    },
+    /** いま照準が指している点の勾配。狙っていなければ null。 */
+    gradeReading() {
+      return gradeValid ? { ...gradeScratch } : null
+    },
     /** 密度場の値。> 0 が固体。 */
     density(x: number, y: number, z: number): number {
       return world.densityAt(x, y, z)
@@ -502,6 +820,10 @@ async function boot(): Promise<void> {
     /** 持ち物の個数。 */
     itemCount(id: string): number {
       return inventory.whole(id)
+    },
+    /** 無制限モードでも変わらない、実際に溜めてある量（テスト用）。 */
+    storedCount(id: string): number {
+      return Math.floor(inventory.stored(id))
     },
     /** ホットバーの枠にアイテムを入れて選ぶ（テスト用）。 */
     equip(id: string) {
@@ -651,6 +973,352 @@ async function boot(): Promise<void> {
     buildColliders(): number {
       return build.colliderCount
     },
+    /** 敷いた軌道の区間数。 */
+    trackCount(): number {
+      return tracks.count
+    },
+    /** 掘った跡・盛った跡まで含めた地表の高さ（テスト用）。 */
+    surfaceAt(x: number, z: number): number {
+      return surfaceY(x, z)
+    },
+    /** デバッグ用の無制限モードを切り替える（F4 と同じ）。 */
+    setUnlimited(on: boolean): boolean {
+      setUnlimited(on)
+      return inventory.unlimited
+    },
+    /** 1 区間を敷くのに要る材料の見積もり（軌道 + 築堤）。 */
+    trackCostAt(x: number, y: number, z: number): { rail: number; fill: number; cut: number } | null {
+      const s2 = tracks.nearest(x, y, z, 14)
+      if (!s2) return null
+      const v = gradeVolume(s2, surfaceY)
+      return { rail: segmentCost(s2), fill: v.fill, cut: v.cut }
+    },
+    /** 敷いた軌道が持つ当たり判定の箱の数。 */
+    trackColliders(): number {
+      return tracks.colliderCount
+    },
+    /** 軌道の種類を選ぶ（テスト用）。 */
+    setTrackKind(name: string): boolean {
+      const i = TRACK_KINDS.indexOf(name as TrackKind)
+      if (i < 0) return false
+      trackIndex = i
+      railhead = null
+      invalidateTrack()
+      hud.setBrush(brushLabel())
+      return true
+    },
+    /** 勾配を % で決める（null で自動＝地形なり）。 */
+    setTrackGrade(percent: number | null) {
+      trackGrade = percent === null ? null : percent / 100
+      invalidateTrack()
+      hud.setBrush(brushLabel())
+    },
+    /** いまの勾配（%）。自動なら null。 */
+    trackGrade(): number | null {
+      return trackGrade === null ? null : trackGrade * 100
+    },
+    /**
+     * 敷かずに見積もりだけを返す（テスト用）。
+     * 狙った長さ・実際の長さ・切り詰めた理由が分かる。
+     */
+    trackPreview(x: number, y: number, z: number) {
+      const kind = TRACK_KINDS[trackIndex]
+      const def = inventory.held()
+      const plan = tracks.plan({
+        kind,
+        mat: def?.material ?? MAT_PLANK,
+        maxLen: segLen,
+        railhead: pickRailhead(kind, x, y, z),
+        aimX: x,
+        aimY: y,
+        aimZ: z,
+        camYaw: controls.yaw,
+        grade: trackGrade,
+        terrain: trackTerrain,
+      })
+      return {
+        check: plan.check,
+        trim: plan.trim,
+        wanted: plan.wanted,
+        length: plan.seg.length,
+        grade: plan.seg.length > 0 ? plan.seg.rise / plan.seg.length : 0,
+        curve: plan.seg.curve,
+      }
+    },
+    /** 1 区間の長さを設定する（テスト用。上下限に丸められる）。 */
+    setTrackLength(m: number) {
+      segLen = clamp(Math.round(m), MIN_SEG_LEN, MAX_SEG_LEN)
+      invalidateTrack()
+      hud.setBrush(brushLabel())
+    },
+    /**
+     * 照準の当たった点を渡して、**本番とまったく同じ経路で**敷く（テスト用）。
+     * レールヘッドの決め方も材料も可否の判定も本番と同じなので、返り値がそのまま理由になる。
+     */
+    trackAim(x: number, y: number, z: number, itemId = 'rock'): string {
+      const def = tryItem(itemId)
+      if (!def?.build || def.material === undefined) return 'material'
+      const kind = TRACK_KINDS[trackIndex]
+      const plan = tracks.plan({
+        kind,
+        mat: def.material,
+        maxLen: segLen,
+        railhead: pickRailhead(kind, x, y, z),
+        aimX: x,
+        aimY: y,
+        aimZ: z,
+        camYaw: controls.yaw,
+        grade: trackGrade,
+        terrain: trackTerrain,
+      })
+      const cost = trackCost(plan.seg)
+      if (inventory.count(def.id) < cost) return 'short'
+      if (plan.check !== 'ok') return plan.check
+      if (!tracks.placePlan(plan)) return 'overlap'
+      reportTrim(plan)
+      inventory.take(def.id, segmentCost(plan.seg))
+      gradeTerrain(plan.seg)
+      refreshNetwork()
+      railhead = plan.joinTo ? null : endOf(plan.seg)
+      invalidateTrack()
+      markMetaDirty()
+      return 'ok'
+    },
+    /** 敷いてある区間を敷いた順に並べたもの（テスト用）。 */
+    trackList() {
+      const out: {
+        kind: string
+        x: number
+        y: number
+        z: number
+        endX: number
+        endY: number
+        endZ: number
+        length: number
+        curve: number
+      }[] = []
+      for (const t of tracks.graph.segments()) {
+        const e = segmentEnd(t)
+        out.push({
+          kind: t.kind,
+          x: t.x,
+          y: t.y,
+          z: t.z,
+          endX: e[0],
+          endY: e[1],
+          endZ: e[2],
+          length: t.length,
+          curve: t.curve,
+        })
+      }
+      return out
+    },
+    /** 指定座標にいちばん近い区間の中身（テスト用）。 */
+    trackAt(x: number, y: number, z: number, range = 4) {
+      const s = tracks.nearest(x, y, z, range)
+      if (!s) return null
+      const e = segmentEnd(s)
+      return {
+        kind: s.kind as string,
+        x: s.x,
+        y: s.y,
+        z: s.z,
+        yaw: s.yaw,
+        curve: s.curve,
+        length: s.length,
+        rise: s.rise,
+        mat: s.mat,
+        endX: e[0],
+        endY: e[1],
+        endZ: e[2],
+        endYaw: e[3],
+      }
+    },
+    /** 指定座標にいちばん近い区間を撤去する（テスト用。材料は戻る）。 */
+    removeTrackAt(x: number, y: number, z: number, range = 4): boolean {
+      const s = tracks.nearest(x, y, z, range)
+      const gone = s ? tracks.remove(s) : null
+      if (!gone) return false
+      const def = ITEM_BY_MATERIAL.get(gone.mat)
+      if (def) inventory.add(def.id, segmentCost(gone))
+      if (railhead && railhead.seg === gone) railhead = null
+      refreshNetwork()
+      invalidateTrack()
+      markMetaDirty()
+      return true
+    },
+    /** いま伸ばそうとしている端点（無ければ null）。 */
+    railhead(): { x: number; y: number; z: number; yaw: number } | null {
+      return railhead ? { x: railhead.x, y: railhead.y, z: railhead.z, yaw: railhead.yaw } : null
+    },
+    /** レールヘッドを手放して新しい線を始める（テスト用）。 */
+    clearRailhead() {
+      railhead = null
+      invalidateTrack()
+    },
+    /** 建てた駅の数。 */
+    stationCount(): number {
+      return trains.stations.length
+    },
+    /** 駅の一覧（建てた順）。 */
+    stationList() {
+      return trains.stations.map((s) => ({ x: s.x, y: s.y, z: s.z, mat: s.mat }))
+    },
+    /** 線路の上に駅を建てる（テスト用。本番と同じ規則で見る）。 */
+    placeStation(x: number, y: number, z: number, itemId = 'rock'): string {
+      const def = tryItem(itemId)
+      if (!def?.build || def.material === undefined) return 'material'
+      if (inventory.count(def.id) < STATION_COST) return 'short'
+      const check = trains.canPlaceStation(x, y, z)
+      if (check !== 'ok') return check
+      if (!trains.addStation(x, y, z, def.material)) return 'notrack'
+      inventory.take(def.id, STATION_COST)
+      markMetaDirty()
+      return 'ok'
+    },
+    /** 指定座標にいちばん近い駅の番号（無ければ -1）。 */
+    stationAt(x: number, y: number, z: number, range = 6): number {
+      return trains.stationAt(x, y, z, range)
+    },
+    /** 駅を撤去する（材料は戻る）。 */
+    removeStationAt(x: number, y: number, z: number, range = 6): boolean {
+      const i = trains.stationAt(x, y, z, range)
+      const gone = i >= 0 ? trains.removeStation(i) : null
+      if (!gone) return false
+      const def = ITEM_BY_MATERIAL.get(gone.mat)
+      if (def) inventory.add(def.id, STATION_COST)
+      routeSel = routeSel.filter((k) => k !== i).map((k) => (k > i ? k - 1 : k))
+      trains.setSelection(routeSel)
+      markMetaDirty()
+      return true
+    },
+    /** 駅を路線に加える（照準で選ぶのと同じ）。 */
+    selectStation(index: number): boolean {
+      if (!trains.stations[index]) return false
+      if (routeSel[routeSel.length - 1] === index) return false
+      routeSel = [...routeSel, index]
+      trains.setSelection(routeSel)
+      hud.setBrush(brushLabel())
+      return true
+    },
+    /** いま選んでいる路線。 */
+    routeSelection(): number[] {
+      return [...routeSel]
+    },
+    clearRoute() {
+      clearRouteSelection()
+      hud.setBrush(brushLabel())
+    },
+    /** 選んだ路線で列車を発車させる（テスト用。R キーと同じ規則）。 */
+    depart(itemId = 'rock'): string {
+      const def = tryItem(itemId)
+      if (!def?.build || def.material === undefined) return 'material'
+      if (routeSel.length < 2) return 'short-route'
+      if (inventory.count(def.id) < TRAIN_COST) return 'short'
+      if (!trains.addTrain(routeSel, def.material)) return 'badroute'
+      inventory.take(def.id, TRAIN_COST)
+      clearRouteSelection()
+      hud.setBrush(brushLabel())
+      markMetaDirty()
+      return 'ok'
+    },
+    /** 走っている列車の数。 */
+    trainCount(): number {
+      return trains.trains.length
+    },
+    /** 列車の状態。 */
+    trainInfo(index = 0) {
+      const t = trains.trains[index]
+      if (!t) return null
+      return {
+        x: t.pos[0],
+        y: t.pos[1],
+        z: t.pos[2],
+        yaw: t.pos[3],
+        speed: t.speed,
+        running: t.running,
+        stuck: t.stuck,
+        hop: t.hop,
+        dir: t.dir,
+        dwell: t.dwell,
+        total: t.total,
+        traveled: t.traveled,
+        route: [...t.route],
+      }
+    },
+    /** 列車を引き上げる（材料は戻る）。 */
+    removeTrainAt(x: number, y: number, z: number, range = 6): boolean {
+      const t = trains.nearestTrain(x, y, z, range)
+      if (!t) return false
+      const def = ITEM_BY_MATERIAL.get(t.mat)
+      if (def) inventory.add(def.id, TRAIN_COST)
+      if (riding === t) riding = null
+      trains.removeTrain(t)
+      markMetaDirty()
+      return true
+    },
+    /** いちばん近い列車に乗る（F キーと同じ）。 */
+    rideTrain(): boolean {
+      return mount()
+    },
+    /** 列車から降りる。 */
+    leaveTrain() {
+      dismount()
+    },
+    /**
+     * いま乗っているか。`riding` は毎フレーム書き出す表示用なので、
+     * 乗り降りした直後に読むならこちらを使う。
+     */
+    isRiding(): boolean {
+      return riding !== null
+    },
+    /** 車体の当たり判定（走行中の位置で組み立てたもの）。 */
+    trainColliders(index = 0) {
+      const t = trains.trains[index]
+      if (!t) return []
+      return carColliders(t.pos, []).map((c) => ({
+        ox: c.ox ?? 0,
+        oz: c.oz ?? 0,
+        minX: c.minX,
+        maxX: c.maxX,
+        minZ: c.minZ,
+        maxZ: c.maxZ,
+        minY: c.minY,
+        maxY: c.maxY,
+      }))
+    },
+    /** いま列車の上に立っているか（立っているなら、その天面の高さ）。 */
+    standingOnTrain(): number | null {
+      let best: number | null = null
+      for (const t of trains.trains) {
+        for (const c of carColliders(t.pos, carScratch)) {
+          if (player.position.y < c.maxY - 0.1 || player.position.y > c.maxY + 0.35) continue
+          worldToLocal(c, player.position.x, player.position.z, roofScratch)
+          const r = player.radius
+          if (roofScratch[0] <= c.minX - r || roofScratch[0] >= c.maxX + r) continue
+          if (roofScratch[1] <= c.minZ - r || roofScratch[1] >= c.maxZ + r) continue
+          if (best === null || c.maxY > best) best = c.maxY
+        }
+      }
+      return best
+    },
+    /** いま居る MOB の一覧（はね飛ばされたかを見るのに使う）。 */
+    mobList() {
+      return mobs.mobs.map((m) => ({
+        kind: m.def.kind as string,
+        x: m.pos.x,
+        y: m.pos.y,
+        z: m.pos.z,
+        vx: m.vel.x,
+        vy: m.vel.y,
+        vz: m.vel.z,
+        hp: m.hp,
+      }))
+    },
+    /** 指定の場所に MOB を湧かせる（テスト用）。 */
+    spawnMobAt(kind: 'wraith' | 'deer' | 'villager', x: number, y: number, z: number) {
+      return mobs.spawn(kind, x, y, z) !== null
+    },
     /** 最寄りの村の広場へ移動する。見つからなければ false。 */
     gotoVillage(): boolean {
       const cx = Math.floor(player.position.x / VILLAGE_CELL)
@@ -731,7 +1399,9 @@ async function boot(): Promise<void> {
     boxesNear: (x, y, z, r, out) => {
       // 村の建物（out を空にして詰める）に、建てたパーツを足す
       villages.collidersNear(x, z, r, out)
-      return build.collectColliders(x, z, r, out, y - 2, y + 4)
+      build.collectColliders(x, z, r, out, y - 2, y + 4)
+      tracks.collectColliders(x, z, r, out, y - 2, y + 4)
+      return trains.collectColliders(x, z, r, out, y - 2, y + 4)
     },
   }
 
@@ -782,6 +1452,12 @@ async function boot(): Promise<void> {
       setTradePanel(false)
       return
     }
+    // 列車が近ければ乗り降りが優先
+    if (riding) {
+      dismount()
+      return
+    }
+    if (mount()) return
     const v = mobs.nearestVillager(player.position.x, player.position.z, 4.5)
     if (!v) {
       hud.showToast('近くに村人がいません')
@@ -823,6 +1499,157 @@ async function boot(): Promise<void> {
   let coalProgress = 0
 
   const isSolidAt = (x: number, y: number, z: number): boolean => world.isSolid(x, y, z)
+
+  /** 地表を探すときの刻みと、二分で詰める回数（4 cm まで詰まる）。 */
+  const SURFACE_STEP = 0.4
+  const SURFACE_REFINE = 3
+
+  /**
+   * 地表の高さ。**掘った跡も盛った跡も反映される**ので、
+   * 切り盛りしたところに橋脚が立ったり、同じ場所を二度盛ったりしない。
+   *
+   * 素の地形の高さから上下に探して、固体と空の境目を二分で詰める。
+   * たいていは 1〜2 歩で見つかるので、素の高さを引くのとほとんど変わらない。
+   */
+  const surfaceY = (x: number, z: number): number => {
+    const h = world.field.height(x, z)
+    const hi = h + GRADE_TOL + 1
+    const lo = h - MAX_PILLAR - 1
+    let solid: number
+    let air: number
+    if (world.isSolid(x, h, z)) {
+      let y = h
+      while (y < hi && world.isSolid(x, y + SURFACE_STEP, z)) y += SURFACE_STEP
+      solid = y
+      air = y + SURFACE_STEP
+    } else {
+      let y = h
+      while (y > lo && !world.isSolid(x, y - SURFACE_STEP, z)) y -= SURFACE_STEP
+      // 下に何も無い（水の中や空洞）ときは素の地形に任せる
+      if (y <= lo) return h
+      solid = y - SURFACE_STEP
+      air = y
+    }
+    for (let i = 0; i < SURFACE_REFINE; i++) {
+      const mid = (solid + air) / 2
+      if (world.isSolid(x, mid, z)) solid = mid
+      else air = mid
+    }
+    return solid
+  }
+
+  /**
+   * 軌道の敷設可否を測る地形。被りの判定は密度場を直接見るので、
+   * **自分で掘った切通しはそのまま「通れる」ようになる**。
+   */
+  const trackTerrain = {
+    ground: surfaceY,
+    solid: isSolidAt,
+    obstacles: trackObstacles,
+  }
+
+  /**
+   * 家や建てたパーツ。軌道がぶつかったら手前で止めるために使う
+   * （`VillageManager.collidersNear` の約束どおり、`out` は空にしてから詰まる）。
+   */
+  function trackObstacles(x: number, z: number, r: number, out: Collider[]): Collider[] {
+    villages.collidersNear(x, z, r, out)
+    return build.collectColliders(x, z, r, out)
+  }
+
+  /** いま見えている区間の勾配（Shift + ホイールの出発点にする）。 */
+  function gradeOfPlan(): number {
+    const seg = trackPlan?.seg
+    return seg && seg.length > 0 ? seg.rise / seg.length : 0
+  }
+
+  /**
+   * 狙った長さに届かなかったときに、その理由を伝える。
+   *
+   * 押しっぱなしで敷き続けても喧しくならないよう、**理由が変わったときだけ**出す。
+   */
+  function reportTrim(plan: TrackPlan): void {
+    if (plan.trim === 'none') {
+      lastTrim = 'none'
+      return
+    }
+    if (plan.trim === lastTrim) return
+    lastTrim = plan.trim
+    const why = TRIM_REASON[plan.trim] ?? 'ぶつかった'
+    hud.showToast(`${why}ので ${plan.seg.length.toFixed(1)} m で止めました`)
+  }
+
+  /**
+   * 敷いた区間に合わせて地形を切り盛りする。
+   *
+   * 差が {@link GRADE_TOL} 以下のところだけを直す。深い谷は橋脚に任せ、
+   * 高すぎる山はそもそも敷けない（{@link TrackGraph.check} が弾く）。
+   *
+   * 土は掘削・設置とまったく同じ扱いで、**切土で出たぶんは手に入り、
+   * 盛土で積んだぶんは手持ちから減る**。掘ったところの素材はブラシ 1 本ごとに
+   * その場で見るので、草地を削れば草が、岩場を削れば岩が返る。
+   */
+  function gradeTerrain(seg: Segment): void {
+    const ops = gradeOps(seg, surfaceY)
+    if (ops.length === 0) return
+    gradeBounds.length = 0
+    world.applyBrushBatch(
+      ops.map((o) => ({
+        x: o.x,
+        y: o.y,
+        z: o.z,
+        shape: orientedBoxBrush(o.hx, o.hy, o.hz, o.yaw),
+        mode: o.mode,
+        material: o.mat,
+      })),
+      gradeBounds,
+    )
+    let filled = 0
+    for (let i = 0; i < ops.length && i < gradeBounds.length; i++) {
+      const o = ops[i]
+      const b = gradeBounds[i]
+      if (o.mode === 'place') {
+        filled += b.solidified
+      } else if (b.cleared > 0) {
+        // 削れたのは路盤のすぐ上。そこの素材を見て手持ちへ返す
+        creditDig(o.x, o.y - o.hy + 0.5, o.z, 1, b.cleared)
+      }
+    }
+    if (filled <= 0) return
+    const def = ITEM_BY_MATERIAL.get(seg.mat)
+    if (def) inventory.takeUpTo(def.id, filled)
+  }
+
+  const gradeBounds: BrushBounds[] = []
+
+  /**
+   * 1 区間を敷くのに要る材料。**軌道そのもの + 築堤で積む土**。
+   *
+   * 積む土の量は敷く前には見積もりでしか分からない（実際に何格子ぶん埋まるかは
+   * ブラシを掛けてみないと数えられない）ので、ここでは体積から見積もって
+   * 足りるかどうかの目安にし、請求はブラシが数えた実数で行う。
+   * 撤去で戻るのは軌道のぶんだけ（積んだ土は地形になったので、掘れば返ってくる）。
+   *
+   * 地面を測るのは安くないので、**ゴーストと同じタイミングでだけ**計算して使い回す。
+   */
+  function planCost(seg: Segment): { total: number; label: string } {
+    if (trackCostCache) return trackCostCache
+    const rail = segmentCost(seg)
+    const { fill, cut } = gradeVolume(seg, surfaceY)
+    const bank = Math.ceil(fill)
+    const dug = Math.floor(cut)
+    const label = bank > 0 ? `${rail}（+築堤 ${bank}）` : dug > 0 ? `${rail}（切土 +${dug}）` : `${rail}`
+    trackCostCache = { total: rail + bank, label }
+    return trackCostCache
+  }
+
+  /** 照準を通さない経路（テスト用フック）でも同じ見積もりを使う。 */
+  function trackCost(seg: Segment): number {
+    trackCostCache = null
+    const n = planCost(seg).total
+    trackCostCache = null
+    return n
+  }
 
   function pieceKind(name: string): PieceKind | null {
     const i = PIECE_KINDS.indexOf(name as PieceKind)
@@ -955,12 +1782,459 @@ async function boot(): Promise<void> {
     editCooldown = BUILD_INTERVAL
   }
 
+  /**
+   * 伸ばす元の端点を決める。
+   *
+   * ①狙点の近くにある自由端（他の線の先へ繋ぎに行ける） →
+   * ②直前に置いた区間の終点（右クリックを続けるだけで線が伸びていく） →
+   * ③無し（狙点から新しい線を始める）。
+   */
+  function pickRailhead(kind: TrackKind, px: number, py: number, pz: number): TrackEnd | null {
+    const near = tracks.nearestEnd(px, py, pz, RAILHEAD_RANGE, kind)
+    if (near) return near
+    if (!railhead) return null
+    // 撤去された区間や、遠く離れた端点は握り続けない
+    if (!tracks.has(railhead.seg) || railhead.seg.kind !== kind) {
+      railhead = null
+      return null
+    }
+    const d = Math.hypot(railhead.x - player.position.x, railhead.z - player.position.z)
+    if (d > RAILHEAD_DROP) {
+      railhead = null
+      return null
+    }
+    return railhead
+  }
+
+  /**
+   * 軌道モードの 1 フレーム。
+   *
+   * 行きたい方を見ると、レールヘッドからそこへ向かう円弧がゴーストで伸びる。
+   * 右クリックで敷き、左クリックで撤去する（軌道モード中は地形を掘らない）。
+   */
+  function updateTrackMode(): void {
+    const kind = TRACK_KINDS[trackIndex]
+    const held = inventory.held()
+
+    // ホイールは 1 区間の長さ。Shift を押しながらだと勾配になる
+    if (controls.wheel !== 0) {
+      const dir = -Math.sign(controls.wheel)
+      if (controls.keys.has('ShiftLeft') || controls.keys.has('ShiftRight')) {
+        const max = TRACK_INFO[kind].maxGrade
+        const base = trackGrade ?? gradeOfPlan()
+        trackGrade = clamp(
+          Math.round((base + dir * GRADE_UI_STEP) / GRADE_UI_STEP) * GRADE_UI_STEP,
+          -max,
+          max,
+        )
+      } else {
+        segLen = clamp(segLen + dir, MIN_SEG_LEN, MAX_SEG_LEN)
+      }
+      controls.wheel = 0
+      invalidateTrack()
+    }
+
+    // 照準は「敷いた軌道」と「地形」の手前の方
+    const trackHit = tracks.raycast(eye.x, eye.y, eye.z, lookDir.x, lookDir.y, lookDir.z, REACH)
+    const terrain = raycastTerrain(world, eye, lookDir, REACH, hit)
+    const onTrack = trackHit !== null && trackHit.distance < (terrain ? terrain.distance : Infinity)
+
+    let px: number
+    let py: number
+    let pz: number
+    if (onTrack && trackHit) {
+      px = eye.x + lookDir.x * trackHit.distance
+      py = eye.y + lookDir.y * trackHit.distance
+      pz = eye.z + lookDir.z * trackHit.distance
+    } else if (terrain) {
+      px = terrain.point.x
+      py = terrain.point.y
+      pz = terrain.point.z
+    } else {
+      px = eye.x + lookDir.x * REACH
+      py = eye.y + lookDir.y * REACH
+      pz = eye.z + lookDir.z * REACH
+    }
+
+    const buildable = held?.build === true && held.material !== undefined
+    const mat = buildable ? (held.material as number) : MAT_PLANK
+
+    const head = pickRailhead(kind, px, py, pz)
+    const key = [
+      kind,
+      mat,
+      segLen,
+      trackGrade ?? 'auto',
+      head ? `${head.x.toFixed(2)},${head.z.toFixed(2)},${head.atEnd}` : 'new',
+      Math.round(px * 20),
+      Math.round(py * 20),
+      Math.round(pz * 20),
+      Math.round(controls.yaw / YAW_STEP),
+    ].join('|')
+    if (key !== trackKey || !trackPlan) {
+      trackKey = key
+      trackCostCache = null
+      trackPlan = tracks.plan({
+        kind,
+        mat,
+        maxLen: segLen,
+        railhead: head,
+        aimX: px,
+        aimY: py,
+        aimZ: pz,
+        grade: trackGrade,
+        aimOnTrack: onTrack,
+        camYaw: controls.yaw,
+        terrain: trackTerrain,
+      })
+    }
+    const plan = trackPlan
+    const cost = planCost(plan.seg).total
+    const enough = buildable && held !== null && inventory.count(held.id) >= cost
+    tracks.setGhost(plan, plan.check === 'ok' && enough, surfaceY)
+    hud.setBrush(brushLabel())
+
+    if (editCooldown > 0) return
+
+    // 左クリック = 撤去。材料は全額戻る
+    if (controls.digging) {
+      const gone = onTrack && trackHit ? tracks.remove(trackHit.seg) : null
+      if (gone) {
+        const def = ITEM_BY_MATERIAL.get(gone.mat)
+        if (def) inventory.add(def.id, segmentCost(gone))
+        if (railhead && railhead.seg === gone) railhead = null
+        refreshNetwork()
+        hud.showToast(`${TRACK_INFO[gone.kind].name}を撤去した`)
+        invalidateTrack()
+        markMetaDirty()
+      } else {
+        hud.showToast('撤去する軌道に照準を合わせてください')
+      }
+      editCooldown = DEMOLISH_INTERVAL
+      return
+    }
+
+    if (!controls.placing) return
+
+    if (!buildable || !held) {
+      hud.showToast('この素材では敷けません（岩・板・レンガ・ガラス）')
+      editCooldown = 0.5
+      return
+    }
+    if (!enough) {
+      hud.showToast(`${held.name}が足りません（この区間に ${cost} 必要）`)
+      editCooldown = 0.5
+      return
+    }
+    if (plan.check !== 'ok') {
+      hud.showToast(TRACK_REASON[plan.check])
+      editCooldown = DEMOLISH_INTERVAL
+      return
+    }
+    if (tracks.placePlan(plan)) {
+      reportTrim(plan)
+      inventory.take(held.id, segmentCost(plan.seg))
+      gradeTerrain(plan.seg)
+      refreshNetwork()
+      // 繋ぎ切ったら線は閉じ、そうでなければ終点が次のレールヘッドになる
+      railhead = plan.joinTo ? null : endOf(plan.seg)
+      invalidateTrack()
+      markMetaDirty()
+    }
+    editCooldown = TRACK_INTERVAL
+  }
+
+  /** 線路が変わったら、経路探索の網を組み直す（駅が線路から外れたら捨てられる）。 */
+  function refreshNetwork(): void {
+    trains.rebuildNetwork(tracks.graph.segments())
+    // 消えた駅を指していた選択は落とす
+    routeSel = routeSel.filter((i) => trains.stations[i])
+    trains.setSelection(routeSel)
+  }
+
+  /** 選んだ路線を捨てる。 */
+  function clearRouteSelection(): void {
+    if (routeSel.length === 0) return
+    routeSel = []
+    trains.setSelection(routeSel)
+  }
+
+  /** 選んだ駅を順に結んで 1 編成走らせる。 */
+  function departRoute(): void {
+    const held = inventory.held()
+    if (routeSel.length < 2) {
+      hud.showToast('駅を 2 つ以上、走らせたい順に選んでください')
+      return
+    }
+    if (!held?.build || held.material === undefined) {
+      hud.showToast('この素材では列車を作れません（岩・板・レンガ・ガラス）')
+      return
+    }
+    if (inventory.count(held.id) < TRAIN_COST) {
+      hud.showToast(`${held.name}が足りません（列車に ${TRAIN_COST} 必要）`)
+      return
+    }
+    const train = trains.addTrain(routeSel, held.material)
+    if (!train) {
+      hud.showToast('その路線では走らせられません')
+      return
+    }
+    inventory.take(held.id, TRAIN_COST)
+    hud.showToast(`列車が発車しました（${routeSel.length} 駅）`)
+    clearRouteSelection()
+    markMetaDirty()
+  }
+
+  /**
+   * 駅・列車モードの 1 フレーム。
+   *
+   * 右クリックで線路の上に駅を置き、**置いた駅に照準を合わせて右クリックすると
+   * 路線に順番に加わる**。2 駅以上選んで `R` を押すと列車が発車する。
+   * 左クリックは駅か列車の撤去、中クリックは選んだ路線の取り消し。
+   */
+  function updateStationMode(): void {
+    const held = inventory.held()
+    const trackHit = tracks.raycast(eye.x, eye.y, eye.z, lookDir.x, lookDir.y, lookDir.z, REACH)
+    const terrain = raycastTerrain(world, eye, lookDir, REACH, hit)
+    const onTrack = trackHit !== null && trackHit.distance < (terrain ? terrain.distance : Infinity)
+    const dist = onTrack && trackHit ? trackHit.distance : terrain ? terrain.distance : REACH
+    const px = eye.x + lookDir.x * dist
+    const py = eye.y + lookDir.y * dist
+    const pz = eye.z + lookDir.z * dist
+
+    const station = trains.stationAt(px, py, pz, STATION_PICK)
+    const train = trains.nearestTrain(px, py, pz, TRAIN_PICK)
+    hud.setBrush(brushLabel())
+
+    if (editCooldown > 0) return
+
+    // 左クリック = 撤去。材料は全額戻る
+    if (controls.digging) {
+      if (station >= 0) {
+        const gone = trains.removeStation(station)
+        if (gone) {
+          const def = ITEM_BY_MATERIAL.get(gone.mat)
+          if (def) inventory.add(def.id, STATION_COST)
+          routeSel = routeSel.filter((i) => i !== station).map((i) => (i > station ? i - 1 : i))
+          trains.setSelection(routeSel)
+          hud.showToast('駅を撤去した')
+          markMetaDirty()
+        }
+      } else if (train) {
+        const def = ITEM_BY_MATERIAL.get(train.mat)
+        if (def) inventory.add(def.id, TRAIN_COST)
+        if (riding === train) dismount()
+        trains.removeTrain(train)
+        hud.showToast('列車を引き上げた')
+        markMetaDirty()
+      } else {
+        hud.showToast('撤去する駅か列車に照準を合わせてください')
+      }
+      editCooldown = DEMOLISH_INTERVAL
+      return
+    }
+
+    if (!controls.placing) return
+
+    // 既にある駅を狙っていれば、路線に加える
+    if (station >= 0) {
+      if (routeSel[routeSel.length - 1] === station) {
+        hud.showToast('同じ駅は続けて選べません')
+      } else {
+        routeSel = [...routeSel, station]
+        trains.setSelection(routeSel)
+        hud.showToast(`駅${station + 1} を路線に追加（${routeSel.length} 駅目）`)
+      }
+      editCooldown = BUILD_INTERVAL
+      return
+    }
+
+    // 何も無ければ線路の上に駅を建てる
+    if (!held?.build || held.material === undefined) {
+      hud.showToast('この素材では駅を建てられません（岩・板・レンガ・ガラス）')
+      editCooldown = 0.5
+      return
+    }
+    if (inventory.count(held.id) < STATION_COST) {
+      hud.showToast(`${held.name}が足りません（駅に ${STATION_COST} 必要）`)
+      editCooldown = 0.5
+      return
+    }
+    const check = trains.canPlaceStation(px, py, pz)
+    if (check === 'notrack') {
+      hud.showToast('駅は線路の上にしか建てられません')
+      editCooldown = DEMOLISH_INTERVAL
+      return
+    }
+    if (check === 'tooclose') {
+      hud.showToast('近くに駅がありすぎます')
+      editCooldown = DEMOLISH_INTERVAL
+      return
+    }
+    if (trains.addStation(px, py, pz, held.material)) {
+      inventory.take(held.id, STATION_COST)
+      hud.showToast(`駅${trains.stations.length} を建てた`)
+      markMetaDirty()
+    }
+    editCooldown = TRACK_INTERVAL
+  }
+
+  /** 近くの列車に乗り込む。乗れたら true。 */
+  function mount(): boolean {
+    const t = trains.nearestTrain(
+      player.position.x,
+      player.position.y,
+      player.position.z,
+      RIDE_RANGE,
+    )
+    if (!t) return false
+    riding = t
+    player.velocity.set(0, 0, 0)
+    hud.showToast('列車に乗った（F で降りる）')
+    return true
+  }
+
+  /** 列車から降りて、線路の脇に立つ。 */
+  function dismount(): void {
+    const t = riding
+    riding = null
+    if (!t) return
+    // ヨー θ の右は (cosθ, -sinθ)
+    player.position.set(
+      t.pos[0] + Math.cos(t.pos[3]) * RIDE_OFF,
+      t.pos[1] + 0.6,
+      t.pos[2] - Math.sin(t.pos[3]) * RIDE_OFF,
+    )
+    player.velocity.set(0, 0, 0)
+    hud.showToast('列車から降りた')
+  }
+
+  /** 乗っているあいだは、列車の運転台にプレイヤーを載せて運ぶ。 */
+  function carryRider(): void {
+    const t = riding
+    if (!t) return
+    if (!trains.trains.includes(t)) {
+      riding = null
+      return
+    }
+    // 運転台は車体の後ろ寄り。前方は (-sinθ, -cosθ)
+    const back = -CAR_LEN * 0.28
+    player.position.set(
+      t.pos[0] - Math.sin(t.pos[3]) * back,
+      t.pos[1] + 0.6,
+      t.pos[2] - Math.cos(t.pos[3]) * back,
+    )
+    player.velocity.set(0, 0, 0)
+  }
+
+  /**
+   * 屋根の上に立っているあいだは、列車が動いたぶんだけ一緒に運ぶ（動く床）。
+   *
+   * 押し出しと接地は既存の箱の仕組みに任せてあるので、ここでやるのは
+   * **足元の車体が動いた量を足す**ことだけ。判定は 1 フレーム前の車体（`prev`）で行う。
+   * プレイヤーが立っていたのはそちらだから。
+   */
+  function carryOnRoof(): void {
+    for (const t of trains.trains) {
+      const dx = t.pos[0] - t.prev[0]
+      const dy = t.pos[1] - t.prev[1]
+      const dz = t.pos[2] - t.prev[2]
+      if (dx === 0 && dy === 0 && dz === 0) continue
+      for (const c of carColliders(t.prev, carScratch)) {
+        const feet = player.position.y
+        if (feet < c.maxY - 0.06 || feet > c.maxY + 0.35) continue
+        worldToLocal(c, player.position.x, player.position.z, roofScratch)
+        const r = player.radius
+        if (roofScratch[0] <= c.minX - r || roofScratch[0] >= c.maxX + r) continue
+        if (roofScratch[1] <= c.minZ - r || roofScratch[1] >= c.maxZ + r) continue
+        player.position.x += dx
+        player.position.y += dy
+        player.position.z += dz
+        return
+      }
+    }
+  }
+
+  /**
+   * 走っている列車が、線路の上のプレイヤーや MOB をはねる。
+   *
+   * 押しのけ（{@link Player.resolveBoxes}）より**先に**見る。あとから見ると
+   * 車体の横へ押し出されたあとになってしまい、当たったことに気づけない。
+   */
+  function applyTrainImpacts(dt: number): void {
+    trainHitCd = Math.max(0, trainHitCd - dt)
+    for (const t of trains.trains) {
+      if (t === riding) continue
+
+      if (!riding && trainHitCd <= 0 && health > 0) {
+        const hit = trainImpact(
+          t.pos,
+          t.speed,
+          player.position.x,
+          player.position.y,
+          player.position.z,
+          player.radius,
+          player.height,
+          impactScratch,
+        )
+        if (hit) {
+          trainHitCd = TRAIN_HIT_COOLDOWN
+          stats.trainHits++
+          hurtPlayer(hit.damage)
+          // やられて復帰したときは、その場所へ飛ばさない
+          if (health > 0) {
+            player.position.y += TRAIN_HIT_LIFT_OFF
+            player.velocity.set(hit.nx * hit.push, hit.lift, hit.nz * hit.push)
+            player.onGround = false
+            hud.showToast('列車にはねられた！')
+          }
+        }
+      }
+
+      for (const m of mobs.mobs) {
+        if (elapsed - (mobHitAt.get(m) ?? -1e9) < TRAIN_HIT_COOLDOWN) continue
+        const hit = trainImpact(
+          t.pos,
+          t.speed,
+          m.pos.x,
+          m.pos.y,
+          m.pos.z,
+          m.def.radius,
+          m.def.height,
+          impactScratch,
+        )
+        if (!hit) continue
+        mobHitAt.set(m, elapsed)
+        m.pos.y += TRAIN_HIT_LIFT_OFF
+        mobs.knock(m, hit.damage, hit.nx, hit.nz, hit.push, hit.lift)
+      }
+    }
+  }
+
+  /** 区間の終点を、次に伸ばせる端点として取り出す。 */
+  function endOf(seg: Segment): TrackEnd {
+    const e = segmentEnd(seg)
+    return { seg, atEnd: true, x: e[0], y: e[1], z: e[2], yaw: e[3] }
+  }
+
   function tick(): void {
     requestAnimationFrame(tick)
     const dt = Math.min(clock.getDelta(), 0.1)
     frames++
+    elapsed += dt
 
-    if (started && controls.locked) {
+    // 列車はプレイヤーより先に動かす。当たり判定・乗り上げ・はねられを
+    // すべて「いまの車体」で決められる
+    if (started) {
+      trains.update(dt)
+      applyTrainImpacts(dt)
+    }
+
+    if (started && riding) {
+      // 乗車中は自分では歩かない。視線だけ自由に回せる
+      carryRider()
+    } else if (started && controls.locked) {
+      carryOnRoof()
       player.update(dt, world, controls)
     }
 
@@ -984,7 +2258,24 @@ async function boot(): Promise<void> {
       player.position.y - 1.2,
       player.position.y + player.height + 0.5,
     )
+    tracks.collectColliders(
+      player.position.x,
+      player.position.z,
+      1.2,
+      player.boxes,
+      player.position.y - 1.2,
+      player.position.y + player.height + 0.5,
+    )
+    trains.collectColliders(
+      player.position.x,
+      player.position.z,
+      1.2,
+      player.boxes,
+      player.position.y - 1.2,
+      player.position.y + player.height + 0.5,
+    )
     build.rebuild()
+    tracks.rebuild(surfaceY)
 
     // 水中は視界を濁らせる
     const underwater = camera.position.y < SEA_LEVEL
@@ -1005,16 +2296,41 @@ async function boot(): Promise<void> {
     }
 
     // --- ブラシと戦闘 ---
+    // 勾配の目安は地形を掘るブラシのときだけ出す。下の分岐で狙点が決まったら出し直す
+    hideGrade()
     if (started && controls.locked && TOOLS[tool].id === 'build') {
       camera.getWorldDirection(lookDir)
       editCooldown -= dt
       updateBuildMode()
+      tracks.setGhost(null, false, surfaceY)
+      ghost.visible = false
+      boxGhost.visible = false
+    } else if (started && controls.locked && TOOLS[tool].id === 'station') {
+      camera.getWorldDirection(lookDir)
+      editCooldown -= dt
+      updateStationMode()
+      build.setGhost(null, false)
+      tracks.setGhost(null, false, surfaceY)
+      ghost.visible = false
+      boxGhost.visible = false
+    } else if (started && controls.locked && TOOLS[tool].id === 'track') {
+      camera.getWorldDirection(lookDir)
+      editCooldown -= dt
+      updateTrackMode()
+      build.setGhost(null, false)
       ghost.visible = false
       boxGhost.visible = false
     } else if (started && controls.locked) {
       build.setGhost(null, false)
+      tracks.setGhost(null, false, surfaceY)
       if (controls.wheel !== 0) {
-        brushRadius = clamp(brushRadius - Math.sign(controls.wheel) * 0.5, MIN_BRUSH, MAX_BRUSH)
+        const dir = -Math.sign(controls.wheel)
+        // Shift を押しながらだと掘る強さ、押していなければブラシの大きさ
+        if (controls.keys.has('ShiftLeft') || controls.keys.has('ShiftRight')) {
+          digDepth = stepDigDepth(digDepth, dir)
+        } else {
+          brushRadius = clamp(brushRadius + dir * 0.5, MIN_BRUSH, MAX_BRUSH)
+        }
         controls.wheel = 0
       }
 
@@ -1109,6 +2425,9 @@ async function boot(): Promise<void> {
           : null
       hud.setBrush(brushLabel(note))
 
+      // 勾配はブラシの中心ではなく地面に当たった点で測る（コメントは grade.ts）
+      if (target && !busy) showGrade(target.point.x, target.point.y, target.point.z)
+
       editCooldown -= dt
       if (editCooldown <= 0 && controls.digging && onMob && mobHit) {
         const dead = mobs.hurt(
@@ -1154,7 +2473,15 @@ async function boot(): Promise<void> {
           // 粒状かどうかは素材 ID から決まるので、盛る側の呼び分けは要らない
           const bounds = smoothing
             ? world.applySmooth(cx, cy, cz, brushRadius, 1)
-            : world.applyBrush(cx, cy, cz, shape, dig ? 'dig' : 'place', material)
+            : world.applyBrush(
+                cx,
+                cy,
+                cz,
+                shape,
+                dig ? 'dig' : 'place',
+                material,
+                dig ? digDepth : DIG_ALL,
+              )
           if (bounds) {
             if (smoothing) {
               // 収支なし
@@ -1175,6 +2502,7 @@ async function boot(): Promise<void> {
       ghost.visible = false
       boxGhost.visible = false
       build.setGhost(null, false)
+      tracks.setGhost(null, false, surfaceY)
       hud.setBrush(brushLabel())
     }
 
@@ -1210,7 +2538,9 @@ async function boot(): Promise<void> {
           `Env   ${biomeName(world, player.position.x, player.position.z)}  村 ${villages.activeCount}`,
           `Tree  ${world.treeCount}  伐採 ${world.choppedCount}`,
           `HP    ${Math.ceil(health)}/${MAX_HEALTH}  MOB ${mobs.total}  松明 ${torches.count}`,
-          `Build ${build.count} パーツ  当たり判定 ${villages.colliderCount + build.colliderCount}`,
+          `Build ${build.count} パーツ  軌道 ${tracks.count} 区間`,
+          `Rail  駅 ${trains.stations.length}  列車 ${trains.trains.length}${riding ? '（乗車中）' : ''}`,
+          `Hit   ${villages.colliderCount + build.colliderCount + tracks.colliderCount}`,
           `Time  ${String(h % 24).padStart(2, '0')}:00${sky.paused ? '  固定' : ''}`,
           `Seed  ${seed}`,
         ].join('\n'),
@@ -1245,6 +2575,11 @@ async function boot(): Promise<void> {
     stats.mobs = mobs.total
     stats.torches = torches.count
     stats.pieces = build.count
+    stats.tracks = tracks.count
+    stats.stations = trains.stations.length
+    stats.trains = trains.trains.length
+    stats.riding = riding !== null
+    stats.unlimited = inventory.unlimited
     stats.trees = world.treeCount
     stats.tool = TOOLS[tool].id
     stats.timeOfDay = sky.timeOfDay

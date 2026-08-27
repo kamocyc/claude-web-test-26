@@ -24,6 +24,9 @@ const AVOID_INTERVAL = 0.2
 const TURNS = [0, 0.6, -0.6, 1.2, -1.2, 1.9, -1.9, 2.7, -2.7]
 /** 障害物を集める半径。 */
 const OBSTACLE_RANGE = 4
+/** 殴られたときに弾かれる速さ（水平）と、持ち上がる速さ。 */
+const HIT_KNOCK = 4.2
+const HIT_LIFT = 3.2
 
 /** 進路上の障害物（木の幹と建物の壁）を教えてくれるもの。 */
 export interface Obstacles {
@@ -568,16 +571,33 @@ export class MobManager {
     return best
   }
 
-  /** ダメージを与える。倒したら true。 */
+  /** 殴った位置から遠ざかる向きへ弾きながらダメージを与える。倒したら true。 */
   hurt(mob: Mob, damage: number, fromX: number, fromZ: number): boolean {
-    mob.hp -= damage
-    mob.hurtFlash = 0.45
     const dx = mob.pos.x - fromX
     const dz = mob.pos.z - fromZ
     const d = Math.hypot(dx, dz) || 1
-    mob.vel.x += (dx / d) * 4.2
-    mob.vel.z += (dz / d) * 4.2
-    mob.vel.y = Math.max(mob.vel.y, 3.2)
+    return this.knock(mob, damage, dx / d, dz / d, HIT_KNOCK, HIT_LIFT)
+  }
+
+  /**
+   * 向きと強さを指定して吹き飛ばしながらダメージを与える。倒したら true。
+   *
+   * 列車にはねられたときのように、当たった相手が「点」ではなく
+   * **面を持つもの**で、弾く向きを外から決めたいときに使う。
+   */
+  knock(
+    mob: Mob,
+    damage: number,
+    nx: number,
+    nz: number,
+    push: number,
+    lift: number,
+  ): boolean {
+    mob.hp -= damage
+    mob.hurtFlash = 0.45
+    mob.vel.x += nx * push
+    mob.vel.z += nz * push
+    mob.vel.y = Math.max(mob.vel.y, lift)
     // 攻撃されたら怯えて逃げるのをやめない（動物はそのまま逃げ続ける）
     mob.wander = 0
     if (mob.hp <= 0) mob.killed = true

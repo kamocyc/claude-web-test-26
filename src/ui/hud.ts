@@ -9,6 +9,7 @@ export class Hud {
   private readonly stats = el<HTMLDivElement>('stats')
   private readonly hotbar = el<HTMLDivElement>('hotbar')
   private readonly brush = el<HTMLDivElement>('brush')
+  private readonly grade = el<HTMLDivElement>('grade')
   private readonly toast = el<HTMLDivElement>('toast')
   private readonly overlay = el<HTMLDivElement>('overlay')
   private readonly loading = el<HTMLDivElement>('loading')
@@ -86,7 +87,7 @@ export class Hud {
       swatch.style.background = def ? def.color : 'transparent'
       swatch.style.opacity = def ? '1' : '0'
       label.textContent = def ? def.name : ''
-      count.textContent = def && !def.unique ? String(n) : ''
+      count.textContent = def && !def.unique ? (inv.unlimited ? '∞' : String(n)) : ''
     }
     if (this.panelOpen) this.renderPanel()
     if (this.tradeOpen) this.renderTrade()
@@ -132,7 +133,7 @@ export class Hud {
       this.invGrid.appendChild(p)
     }
     for (const def of owned) {
-      this.invGrid.appendChild(this.itemCell(def, inv.whole(def.id), () => {
+      this.invGrid.appendChild(this.itemCell(def, inv.unlimited ? Infinity : inv.whole(def.id), () => {
         inv.assign(inv.selected, def.id)
         this.refresh()
       }))
@@ -164,7 +165,7 @@ export class Hud {
     cell.innerHTML =
       `<span class="swatch" style="background:${def.color}"></span>` +
       `<span class="label">${def.name}</span>` +
-      `<span class="count">${def.unique ? '' : n}</span>`
+      `<span class="count">${def.unique ? '' : Number.isFinite(n) ? n : '∞'}</span>`
     cell.title = def.note ?? ''
     cell.addEventListener('click', onClick)
     return cell
@@ -205,6 +206,11 @@ export class Hud {
 
   setBrush(label: string): void {
     this.brush.textContent = label
+  }
+
+  /** 照準の勾配。空文字で消える。 */
+  setGrade(label: string): void {
+    this.grade.textContent = label
   }
 
   showToast(text: string, ms = 1800): void {

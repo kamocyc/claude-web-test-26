@@ -1,0 +1,536 @@
+import { expect, test } from '@playwright/test'
+
+type Page = import('@playwright/test').Page
+
+async function start(page: Page): Promise<void> {
+  await page.goto('/')
+  await page.waitForFunction(() => window.__smooth?.ready === true, null, { timeout: 75_000 })
+  await page.click('#play')
+  await page.waitForTimeout(1200)
+}
+
+/** 材料を持たせて軌道モードにする。 */
+async function prepare(page: Page, kind = 'rail', length = 8): Promise<void> {
+  await page.evaluate(
+    ({ kind, length }) => {
+      const s = window.__smooth!
+      s.give('rock', 4000)
+      s.equip('rock')
+      s.setTool('track')
+      s.setTrackKind(kind)
+      s.setTrackLength(length)
+      s.clearRailhead()
+      s.look(0, -0.35)
+    },
+    { kind, length },
+  )
+  await page.waitForTimeout(400)
+}
+
+/** 村の広場は平らなので、敷く場所として当てにできる。 */
+async function goToFlatGround(page: Page): Promise<void> {
+  expect(await page.evaluate(() => window.__smooth!.gotoVillage()), '村が見つからない').toBe(true)
+  await page.waitForTimeout(2500)
+}
+
+/**
+ * 平らで開けた向きを探して、そちらを向く。
+ *
+ * 村の広場でも一方向は丘に突き当たる。切り盛りで直せるのは小さな段差までなので、
+ * 丘へ向けて敷けば途中で切り詰められて当然。ここで測りたいのはそこではないため、
+ * **足元に地面があって頭上が塞がっていない**向きを選んでから敷く。
+ */
+async function faceOpenGround(page: Page): Promise<{ dx: number; dz: number; reach: number }> {
+  const dir = await page.evaluate(() => {
+    const s = window.__smooth!
+    const p = s.state()
+    const cands: { dx: number; dz: number; reach: number }[] = []
+    for (let i = 0; i < 24; i++) {
+      const a = (i / 24) * Math.PI * 2
+      const dx = Math.cos(a)
+      const dz = Math.sin(a)
+      let reach = 0
+      for (let d = 2; d <= 34; d += 2) {
+        const x = p.x + dx * d
+        const z = p.z + dz * d
+        if (s.density(x, p.y + 0.35, z) > 0) break // 軌道面より上に地面が出ている
+        if (s.density(x, p.y - 2.5, z) <= 0) break // 足元が抜けている
+        reach = d
+      }
+      cands.push({ dx, dz, reach })
+    }
+    cands.sort((a, b) => b.reach - a.reach)
+    // 村の広場は家に囲まれているので、**見積もりが切り詰められない向き**を選ぶ
+    // 前方 = (-sin(yaw), -cos(yaw))
+    let pick = cands[0]
+    for (const c of cands) {
+      if (c.reach < 28) break
+      s.look(Math.atan2(-c.dx, -c.dz), -0.3)
+      s.clearRailhead()
+      if (s.trackPreview(p.x + c.dx * 8, p.y, p.z + c.dz * 8).trim === 'none') {
+        pick = c
+        break
+      }
+    }
+    s.look(Math.atan2(-pick.dx, -pick.dz), -0.3)
+    s.clearRailhead()
+    return pick
+  })
+  expect(dir.reach, '村の周りに平らな向きが見つからない').toBeGreaterThanOrEqual(28)
+  return dir
+}
+
+/**
+ * ボタンを押したまま、ゲーム側の条件が満たされるまで待って離す。
+ * ヘッドレスは SwiftShader で数 fps しか出ないので、固定時間の押しっぱなしでは
+ * 1 フレームも回らないことがある。
+ */
+async function holdUntil(
+  page: Page,
+  button: 0 | 2,
+  predicate: string,
+  timeout = 20_000,
+): Promise<void> {
+  await page.evaluate(
+    (b) => document.dispatchEvent(new MouseEvent('mousedown', { button: b })),
+    button,
+  )
+  try {
+    await page.waitForFunction(`(${predicate})()`, null, { timeout })
+  } finally {
+    await page.evaluate(
+      (b) => document.dispatchEvent(new MouseEvent('mouseup', { button: b })),
+      button,
+    )
+    await page.waitForTimeout(600)
+  }
+}
+
+test.describe('軌道モード', () => {
+  test('B で軌道モードに入り、R で線路と道路が入れ替わる', async ({ page }) => {
+    await start(page)
+    await prepare(page)
+    expect(await page.textContent('#brush')).toContain('軌道')
+    expect(await page.textContent('#brush')).toContain('線路')
+
+    await page.keyboard.press('KeyR')
+    await page.waitForTimeout(400)
+    expect(await page.textContent('#brush')).toContain('道路')
+
+    await page.keyboard.press('KeyR')
+    await page.waitForTimeout(400)
+    expect(await page.textContent('#brush')).toContain('線路')
+  })
+
+  test('狙った先へ線路が伸び、続けて敷くと端点で繋がる', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page)
+
+    const dir = await faceOpenGround(page)
+
+    const laid = await page.evaluate(
+      ({ dx, dz }) => {
+        const s = window.__smooth!
+        const p = s.state()
+        const results: string[] = []
+        // 8 m 先から始めて、6 m ずつ先を狙い足していく
+        for (let i = 0; i < 3; i++) {
+          const d = 8 + i * 6
+          results.push(s.trackAim(p.x + dx * d, p.y, p.z + dz * d))
+        }
+        return { results, segs: s.trackList(), count: s.trackCount() }
+      },
+      dir,
+    )
+
+    expect(laid.results).toEqual(['ok', 'ok', 'ok'])
+    expect(laid.count).toBe(3)
+    // 2 本目・3 本目は前の区間の終点から始まる（継ぎ目に隙間も段差も無い）
+    for (let i = 1; i < laid.segs.length; i++) {
+      const prev = laid.segs[i - 1]
+      const cur = laid.segs[i]
+      expect(Math.hypot(cur.x - prev.endX, cur.y - prev.endY, cur.z - prev.endZ)).toBeLessThan(0.01)
+    }
+  })
+
+  test('敷いた線路の上に立てる', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 10)
+
+    const dir = await faceOpenGround(page)
+
+    const onTrack = await page.evaluate(async ({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      const aimX = p.x + dx * 8
+      const aimZ = p.z + dz * 8
+      if (s.trackAim(aimX, p.y, aimZ) !== 'ok') return { placed: false, onGround: false, dy: NaN }
+      const seg = s.trackAt(aimX, p.y, aimZ, 14)!
+      // 区間の真ん中へ降りる
+      const midX = (seg.x + seg.endX) / 2
+      const midZ = (seg.z + seg.endZ) / 2
+      const midY = (seg.y + seg.endY) / 2
+      s.teleport(midX, midZ)
+      await new Promise((r) => setTimeout(r, 2500))
+      const st = s.state()
+      return { placed: true, onGround: st.onGround, dy: st.y - midY }
+    }, dir)
+
+    expect(onTrack.placed).toBe(true)
+    expect(onTrack.onGround).toBe(true)
+    // 路盤の天面に立っている（地面へ落ちていない）
+    expect(Math.abs(onTrack.dy)).toBeLessThan(0.35)
+  })
+
+  test('右クリックで敷き、左クリックで撤去できる（実際の操作）', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 10)
+    await faceOpenGround(page)
+
+    await holdUntil(page, 2, '() => window.__smooth.trackCount() >= 1')
+    expect(await page.evaluate(() => window.__smooth!.trackCount())).toBeGreaterThanOrEqual(1)
+    // 敷いた先が次のレールヘッドになる
+    expect(await page.evaluate(() => window.__smooth!.railhead())).not.toBeNull()
+
+    // 敷いた軌道のそばへ寄り、その面へ照準を落として撤去する
+    const before = await page.evaluate(() => window.__smooth!.trackCount())
+    await page.evaluate(() => {
+      const s = window.__smooth!
+      const seg = s.trackList()[0]
+      // 区間の始点の少し手前（進行方向の逆側）に立つ
+      const ux = (seg.endX - seg.x) / seg.length
+      const uz = (seg.endZ - seg.z) / seg.length
+      s.teleport(seg.x - ux * 3.5, seg.z - uz * 3.5)
+    })
+    await page.waitForTimeout(1500)
+    await page.evaluate(() => {
+      const s = window.__smooth!
+      const seg = s.trackList()[0]
+      const p = s.state()
+      const ux = (seg.endX - seg.x) / seg.length
+      const uz = (seg.endZ - seg.z) / seg.length
+      // 区間の 2 m 先を狙う（目の高さから見下ろす角度をそのまま渡す）
+      const tx = seg.x + ux * 2
+      const tz = seg.z + uz * 2
+      const dx = tx - p.x
+      const dz = tz - p.z
+      const dy = seg.y - (p.y + 1.62)
+      s.look(Math.atan2(-dx, -dz), Math.atan2(dy, Math.hypot(dx, dz)))
+    })
+    await page.waitForTimeout(800)
+    await holdUntil(page, 0, `() => window.__smooth.trackCount() < ${before}`)
+    expect(await page.evaluate(() => window.__smooth!.trackCount())).toBeLessThan(before)
+  })
+
+  test('撤去すると材料が全額戻る', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page)
+
+    const dir = await faceOpenGround(page)
+
+    const result = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      const x = p.x + dx * 8
+      const z = p.z + dz * 8
+      const placed = s.trackAim(x, p.y, z)
+      // 敷いたあとの手持ちを起点にする（切り盛りした土のぶんは戻らないので別勘定）
+      const laid = s.itemCount('rock')
+      const seg = s.trackList()[0]
+      const removed = s.removeTrackAt(x, p.y, z, 14)
+      return {
+        placed,
+        removed,
+        refund: s.itemCount('rock') - laid,
+        rail: Math.max(1, Math.round(seg.length * 4)), // 線路は 1 m あたり 4
+        count: s.trackCount(),
+      }
+    }, dir)
+
+    expect(result.placed).toBe('ok')
+    expect(result.removed).toBe(true)
+    expect(result.count).toBe(0)
+    // 戻るのは線路のぶんきっかり
+    expect(result.refund).toBe(result.rail)
+  })
+  test('小さな段差は、敷くと地形のほうが路盤に合う（切り盛り）', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 10)
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      // 8 m 先から、見ている向きへ 10 m の線を敷く
+      const ax = p.x + dx * 8
+      const az = p.z + dz * 8
+      // 線の途中に 1.2 m のくぼみと 1.4 m の出っ張りを作る
+      const hollow = { x: ax + dx * 3, z: az + dz * 3 }
+      const mound = { x: ax + dx * 7, z: az + dz * 7 }
+      s.dig(hollow.x, s.surfaceAt(hollow.x, hollow.z) + 0.8, hollow.z, 2)
+      s.fill(mound.x, s.surfaceAt(mound.x, mound.z) + 0.2, mound.z, 1.2)
+      const before = {
+        hollow: s.surfaceAt(hollow.x, hollow.z),
+        mound: s.surfaceAt(mound.x, mound.z),
+      }
+
+      const placed = s.trackAim(ax, p.y, az)
+      const seg = s.trackList()[0]
+      const after = {
+        hollow: s.surfaceAt(hollow.x, hollow.z),
+        mound: s.surfaceAt(mound.x, mound.z),
+      }
+      return { placed, seg, before, after, hollow, mound }
+    }, dir)
+
+    expect(r.placed).toBe('ok')
+    // 掘ったところは下がり、盛ったところは上がっている（測る対象がちゃんとできている）
+    expect(r.before.hollow).toBeLessThan(r.before.mound - 1.5)
+
+    // 区間は直線なので、注目点の路盤の底面は始点と終点の線形補間で出せる
+    const seg = r.seg
+    const deckBottom = (x: number, z: number): number => {
+      const t = Math.hypot(x - seg.x, z - seg.z) / seg.length
+      return seg.y + (seg.endY - seg.y) * t - 0.35
+    }
+
+    // くぼみは築堤で埋まり、出っ張りは切土で削られて、どちらも路盤の底面に合う
+    expect(Math.abs(r.after.hollow - deckBottom(r.hollow.x, r.hollow.z))).toBeLessThan(0.3)
+    expect(Math.abs(r.after.mound - deckBottom(r.mound.x, r.mound.z))).toBeLessThan(0.3)
+    // 実際に地形が動いている
+    expect(r.after.hollow - r.before.hollow).toBeGreaterThan(0.6)
+    expect(r.before.mound - r.after.mound).toBeGreaterThan(0.6)
+  })
+  test('切り盛りした土のぶんだけ材料が増減する', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 8)
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      // 進行方向の右手。2 本の線を左右に離して敷き、互いに重ならないようにする
+      const rx = -dz
+      const rz = dx
+      const rail = (i: number): number => {
+        const seg = s.trackList()[i]
+        return Math.max(1, Math.round(seg.length * 4)) // 線路は 1 m あたり 4
+      }
+
+      // (1) くぼみをまたぐ線 — 築堤ぶん余計に材料を使うはず
+      const ax = p.x + dx * 8 - rx * 7
+      const az = p.z + dz * 8 - rz * 7
+      const hx = ax + dx * 4
+      const hz2 = az + dz * 4
+      s.dig(hx, s.surfaceAt(hx, hz2) + 0.8, hz2, 2.2)
+      s.clearRailhead()
+      const beforeA = s.itemCount('rock')
+      const placedA = s.trackAim(ax, s.surfaceAt(ax, az), az)
+      const spentA = beforeA - s.itemCount('rock')
+
+      // (2) 岩のこぶを削る線 — 削った岩が返るので、線路のぶんより安く済むはず
+      const bx = p.x + dx * 8 + rx * 7
+      const bz = p.z + dz * 8 + rz * 7
+      for (const t of [2, 5]) {
+        const mx = bx + dx * t
+        const mz = bz + dz * t
+        s.fill(mx, s.surfaceAt(mx, mz) + 0.2, mz, 1.5, 'rock')
+      }
+      s.clearRailhead()
+      const beforeB = s.itemCount('rock')
+      const placedB = s.trackAim(bx, s.surfaceAt(bx, bz), bz)
+      const spentB = beforeB - s.itemCount('rock')
+
+      return {
+        placedA,
+        placedB,
+        spentA,
+        spentB,
+        railA: rail(0),
+        railB: rail(1),
+        count: s.trackCount(),
+      }
+    }, dir)
+
+    expect([r.placedA, r.placedB]).toEqual(['ok', 'ok'])
+    expect(r.count).toBe(2)
+    // 築堤に積んだ土のぶん、線路そのものより多く払う
+    expect(r.spentA).toBeGreaterThan(r.railA)
+    // 切土で出た岩が返るので、線路そのものより安くなる
+    expect(r.spentB).toBeLessThan(r.railB)
+    expect(r.spentB).toBeLessThan(r.spentA)
+  })
+
+  test('F4 の無制限モードでは材料なしで敷け、溜めた量も減らない', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await page.evaluate(() => {
+      const s = window.__smooth!
+      s.equip('rock')
+      s.setTool('track')
+      s.setTrackKind('rail')
+      s.setTrackLength(8)
+      s.clearRailhead()
+      s.look(0, -0.35)
+    })
+    const dir = await faceOpenGround(page)
+
+    // 材料が無いので敷けない
+    const short = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      return { r: s.trackAim(p.x + dx * 8, p.y, p.z + dz * 8), rock: s.itemCount('rock') }
+    }, dir)
+    expect(short.rock).toBe(0)
+    expect(short.r).toBe('short')
+
+    // F4 で無制限モードへ
+    await page.keyboard.press('F4')
+    await page.waitForFunction(() => window.__smooth!.unlimited === true, null, { timeout: 10_000 })
+
+    const free = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      s.clearRailhead()
+      const r = s.trackAim(p.x + dx * 8, p.y, p.z + dz * 8)
+      return { r, count: s.trackCount(), stored: s.storedCount('rock') }
+    }, dir)
+    expect(free.r).toBe('ok')
+    expect(free.count).toBe(1)
+    // 溜めてある量は 0 のまま（無制限モードは払いを素通しするだけ）
+    expect(free.stored).toBe(0)
+
+    // もう一度押すと元に戻る
+    await page.keyboard.press('F4')
+    await page.waitForFunction(() => window.__smooth!.unlimited === false, null, { timeout: 10_000 })
+    const back = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      s.clearRailhead()
+      return { r: s.trackAim(p.x + dx * 20, p.y, p.z + dz * 20), rock: s.itemCount('rock') }
+    }, dir)
+    expect(back.rock).toBe(0)
+    expect(back.r).toBe('short')
+  })
+  test('ホイールで長さを伸ばすと、狙点が手前でも線路が伸びる', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 8)
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      // まず 1 本敷いて、その終点をレールヘッドにする
+      const first = s.trackAim(p.x + dx * 8, p.y, p.z + dz * 8)
+      const head = s.railhead()!
+      // 狙点はレールヘッドのすぐ先（3 m）。手が届く範囲しか狙えなくても…
+      const ax = head.x + dx * 3
+      const az = head.z + dz * 3
+      const short = s.trackPreview(ax, p.y, az)
+      s.setTrackLength(20)
+      const long = s.trackPreview(ax, p.y, az)
+      s.setTrackLength(12)
+      const mid = s.trackPreview(ax, p.y, az)
+      return { first, short, long, mid }
+    }, dir)
+
+    expect(r.first).toBe('ok')
+    // …ホイールで決めた長さまで伸びる（狙点までの 3 m にはならない）
+    expect(r.short.length).toBeCloseTo(8, 1)
+    expect(r.long.length).toBeCloseTo(20, 1)
+    expect(r.mid.length).toBeCloseTo(12, 1)
+    expect(r.long.trim).toBe('none')
+  })
+
+  test('Shift + ホイールの勾配で登り降りが決まり、G で自動に戻る', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 12)
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      s.trackAim(p.x + dx * 8, p.y, p.z + dz * 8)
+      const head = s.railhead()!
+      const ax = head.x + dx * 3
+      const az = head.z + dz * 3
+
+      s.setTrackGrade(3)
+      const up = s.trackPreview(ax, p.y, az)
+      s.setTrackGrade(-3)
+      const down = s.trackPreview(ax, p.y, az)
+      // 上限（線路は 6 %）を超える指定は丸められる
+      s.setTrackGrade(30)
+      const clamped = s.trackPreview(ax, p.y, az)
+      const shown = s.trackGrade()
+      s.setTrackGrade(null)
+      const auto = s.trackPreview(ax, p.y, az)
+      return { up, down, clamped, shown, auto, autoShown: s.trackGrade() }
+    }, dir)
+
+    expect(r.up.grade).toBeCloseTo(0.03, 3)
+    expect(r.down.grade).toBeCloseTo(-0.03, 3)
+    expect(r.clamped.grade).toBeCloseTo(0.06, 3)
+    expect(r.shown).toBeCloseTo(30, 3)
+    expect(r.autoShown).toBeNull()
+    // 自動は地形なり。平らな広場なのでほぼ水平
+    expect(Math.abs(r.auto.grade)).toBeLessThan(0.03)
+  })
+
+  test('建物にぶつかると手前で止まり、理由が出る', async ({ page }) => {
+    await start(page)
+    await goToFlatGround(page)
+    await prepare(page, 'rail', 20)
+    await page.evaluate(() => window.__smooth!.give('plank', 900))
+
+    const dir = await faceOpenGround(page)
+
+    const r = await page.evaluate(({ dx, dz }) => {
+      const s = window.__smooth!
+      const p = s.state()
+      // 6 m 先から線を始め、その 12 m 先に壁を建てる
+      const ax = p.x + dx * 6
+      const az = p.z + dz * 6
+      s.clearRailhead()
+      const clear = s.trackPreview(ax, p.y, az)
+
+      const bx = ax + dx * 12
+      const bz = az + dz * 12
+      const built: string[] = []
+      // 線路（幅 3 m）を塞ぐように、横へ 3 つ並べる
+      for (const t of [-3, 0, 3]) {
+        built.push(s.buildAt('block', bx - dz * t, s.surfaceAt(bx - dz * t, bz + dx * t), bz + dx * t, 'plank'))
+      }
+      const blocked = s.trackPreview(ax, p.y, az)
+      const placed = s.trackAim(ax, p.y, az)
+      const seg = s.trackList()[0]
+      // 敷いた直後の案内（本番の右クリックと同じ経路で出る）
+      const toast = document.getElementById('toast')?.textContent ?? ''
+      return { clear, built, blocked, placed, length: seg?.length ?? 0, toast }
+    }, dir)
+
+    expect(r.built).toContain('ok')
+    // 壁が無ければ 20 m 敷けるはずのところ…
+    expect(r.clear.length).toBeCloseTo(20, 1)
+    // …壁の手前で止まり、理由が分かる
+    expect(r.blocked.trim).toBe('blocked')
+    expect(r.blocked.wanted).toBeCloseTo(20, 1)
+    expect(r.blocked.length).toBeLessThan(16)
+    expect(r.placed).toBe('ok')
+    expect(r.length).toBeLessThan(16)
+    // 理由が画面に出る
+    expect(r.toast).toContain('建物にぶつかった')
+  })
+})

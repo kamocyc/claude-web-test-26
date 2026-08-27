@@ -16,8 +16,15 @@ import {
 import { DensityField } from './density'
 import { Chunk, TREE_FIELDS, localCornerIndex, ownerChunkCoord, unpackLocalIndex } from './Chunk'
 import type { EditMap } from './Chunk'
-import { applyBrush, applySmoothBrush, isLooseMaterial, settleLoose } from './edits'
-import type { BrushBounds, BrushMode, BrushShape } from './edits'
+import {
+  DIG_ALL,
+  applyBrush,
+  applyBrushes,
+  applySmoothBrush,
+  isLooseMaterial,
+  settleLoose,
+} from './edits'
+import type { BrushBounds, BrushMode, BrushOp, BrushShape } from './edits'
 import { TREE_CELL, TREE_STRIDE, treeCellKey } from './vegetation'
 import { WorkerPool } from './WorkerPool'
 import type { TreePrototype } from '../render/treeMeshes'
@@ -302,6 +309,7 @@ export class World {
     return n
   }
 
+  /** @param depth 1 回で削る深さの上限（m）。{@link DIG_ALL} でブラシの形をそのまま抜く。 */
   applyBrush(
     x: number,
     y: number,
@@ -309,6 +317,7 @@ export class World {
     shape: BrushShape,
     mode: BrushMode,
     material: number,
+    depth: number = DIG_ALL,
   ): BrushBounds | null {
     const bounds = applyBrush(
       x,
@@ -322,6 +331,7 @@ export class World {
       this.writeCorner,
       WORLD_MIN_Y + 2,
       WORLD_MAX_Y - 2,
+      depth,
     )
     // 崩すのは、緩い土砂に触ったとき・粒状の素材を置いたとき・
     // 土や砂の自然地形を掘ったときだけ。岩場や草地の掘削は今までどおりの負荷で済む。
@@ -380,6 +390,28 @@ export class World {
     bounds.maxX = Math.max(bounds.maxX, s.maxX)
     bounds.maxY = Math.max(bounds.maxY, s.maxY)
     bounds.maxZ = Math.max(bounds.maxZ, s.maxZ)
+  }
+
+  /**
+   * 複数のブラシをまとめて掛ける。何も変化しなければ null。
+   *
+   * 崩れ（{@link settleLoose}）は起こさない。軌道の切り盛りのように
+   * **形をそのまま残したい**編集のためのもので、掛けた箱の面がそのまま地面になる。
+   * メッシュの作り直しは最後に 1 回だけなので、細かい箱を何十本並べても
+   * 1 回の編集と同じ負荷で済む。`each` を渡すと 1 本ごとの結果も受け取れる。
+   */
+  applyBrushBatch(ops: readonly BrushOp[], each?: BrushBounds[]): BrushBounds | null {
+    if (ops.length === 0) return null
+    const bounds = applyBrushes(
+      ops,
+      this.readD,
+      this.readMat,
+      this.writeCorner,
+      WORLD_MIN_Y + 2,
+      WORLD_MAX_Y - 2,
+      each,
+    )
+    return this.finishEdit(bounds)
   }
 
   /** 凸凹をならす。何も変化しなければ null。 */

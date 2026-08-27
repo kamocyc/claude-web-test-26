@@ -31,6 +31,13 @@
       #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
       #crosshair::after { top: 8px; left: 0; height: 2px; width: 18px; }
 
+      /* 照準の勾配。目の高さ（水平）から狙点がどれだけ上下しているか */
+      #grade {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, 26px);
+        font: 12px ui-monospace, monospace; opacity: .85; color: #cfefff;
+        white-space: nowrap; text-shadow: 0 1px 3px rgba(0,0,0,.9);
+      }
+
       #stats {
         position: absolute; left: 12px; top: 12px;
         font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -145,7 +152,7 @@
       #overlay {
         position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
         background: radial-gradient(120% 120% at 50% 30%, rgba(24,36,52,.82), rgba(6,9,13,.94));
-        pointer-events: auto; text-align: center; padding: 24px;
+        pointer-events: auto; text-align: center; padding: 24px; overflow-y: auto;
       }
       #overlay.hidden { display: none; }
       #overlay .card { max-width: 520px; }
@@ -182,6 +189,7 @@
   <body>
     <div id="hud">
       <div id="crosshair"></div>
+      <div id="grade"></div>
       <div id="stats"></div>
       <div id="brush"></div>
       <div id="toast"></div>
@@ -222,17 +230,19 @@
             <tr><td>Space</td><td>ジャンプ / 上昇（飛行中）</td></tr>
             <tr><td>Space ×2</td><td>飛行モード切替</td></tr>
             <tr><td>Shift</td><td>ダッシュ / 下降（飛行中）</td></tr>
-            <tr><td>左クリック</td><td>掘る（MOB に合わせると攻撃 / 木なら伐採 / 建築モードでは解体）</td></tr>
-            <tr><td>右クリック</td><td>盛る（掘って貯めた分だけ。建築モードではパーツを置く）</td></tr>
-            <tr><td>ホイール</td><td>ブラシの大きさ（建築モードでは向きを 5° ずつ / Shift で 45° ずつ）</td></tr>
-            <tr><td>B</td><td>ブラシ切替（球 / 直方体 / ならし / 建築）</td></tr>
-            <tr><td>R</td><td>建築パーツ切替（壁 / 窓 / 戸口 / 床 / 階段 / 屋根 / ブロック）</td></tr>
-            <tr><td>中クリック</td><td>建築の向きを既定に戻す</td></tr>
+            <tr><td>左クリック</td><td>掘る（MOB は攻撃 / 木は伐採 / 建築・軌道では撤去）</td></tr>
+            <tr><td>右クリック</td><td>盛る（建築モードはパーツ / 軌道モードは軌道を敷く）</td></tr>
+            <tr><td>ホイール</td><td>ブラシの大きさ / 建築は向き 5° ずつ / 軌道は区間の長さ</td></tr>
+            <tr><td>Shift + ホイール</td><td>掘る強さ（1 回で削る深さ）/ 軌道は勾配</td></tr>
+            <tr><td>B</td><td>ブラシ切替（球 / 直方体 / ならし / 建築 / 軌道 / 駅）</td></tr>
+            <tr><td>R</td><td>建築パーツ切替 / 軌道は 線路 ⇄ 道路 / 駅は発車</td></tr>
+            <tr><td>中クリック</td><td>建築の向きを戻す / 軌道は接続を切る / 駅は路線を取消</td></tr>
             <tr><td>1 – 9</td><td>ホットバーの選択</td></tr>
             <tr><td>E</td><td>持ち物とクラフト</td></tr>
-            <tr><td>F</td><td>村人と交換する</td></tr>
+            <tr><td>F</td><td>列車の乗り降り（屋根にも乗れる） / 村人と交換</td></tr>
             <tr><td>V</td><td>最寄りの村へワープ（デバッグ）</td></tr>
             <tr><td>F3</td><td>ステータス表示</td></tr>
+            <tr><td>F4</td><td>材料を無制限に（デバッグ）</td></tr>
             <tr><td>Esc</td><td>ポーズ</td></tr>
           </table>
           <div id="seedRow">
